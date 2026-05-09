@@ -1311,6 +1311,13 @@ class BasePlatformAdapter(ABC):
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
 
+        # Patch 07 -- LLM connection error suppression.
+        # Tracks the last time a connection-class error was posted to each
+        # session, so we can suppress repeated identical noise when the LLM
+        # backend is temporarily unavailable.  Keyed by session_key, value
+        # is a (error_type_name, monotonic_timestamp) tuple.
+        self._llm_error_last_posted: Dict[str, tuple] = {}
+
     @property
     def has_fatal_error(self) -> bool:
         return self._fatal_error_message is not None
@@ -3138,20 +3145,66 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Send the error to the user so they aren't left with radio silence.
+            # Patch 07 -- suppress repeated LLM connection errors.
+            # Connection-class errors get a sanitized message with a 5-minute
+            # cooldown to avoid flooding the channel when the backend is down.
             try:
+                import time as _time_mod
+
                 error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
+                _LLM_CONNECTION_ERRORS = (
+                    "ConnectionRefusedError",
+                    "ConnectionError",
+                    "ConnectionResetError",
+                    "TimeoutError",
+                    "ConnectTimeoutError",
+                    "ReadTimeout",
+                    "ServerDisconnectedError",
+                    "ClientConnectorError",
+                    "OSError",
                 )
+                _is_llm_conn_error = error_type in _LLM_CONNECTION_ERRORS or isinstance(
+                    e, (ConnectionError, TimeoutError, OSError)
+                )
+
+                if _is_llm_conn_error:
+                    # Cooldown: suppress if same error class posted <5 min ago.
+                    _cooldown_secs = 300
+                    _now = _time_mod.monotonic()
+                    _prev = self._llm_error_last_posted.get(session_key)
+                    if _prev is not None:
+                        _prev_type, _prev_ts = _prev
+                        if _prev_type == error_type and (_now - _prev_ts) < _cooldown_secs:
+                            logger.info(
+                                "[%s] Suppressing duplicate LLM error (%s) for session %s (cooldown)",
+                                self.name, error_type, session_key,
+                            )
+                            return  # Suppress — already notified recently.
+                    self._llm_error_last_posted[session_key] = (error_type, _now)
+                    # Sanitized, user-friendly message.
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            "The AI backend is temporarily unavailable. "
+                            "I'll resume automatically when it comes back — no action needed."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                else:
+                    # Genuine/unexpected error — post full details as before.
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
