@@ -70,6 +70,9 @@ class TurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
+    # Stable app-server v2 ``TurnError.codexErrorInfo`` value. Kept separate
+    # from rendered text so callers need not scrape provider-controlled prose.
+    codex_error_info: Any = None
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -733,14 +736,13 @@ class CodexAppServerSession:
 
             if method == "turn/completed":
                 turn_complete = True
-                turn_status = (
-                    (note.get("params") or {}).get("turn") or {}
-                ).get("status")
+                turn_obj = (note.get("params") or {}).get("turn") or {}
+                turn_status = turn_obj.get("status")
                 if turn_status and turn_status not in {"completed", "interrupted"}:
-                    err_obj = (
-                        (note.get("params") or {}).get("turn") or {}
-                    ).get("error")
+                    err_obj = turn_obj.get("error")
                     if err_obj:
+                        if isinstance(err_obj, dict):
+                            result.codex_error_info = err_obj.get("codexErrorInfo")
                         err_msg = _format_responses_error(err_obj, str(turn_status))
                         # If the turn failed for an auth/refresh reason,
                         # rewrite the error into a re-auth hint AND mark
