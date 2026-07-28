@@ -2463,6 +2463,7 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
+    BackendUnavailableReply,
     BasePlatformAdapter,
     EphemeralReply,
     MessageEvent,
@@ -2499,6 +2500,31 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_BACKEND_UNAVAILABLE_FAILURE_REASONS = frozenset({
+    "overloaded",
+    "server_error",
+    "timeout",
+})
+_BACKEND_UNAVAILABLE_NOTICE = (
+    "The AI backend is temporarily unavailable. "
+    "Please try sending your message again in a moment."
+)
+
+
+def _is_backend_unavailable_agent_result(agent_result: dict) -> bool:
+    """Whether a failed agent result represents a transient backend outage.
+
+    The agent retry loop emits this structured classification.  Do not infer
+    it from exceptions at the adapter layer, where a connection failure may
+    belong to Slack, Telegram, media delivery, storage, or another subsystem.
+    """
+    return bool(
+        agent_result.get("failed")
+        and agent_result.get("failure_reason")
+        in _BACKEND_UNAVAILABLE_FAILURE_REASONS
+    )
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -18813,6 +18839,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+
+            # The retry loop already classified provider failures.  Mark
+            # transient backend outages explicitly so the adapter can suppress
+            # only this safe notice and arm its cooldown after delivery.
+            if (
+                not _gateway_surface_passes_raw_text(source.platform)
+                and _is_backend_unavailable_agent_result(agent_result)
+            ):
+                return BackendUnavailableReply(_BACKEND_UNAVAILABLE_NOTICE)
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
