@@ -22,9 +22,25 @@ class PushAdapter:
 
     def __init__(self):
         self.handled = []
+        self.platform = Platform.TELEGRAM
+        self._transport_profile = None
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+
+@pytest.mark.asyncio
+async def test_deliver_wake_stamps_push_source_before_injection():
+    adapter = PushAdapter()
+    source = _source()
+
+    await deliver_wake(adapter, text="wake", session_id="sid", source=source)
+
+    assert len(adapter.handled) == 1
+    event = adapter.handled[0]
+    assert event.source._transport_adapter_ref() is adapter
+    assert event.source._transport_platform == Platform.TELEGRAM
+    assert event.source._transport_profile is None
 
 
 class ApiServerLikeAdapter:

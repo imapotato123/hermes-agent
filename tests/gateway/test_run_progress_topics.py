@@ -12,7 +12,7 @@ import pytest
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -57,6 +57,18 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+    def fronts_platform(self, platform) -> bool:
+        """Model the one Discord account acknowledged by this fake Relay."""
+        return self.platform == Platform.RELAY and platform == Platform.DISCORD
+
+    def transport_identity_for_platform(self, platform):
+        if self.fronts_platform(platform):
+            return "discord:progress-test-bot"
+        return None
+
+    def matches_transport_identity(self, identity: str) -> bool:
+        return identity == "discord:progress-test-bot"
 
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -398,7 +410,35 @@ def _make_runner(adapter):
         group_sessions_per_user=False,
         stt_enabled=False,
     )
+    original_run_agent = runner._run_agent
+
+    async def _run_agent_with_owner(*args, **kwargs):
+        source = kwargs.get("source")
+        if source is not None:
+            # Model trusted adapter ingress. The public Relay routing hint is
+            # deliberately insufficient without this process-local stamp.
+            stamp_source_transport_owner(
+                source,
+                profile=None,
+                adapter=adapter,
+                platform=adapter.platform,
+            )
+        return await original_run_agent(*args, **kwargs)
+
+    runner._run_agent = _run_agent_with_owner
     return runner
+
+
+def test_relay_progress_hint_without_owner_capability_fails_closed():
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chan-parent",
+        delivered_via_upstream_relay=True,
+    )
+
+    assert runner._adapter_for_source(source) is None
 
 
 @pytest.mark.asyncio
@@ -1267,6 +1307,11 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
         chat_type="group",
         thread_id="17585",
     )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.TELEGRAM,
+    )
     event = MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
@@ -1277,6 +1322,7 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
 
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, session_key)
 
     sent_texts = [call["content"] for call in adapter.sent]
@@ -1313,6 +1359,11 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
         chat_type="group",
         thread_id="17585",
     )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.TELEGRAM,
+    )
     event = MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
@@ -1323,6 +1374,7 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
 
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await asyncio.wait_for(
         adapter._process_message_background(event, session_key), timeout=1.0
     )

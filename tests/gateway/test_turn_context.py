@@ -10,6 +10,8 @@ itself (that's covered by test_run_progress_topics.py et al.).
 
 import asyncio
 import queue as queue_mod
+from contextlib import suppress
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,3 +66,100 @@ class TestTurnRunner:
         ctx = TurnContext(progress_queue=queue_mod.Queue())
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
+
+    def test_live_status_callback_follows_replacement_adapter(self):
+        from gateway.run import TurnRunner
+
+        class StatusAdapter:
+            supports_status_text = True
+
+            def __init__(self):
+                self.status = []
+
+            def set_status_text(self, chat_id, text):
+                self.status.append((chat_id, text))
+
+        first = StatusAdapter()
+        replacement = StatusAdapter()
+        owner = {"adapter": replacement}
+        ctx = TurnContext(
+            source=SimpleNamespace(chat_id="chat-1"),
+            _run_still_current=lambda: True,
+            _live_adapter=lambda: owner["adapter"],
+            _live_status_adapter=first,
+            _live_status_mode="full",
+        )
+        runner = TurnRunner(SimpleNamespace(), ctx)
+
+        runner.progress_callback("tool.started", "web_search", args={"query": "x"})
+
+        assert first.status == []
+        assert replacement.status
+        assert replacement.status[0][0] == "chat-1"
+
+    @pytest.mark.asyncio
+    async def test_progress_replacement_opens_fresh_bubble_without_cross_edit(self):
+        from gateway.platforms.base import SendResult
+        from gateway.run import TurnRunner
+
+        owner = {"adapter": None}
+
+        class EditableAdapter:
+            name = "progress-test"
+            MAX_MESSAGE_LENGTH = 4000
+
+            def __init__(self, message_id, *, retire_on_send=False):
+                self.message_id = message_id
+                self.retire_on_send = retire_on_send
+                self.sent = []
+                self.edits = []
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.sent.append(content)
+                if self.retire_on_send:
+                    owner["adapter"] = replacement
+                return SendResult(success=True, message_id=self.message_id)
+
+            async def edit_message(self, chat_id, message_id, content):
+                self.edits.append((message_id, content))
+                return SendResult(success=True, message_id=message_id)
+
+            async def send_typing(self, chat_id, metadata=None):
+                return None
+
+        first = EditableAdapter("progress-1", retire_on_send=True)
+        replacement = EditableAdapter("progress-2")
+        owner["adapter"] = first
+        progress_queue = queue_mod.Queue()
+        progress_queue.put("first line")
+        ctx = TurnContext(
+            source=SimpleNamespace(chat_id="chat-1"),
+            progress_queue=progress_queue,
+            _run_still_current=lambda: True,
+            _live_adapter=lambda: owner["adapter"],
+            _live_operation=lambda name: (
+                owner["adapter"],
+                getattr(owner["adapter"], name, None),
+            ),
+        )
+        runner = TurnRunner(SimpleNamespace(), ctx)
+        task = asyncio.create_task(runner.send_progress_messages())
+        try:
+            for _ in range(50):
+                if first.sent:
+                    break
+                await asyncio.sleep(0.03)
+            assert first.sent == ["first line"]
+            await asyncio.sleep(1.6)
+            progress_queue.put("second line")
+            for _ in range(120):
+                if replacement.sent:
+                    break
+                await asyncio.sleep(0.03)
+            assert replacement.sent == ["first line\nsecond line"]
+            assert first.edits == []
+            assert replacement.edits == []
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task

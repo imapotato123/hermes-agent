@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -4599,6 +4602,96 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "Invalid API response" in result["error"]
         assert result.get("final_response") == result["error"]
+        assert result["failure_reason"] == "unknown"
+
+    @pytest.mark.parametrize(
+        ("status_code", "failure_reason"),
+        [
+            (401, "auth"),
+            (402, "billing"),
+            (408, "timeout"),
+            (429, "rate_limit"),
+            (500, "server_error"),
+            (502, "server_error"),
+            (503, "overloaded"),
+            (504, "timeout"),
+            (524, "timeout"),
+            (529, "overloaded"),
+        ],
+    )
+    def test_invalid_response_status_carries_structured_reason(
+        self, agent, status_code, failure_reason
+    ):
+        """Production invalid-response returns preserve status taxonomy."""
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+        bad_resp = SimpleNamespace(
+            choices=[],
+            error=SimpleNamespace(code=status_code),
+            model="test/model",
+            usage=None,
+        )
+        agent.client.chat.completions.create.return_value = bad_resp
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == failure_reason
+
+    def test_transient_failure_result_carries_structured_reason(self, agent):
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=TimeoutError("provider request timed out"),
+            ),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "timeout"
+
+    def test_nonretryable_auth_result_carries_structured_excluded_reason(self, agent):
+        self._setup_agent(agent)
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+
+        class UnauthorizedError(RuntimeError):
+            status_code = 401
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=UnauthorizedError("invalid API key"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "auth"
 
     def test_invalid_response_retry_completes_one_logical_call(self, agent):
         self._setup_agent(agent)
@@ -5772,19 +5865,26 @@ class TestAnthropicInterruptHandler:
         """
         import threading
         import time
+        from types import SimpleNamespace
         from unittest.mock import MagicMock
         from run_agent import AIAgent
         from agent.chat_completion_helpers import interruptible_api_call
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="https://api.anthropic.com",
-            provider="anthropic",
-            model="claude-test",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
+        fake_sdk = SimpleNamespace(
+            NOT_GIVEN=object(),
+            Anthropic=MagicMock,
+            AnthropicBedrock=MagicMock,
         )
+        with patch("agent.anthropic_adapter._anthropic_sdk", fake_sdk):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
         agent.api_mode = "anthropic_messages"
         agent._interrupt_requested = False
         agent._anthropic_client = MagicMock()

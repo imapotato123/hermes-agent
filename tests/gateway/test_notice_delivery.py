@@ -5,17 +5,17 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_source() -> SessionSource:
-    return SessionSource(
+    return stamp_source_transport_owner(SessionSource(
         platform=Platform.SLACK,
         chat_id="C123",
         chat_type="channel",
         user_id="U123",
         thread_id="111.222",
-    )
+    ), profile=None)
 
 
 def _make_runner(extra=None):
