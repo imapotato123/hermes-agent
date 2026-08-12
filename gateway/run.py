@@ -2463,6 +2463,7 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
+    BackendNoticeState,
     BackendUnavailableReply,
     BasePlatformAdapter,
     EphemeralReply,
@@ -5982,6 +5983,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.__dict__["_sessions"] = sessions
         return sessions
 
+    def _backend_notice_state_for_adapters(self) -> BackendNoticeState:
+        """Return runner-owned notice state, tolerating partial test runners."""
+        state = self.__dict__.get("_backend_notice_state")
+        if state is None:
+            state = BackendNoticeState()
+            self.__dict__["_backend_notice_state"] = state
+        return state
+
+    def _share_backend_notice_state(self, adapter: Any) -> None:
+        """Wire shared cooldown state when the adapter implements the seam."""
+        setter = getattr(adapter, "set_backend_notice_state", None)
+        if callable(setter):
+            setter(self._backend_notice_state_for_adapters())
+
     def _session_state(self, session_key: str) -> "SessionState":
         """Get-or-create the :class:`SessionState` for ``session_key``."""
         sessions = self._sessions_map()
@@ -6040,6 +6055,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._backend_notice_state = BackendNoticeState()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -11477,6 +11493,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            self._share_backend_notice_state(adapter)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -12860,6 +12877,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._share_backend_notice_state(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13835,6 +13853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        self._share_backend_notice_state(adapter)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
