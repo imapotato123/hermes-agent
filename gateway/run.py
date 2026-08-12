@@ -21056,12 +21056,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                     if text_content:
-                        send_result = await _deliver(
-                            "send",
-                            chat_id=source.chat_id,
-                            content=outbound_text,
-                            metadata=_thread_metadata,
-                        )
+                        if is_backend_unavailable:
+                            notice_state = self._backend_notice_state_for_adapters()
+
+                            async def _send_and_finish_background_notice_claim():
+                                delivered = False
+                                try:
+                                    send_result = await _deliver(
+                                        "send",
+                                        chat_id=source.chat_id,
+                                        content=outbound_text,
+                                        metadata=_thread_metadata,
+                                    )
+                                    delivered = bool(
+                                        getattr(send_result, "success", False)
+                                    )
+                                    return send_result
+                                finally:
+                                    notice_state.finish_claim(
+                                        backend_notice_key,
+                                        "backend_unavailable",
+                                        time.monotonic(),
+                                        delivered=delivered,
+                                    )
+
+                            send_task = asyncio.create_task(
+                                _send_and_finish_background_notice_claim()
+                            )
+                            try:
+                                send_result = await asyncio.shield(send_task)
+                            except asyncio.CancelledError:
+                                notice_state.track_delivery_task(send_task)
+                                raise
+                            finally:
+                                backend_notice_claimed = False
+                        else:
+                            send_result = await _deliver(
+                                "send",
+                                chat_id=source.chat_id,
+                                content=outbound_text,
+                                metadata=_thread_metadata,
+                            )
                         notice_delivered = bool(
                             getattr(send_result, "success", False)
                         )
