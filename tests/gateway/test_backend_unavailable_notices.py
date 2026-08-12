@@ -184,6 +184,16 @@ def _wire_runner(monkeypatch, tmp_path, adapter, results):
     return runner
 
 
+def test_shared_notice_state_wiring_attaches_runner_for_direct_builtins():
+    adapter = CaptureSlackAdapter()
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner._backend_notice_state = BackendNoticeState()
+
+    runner._share_backend_notice_state(adapter, profile_name="default")
+
+    assert cast(Any, adapter).gateway_runner is runner
+
+
 @pytest.mark.asyncio
 async def test_real_gateway_path_sanitizes_backend_transport_failure(monkeypatch, tmp_path):
     raw_error = "APIConnectionError: connection refused at https://api.example.com/v1"

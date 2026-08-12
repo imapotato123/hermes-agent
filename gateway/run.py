@@ -5996,7 +5996,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
         profile_name: Optional[str] = None,
     ) -> None:
-        """Wire profile-scoped cooldown state across adapter reconnects."""
+        """Wire runner routing and profile-scoped state across reconnects."""
+        # Some direct built-in factory branches predate the platform registry
+        # and do not inject this back-reference themselves. This common seam is
+        # used by primary/secondary startup and reconnect, so attach it here to
+        # keep final-response routing generation-aware on every platform.
+        adapter.gateway_runner = self
         setter = getattr(adapter, "set_backend_notice_state", None)
         if callable(setter):
             if not profile_name:
