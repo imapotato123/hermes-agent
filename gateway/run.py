@@ -5997,6 +5997,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile_name: Optional[str] = None,
     ) -> None:
         """Wire profile-scoped cooldown state across adapter reconnects."""
+        # All adapters participate in replacement routing, including direct
+        # built-ins created outside plugin factories.
+        adapter.gateway_runner = self
         setter = getattr(adapter, "set_backend_notice_state", None)
         if callable(setter):
             if not profile_name:

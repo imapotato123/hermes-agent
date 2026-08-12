@@ -591,8 +591,8 @@ async def test_shared_runner_state_does_not_cross_suppress_profiles():
     assert [message["content"] for message in first.sent] == [_NOTICE]
     assert [message["content"] for message in second.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:alpha:agent:main:slack:channel:C123:171717",
-        "profile:beta:agent:main:slack:channel:C123:171717",
+        "profile:5:alpha:agent:main:slack:channel:C123:171717",
+        "profile:4:beta:agent:main:slack:channel:C123:171717",
     }
 
 
@@ -627,9 +627,24 @@ async def test_default_profile_does_not_collide_with_named_main_profile():
     assert [message["content"] for message in default_adapter.sent] == [_NOTICE]
     assert [message["content"] for message in named_main_adapter.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:default:agent:main:slack:channel:C123:171717",
-        "profile:main:agent:main:slack:channel:C123:171717",
+        "profile:7:default:agent:main:slack:channel:C123:171717",
+        "profile:4:main:agent:main:slack:channel:C123:171717",
     }
+
+
+def test_shared_notice_state_wiring_attaches_runner_for_direct_builtins():
+    """The common wiring seam covers direct built-ins as well as factories."""
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner._backend_notice_state = BackendNoticeState()
+    runner._active_profile_name = lambda: "default"
+    adapter = CaptureSlackAdapter()
+
+    assert adapter.gateway_runner is None
+
+    runner._share_backend_notice_state(adapter)
+
+    assert adapter.gateway_runner is runner
+    assert adapter._backend_notice_state is runner._backend_notice_state
 
 
 @pytest.mark.asyncio
@@ -720,7 +735,7 @@ def test_notice_tracker_prunes_expired_sessions():
 
     adapter._record_llm_error_notice("live", "backend_unavailable", now)
 
-    assert set(adapter._llm_error_last_posted) == {"profile:default:live"}
+    assert set(adapter._llm_error_last_posted) == {"profile:7:default:live"}
 
 
 def test_notice_tracker_is_bounded():
@@ -737,7 +752,7 @@ def test_notice_tracker_is_bounded():
 
     assert len(adapter._llm_error_last_posted) <= _LLM_ERROR_TRACKER_MAX_SESSIONS
     assert (
-        f"profile:default:session-{overflow - 1}"
+        f"profile:7:default:session-{overflow - 1}"
         in adapter._llm_error_last_posted
     )
     assert "session-0" not in adapter._llm_error_last_posted

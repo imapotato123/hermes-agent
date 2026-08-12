@@ -71,6 +71,9 @@ class TurnResult:
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     error_code: Optional[str] = None  # Structured provider/Responses error code
+    # Stable app-server v2 ``TurnError.codexErrorInfo`` value. Keep the full
+    # protocol object separate from rendered text and the top-level code.
+    codex_error_info: Any = None
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -742,6 +745,8 @@ class CodexAppServerSession:
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
                     if err_obj:
+                        if isinstance(err_obj, dict):
+                            result.codex_error_info = err_obj.get("codexErrorInfo")
                         raw_error_code = (
                             err_obj.get("code")
                             if isinstance(err_obj, dict)
