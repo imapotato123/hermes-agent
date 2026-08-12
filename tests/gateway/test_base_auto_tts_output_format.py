@@ -24,7 +24,11 @@ from gateway.platforms.base import (
     SendResult,
     build_auto_tts_output_path,
 )
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
 
@@ -54,14 +58,16 @@ class _DummyAdapter(BasePlatformAdapter):
 
 
 def _make_voice_event(platform: Platform) -> MessageEvent:
+    source = SessionSource(
+        platform=platform,
+        chat_id="-1001",
+        chat_type="group",
+    )
+    stamp_source_transport_owner(source, profile=None, platform=platform)
     return MessageEvent(
         text="hello",
         message_type=MessageType.VOICE,
-        source=SessionSource(
-            platform=platform,
-            chat_id="-1001",
-            chat_type="group",
-        ),
+        source=source,
         message_id="voice-1",
     )
 
@@ -97,6 +103,7 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
     long_reply = "x" * 2000  # avoid the telegram caption-collapse path
     adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=long_reply))
     event = _make_voice_event(platform)
+    stamp_source_transport_owner(event.source, adapter=adapter)
     requested = []
 
     def fake_tts(*, text, output_path=None):
@@ -124,6 +131,7 @@ async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
     adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="reply text"))
     event = _make_voice_event(Platform.TELEGRAM)
+    stamp_source_transport_owner(event.source, adapter=adapter)
 
     def fake_tts(*, text, output_path=None):
         from pathlib import Path

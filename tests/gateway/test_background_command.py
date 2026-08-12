@@ -10,8 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.platforms.base import BackendNoticeState, MessageEvent, SendResult
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -23,6 +23,7 @@ def _make_event(text="/background", platform=Platform.TELEGRAM,
         chat_id=chat_id,
         user_name="testuser",
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(text=text, source=source)
 
 
@@ -95,7 +96,8 @@ class TestRunBackgroundTask:
     async def test_no_credentials_sends_error(self):
         """When provider credentials are missing, an error is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
 
@@ -104,6 +106,12 @@ class TestRunBackgroundTask:
             user_id="12345",
             chat_id="67890",
             user_name="testuser",
+        )
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+            adapter=mock_adapter,
         )
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
@@ -118,7 +126,8 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
@@ -129,6 +138,12 @@ class TestRunBackgroundTask:
             user_id="12345",
             chat_id="67890",
             user_name="testuser",
+        )
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+            adapter=mock_adapter,
         )
 
         mock_result = {"final_response": "Hello from background!", "messages": []}
@@ -165,6 +180,251 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_during_agent_run_delivers_only_through_replacement(self):
+        runner = _make_runner()
+        stale = MagicMock()
+        stale.platform = Platform.TELEGRAM
+        stale.send = AsyncMock()
+        stale.extract_media = MagicMock(return_value=([], "done"))
+        stale.extract_images = MagicMock(return_value=([], "done"))
+        replacement = MagicMock()
+        replacement.platform = Platform.TELEGRAM
+        replacement.send = AsyncMock()
+        replacement.extract_media = stale.extract_media
+        replacement.extract_images = stale.extract_images
+        runner.adapters[Platform.TELEGRAM] = stale
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+        )
+
+        def run_and_replace(*_args, **_kwargs):
+            runner.adapters[Platform.TELEGRAM] = replacement
+            return {"final_response": "done", "messages": []}
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.side_effect = run_and_replace
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        stale.send.assert_not_awaited()
+        replacement.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_structured_background_outage_never_exposes_raw_error(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], ""))
+        adapter.extract_images = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+        )
+        raw = "provider https://secret.invalid/v1 overloaded"
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = {
+                "failed": True,
+                "failure_reason": "server_error",
+                "final_response": "",
+                "error": raw,
+            }
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        adapter.send.assert_awaited_once()
+        content = adapter.send.await_args.kwargs["content"]
+        assert "temporarily unavailable" in content
+        assert raw not in content
+
+    @pytest.mark.asyncio
+    async def test_failed_outage_notice_does_not_send_ordinary_failure_fallback(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.send = AsyncMock(side_effect=RuntimeError("transport down"))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = {
+                "failed": True,
+                "failure_reason": "server_error",
+                "final_response": "",
+                "error": "raw provider detail",
+            }
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        assert adapter.send.await_count == 1
+        assert "temporarily unavailable" in adapter.send.await_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_outage_waits_for_ambiguous_send_result(self):
+        runner = _make_runner()
+        runner._backend_notice_state = BackendNoticeState()
+        runner._profile_adapters = {}
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.extract_media = MagicMock(return_value=([], ""))
+        adapter.extract_images = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._share_backend_notice_state(adapter)
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+            adapter=adapter,
+        )
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+
+        async def ambiguous_send(*_args, **_kwargs):
+            send_started.set()
+            await finish_send.wait()
+            return SendResult(success=True, message_id="notice-1")
+
+        adapter.send = ambiguous_send
+        result = {
+            "failed": True,
+            "failure_reason": "server_error",
+            "final_response": "",
+            "error": "raw provider detail",
+        }
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = result
+            mock_agent.return_value = instance
+            task = asyncio.create_task(
+                runner._run_background_task("prompt", source, "bg_test")
+            )
+            await send_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        state = runner._backend_notice_state
+        assert state._claim_results
+        claim_key = next(iter(state._claim_results))[0]
+        next_claim = asyncio.create_task(
+            state.claim(claim_key, "backend_unavailable")
+        )
+        await asyncio.sleep(0)
+        assert next_claim.done() is False
+
+        finish_send.set()
+        assert await next_claim is False
+        assert state.inflight == set()
+        assert state._claim_results == {}
+
+    @pytest.mark.asyncio
+    async def test_background_outage_claim_key_is_stable_across_empty_owner_slot(self):
+        runner = _make_runner()
+        runner._backend_notice_state = BackendNoticeState()
+        runner._profile_adapters = {}
+        stale = MagicMock()
+        stale.platform = Platform.TELEGRAM
+        stale.extract_media = MagicMock(return_value=([], ""))
+        stale.extract_images = MagicMock(return_value=([], ""))
+        stale.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = stale
+        runner._share_backend_notice_state(stale, profile_name="default")
+
+        replacement = MagicMock()
+        replacement.platform = Platform.TELEGRAM
+        replacement.extract_media = stale.extract_media
+        replacement.extract_images = stale.extract_images
+        replacement.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="notice")
+        )
+        runner._share_backend_notice_state(replacement, profile_name="default")
+
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(source, adapter=stale)
+        result = {
+            "failed": True,
+            "failure_reason": "server_error",
+            "final_response": "",
+            "error": "raw provider detail",
+        }
+        run_count = 0
+
+        def run_with_first_owner_gap(*_args, **_kwargs):
+            nonlocal run_count
+            run_count += 1
+            if run_count == 1:
+                runner.adapters.pop(Platform.TELEGRAM)
+            return result
+
+        original_claim = runner._backend_notice_state.claim
+        claim_keys = []
+
+        async def claim_and_restore_owner(key, kind):
+            claim_keys.append(key)
+            claimed = await original_claim(key, kind)
+            runner.adapters[Platform.TELEGRAM] = replacement
+            return claimed
+
+        runner._backend_notice_state.claim = claim_and_restore_owner
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.side_effect = run_with_first_owner_gap
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg-1")
+            await runner._run_background_task("prompt", source, "bg-2")
+
+        assert replacement.send.await_count == 1
+        assert len(claim_keys) == 2
+        assert claim_keys[0] == claim_keys[1]
+        assert set(runner._backend_notice_state.posted) == {claim_keys[0]}
 
 
 # ---------------------------------------------------------------------------

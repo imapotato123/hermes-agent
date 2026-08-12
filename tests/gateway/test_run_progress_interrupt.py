@@ -18,7 +18,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -179,6 +179,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         chat_type="group",
         thread_id="17585",
     )
+    stamp_source_transport_owner(source, profile=None)
     result = await runner._run_agent(
         message="hi",
         context_prompt="",
