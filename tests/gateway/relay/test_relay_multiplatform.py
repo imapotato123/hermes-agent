@@ -19,6 +19,12 @@ import json
 import pytest
 
 import gateway.relay as relay
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.session import SessionSource
+from tests.gateway.relay.stub_connector import StubConnector
 
 
 @pytest.fixture(autouse=True)
@@ -150,5 +156,92 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
     )
     await adapter.send("dc-1", "a discord reply")
     assert stub.sent_platforms[-1] == "discord"
+
+
+@pytest.mark.asyncio
+async def test_same_chat_id_across_platforms_never_combines_route_state():
+    descriptor = CapabilityDescriptor(
+        contract_version=1,
+        platform="discord",
+        label="Discord",
+        max_message_length=2000,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="discord",
+        len_unit="chars",
+    )
+    stub = StubConnector(descriptor)
+    stub._identities = [("discord", "app-1"), ("telegram", "bot-9")]
+    adapter = RelayAdapter(PlatformConfig(), descriptor, transport=stub)
+    await adapter.connect()
+
+    discord = MessageEvent(
+        text="discord",
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="42",
+            chat_type="channel",
+            scope_id="guild-old",
+            user_id="discord-user",
+        ),
+    )
+    telegram = MessageEvent(
+        text="telegram",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="42",
+            chat_type="dm",
+            user_id="telegram-user",
+        ),
+    )
+    adapter.prime_routing_cache(discord)
+    adapter.prime_routing_cache(telegram)
+
+    await adapter.send_for_source(discord.source, "discord answer")
+
+    assert stub.sent_platforms[-1] == "discord"
+    assert stub.sent[-1]["metadata"] == {
+        "scope_id": "guild-old",
+        "user_id": "discord-user",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_cross_platform_route_never_inherits_other_platform_tenant():
+    descriptor = CapabilityDescriptor(
+        contract_version=1,
+        platform="discord",
+        label="Discord",
+        max_message_length=2000,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="discord",
+        len_unit="chars",
+    )
+    stub = StubConnector(descriptor)
+    stub._identities = [("discord", "app-d"), ("slack", "bot-s")]
+    adapter = RelayAdapter(PlatformConfig(), descriptor, transport=stub)
+    await adapter.connect()
+    adapter.prime_routing_cache(
+        MessageEvent(
+            text="slack",
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="SAME",
+                scope_id="team-s",
+                user_id="user-s",
+            ),
+        )
+    )
+
+    await adapter.send_for_source(
+        SessionSource(platform=Platform.DISCORD, chat_id="SAME"),
+        "discord reply",
+    )
+
+    assert stub.sent_platforms[-1] == "discord"
+    assert stub.sent[-1]["metadata"] == {}
 
 

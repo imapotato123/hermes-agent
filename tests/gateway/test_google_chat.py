@@ -1566,7 +1566,7 @@ class TestAuthorizationEmailMatch:
         """
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
-        from gateway.session import SessionSource
+        from gateway.session import SessionSource, stamp_source_transport_owner
 
         monkeypatch.setenv("GOOGLE_CHAT_ALLOWED_USERS", "alice@example.com")
         cfg = GatewayConfig()
@@ -1582,6 +1582,7 @@ class TestAuthorizationEmailMatch:
             user_name="Alice",
             user_id_alt="users/12345",         # resource name moves to alt
         )
+        stamp_source_transport_owner(source, profile=None)
         assert runner._is_user_authorized(source) is True
 
 

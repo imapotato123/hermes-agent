@@ -18,7 +18,11 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 class _MediaRoutingAdapter(BasePlatformAdapter):
@@ -38,18 +42,33 @@ class _MediaRoutingAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
-def _event(thread_id=None):
+def _event(thread_id=None, *, adapter=None):
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="chat-1",
         chat_type="dm",
         thread_id=thread_id,
     )
+    if adapter is not None:
+        stamp_source_transport_owner(source, profile=None, adapter=adapter)
     return MessageEvent(
         text="make speech",
         message_type=MessageType.TEXT,
         source=source,
         message_id="msg-1",
+    )
+
+
+def _bind_runner_owner(runner, event, adapter) -> None:
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
+    stamp_source_transport_owner(
+        event.source,
+        profile=None,
+        platform=event.source.platform,
+        adapter=adapter,
     )
 
 
@@ -68,7 +87,7 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
 @pytest.mark.asyncio
 async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
-    event = _event()
+    event = _event(adapter=adapter)
     media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")
     adapter._message_handler = AsyncMock(
         return_value=f"[[audio_as_voice]]\nMEDIA:{media_file}"
@@ -161,7 +180,7 @@ class _DiscordMediaFailureAdapter(BasePlatformAdapter):
 async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     """Attachmentless send_video results must surface a user-visible notice (#66797)."""
     adapter = _DiscordMediaFailureAdapter()
-    event = _event()
+    event = _event(adapter=adapter)
     media_file = _allowed_media_path(tmp_path, monkeypatch, "clip.mp4")
     adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
     adapter.send_video = AsyncMock(
@@ -222,6 +241,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -241,6 +261,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata={"thread_id": "topic-1"},
+        source=event.source,
     )
 
 
@@ -272,6 +293,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -291,6 +313,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata=routing_metadata,
+        source=event.source,
     )
 
 
@@ -312,6 +335,7 @@ async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     response = "See this mockup\nhttps://example.com/mockup.png"
     await GatewayRunner._deliver_queued_first_response(
@@ -355,6 +379,7 @@ async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     response = f"The inspected file is at {media_file}."
     await GatewayRunner._deliver_queued_first_response(
@@ -394,6 +419,7 @@ async def test_queued_followup_delivery_preserves_protected_media_example():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     response = "Tag files like `MEDIA:/tmp/example.png` in tool output."
     await GatewayRunner._deliver_queued_first_response(
@@ -435,6 +461,7 @@ async def test_queued_followup_delivery_skips_media_when_turn_failed():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    _bind_runner_owner(runner, event, adapter)
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -554,6 +581,7 @@ async def test_queued_resend_branch_delivers_media_and_preserves_protected_examp
         chat_type="dm",
         thread_id="topic-1",
     )
+    stamp_source_transport_owner(source, profile=None)
     session_key = build_session_key(source)
     adapter._pending_messages[session_key] = MessageEvent(
         text="queued follow-up",

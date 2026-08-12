@@ -23,7 +23,11 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 class _DrainProbeAdapter(BasePlatformAdapter):
@@ -98,6 +102,7 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
     must start a second turn automatically."""
     adapter = _DrainProbeAdapter()
     src = _slack_thread_source()
+    stamp_source_transport_owner(src, adapter=adapter)
     key = build_session_key(src)
     handled: list[str] = []
 
@@ -178,6 +183,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
 
     adapter = _DrainProbeAdapter()
     runner.adapters = {Platform.SLACK: adapter}
+    stamp_source_transport_owner(src, profile=None, adapter=adapter)
 
     GoalManager(session_entry.session_id).set("ship it")
     with patch(

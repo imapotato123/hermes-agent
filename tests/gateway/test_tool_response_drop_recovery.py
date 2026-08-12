@@ -30,7 +30,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, stamp_source_transport_owner
 
 
 class _DummyAdapter(BasePlatformAdapter):
@@ -58,11 +58,9 @@ class _DummyAdapter(BasePlatformAdapter):
 
 
 def _make_event(platform: Platform, chat_id: str = "111", message_id: str = "m1") -> MessageEvent:
-    return MessageEvent(
-        text="hello",
-        source=SessionSource(platform=platform, chat_id=chat_id, chat_type="dm"),
-        message_id=message_id,
-    )
+    source = SessionSource(platform=platform, chat_id=chat_id, chat_type="dm")
+    stamp_source_transport_owner(source, profile=None, platform=platform)
+    return MessageEvent(text="hello", source=source, message_id=message_id)
 
 
 async def _hold_typing(_chat_id, interval=2.0, metadata=None, stop_event=None):
@@ -111,6 +109,7 @@ class TestExtractStripRecoveryAllPlatforms:
         _strip_everything(adapter, monkeypatch)
 
         event = _make_event(platform)
+        stamp_source_transport_owner(event.source, adapter=adapter)
         with caplog.at_level(logging.WARNING, logger="gateway.platforms.base"):
             await adapter._process_message_background(
                 event, build_session_key(event.source)
@@ -155,6 +154,7 @@ class TestRecoveryDoesNotLeakMediaFragments:
         )
 
         event = _make_event(Platform.DISCORD)
+        stamp_source_transport_owner(event.source, adapter=adapter)
         with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
             await adapter._process_message_background(
                 event, build_session_key(event.source)
@@ -191,6 +191,7 @@ class TestUnrecoverableDropIsLoud:
         _strip_everything(adapter, monkeypatch)
 
         event = _make_event(Platform.DISCORD)
+        stamp_source_transport_owner(event.source, adapter=adapter)
         with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
             await adapter._process_message_background(
                 event, build_session_key(event.source)

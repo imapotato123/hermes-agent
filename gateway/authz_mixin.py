@@ -21,7 +21,11 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+)
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -106,7 +110,7 @@ class GatewayAuthorizationMixin:
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        if profile_name:
             active_profile = None
             active_profile_fn = getattr(self, "_active_profile_name", None)
             if callable(active_profile_fn):
@@ -120,9 +124,11 @@ class GatewayAuthorizationMixin:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
-            # Fail closed: a stamped secondary profile with no registry entry
-            # (e.g. its adapter failed to connect) must NOT fall back to the
-            # default profile's adapter — that sends replies out the wrong bot.
+            # Fail closed: any explicitly stamped non-active profile with no
+            # registry entry (e.g. its adapter failed to connect) must NOT fall
+            # back to the active profile's adapter. ``default`` is a literal
+            # profile name, not an alias for ``self.adapters`` when another
+            # named profile is active.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
@@ -140,19 +146,93 @@ class GatewayAuthorizationMixin:
         # authenticated connector socket. Looking up the underlying platform
         # here silently disables streaming, typing, and tool progress when a
         # managed gateway does not also run that platform's native adapter.
-        if getattr(source, "delivered_via_upstream_relay", False) is True:
+        source_attrs = getattr(source, "__dict__", {})
+        if (
+            source_has_transport_owner(source)
+            and source_attrs.get("_transport_platform") == Platform.RELAY
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+        ):
             # One process-level RelayAdapter owns the connector socket for all
             # multiplexed profiles. Secondary profiles intentionally do not
             # register their own relay adapters, so profile-aware lookup would
-            # fail and suppress streamed delivery for those profiles.
+            # fail and suppress streamed delivery for those profiles. A relay
+            # reconnect creates a cold routing cache, so warm its discriminator
+            # state from this authenticated in-process source before delivery.
             adapters = getattr(self, "adapters", None) or {}
-            return adapters.get(Platform.RELAY)
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
-        )
+            adapter = adapters.get(Platform.RELAY)
+            expected_identity = source_attrs.get("_transport_identity")
+            if expected_identity is None:
+                return None
+            matches_identity = getattr(
+                adapter, "matches_transport_identity", None
+            )
+            if not callable(matches_identity) or not matches_identity(
+                str(expected_identity)
+            ):
+                return None
+            fronts = getattr(adapter, "fronts_platform", None)
+            if not callable(fronts) or not fronts(
+                getattr(source, "platform", None)
+            ):
+                return None
+            prime = getattr(adapter, "prime_routing_source", None)
+            if callable(prime):
+                prime(source)
+            return adapter
+        # ``source.profile`` names the runtime selected by profile_routes, not
+        # necessarily the credential that received the message. Resolve the
+        # durable physical platform/profile pair instead; relay sources retain
+        # their underlying logical platform for session identity.
+        source_attrs = getattr(source, "__dict__", {})
+        if source_has_transport_owner(source):
+            transport_platform = source_attrs.get(
+                "_transport_platform", getattr(source, "platform", None)
+            )
+            logical_platform = getattr(source, "platform", None)
+            if (
+                transport_platform != Platform.RELAY
+                and transport_platform != logical_platform
+            ):
+                return None
+            adapter = self._authorization_adapter(
+                transport_platform,
+                source_attrs.get("_transport_profile"),
+            )
+            if transport_platform == Platform.RELAY and adapter is not None:
+                expected_identity = source_attrs.get("_transport_identity")
+                matches_identity = getattr(
+                    adapter, "matches_transport_identity", None
+                )
+                if expected_identity is not None:
+                    if not callable(matches_identity) or not matches_identity(
+                        str(expected_identity)
+                    ):
+                        return None
+                elif getattr(source, "delivered_via_upstream_relay", False) is not True:
+                    # Restored relay owners without an account fingerprint are
+                    # ambiguous and must not degrade to platform-only routing.
+                    return None
+                fronts = getattr(adapter, "fronts_platform", None)
+                if (
+                    getattr(source, "platform", None) != Platform.RELAY
+                    and (not callable(fronts) or not fronts(
+                    getattr(source, "platform", None)
+                    ))
+                ):
+                    return None
+                prime = getattr(adapter, "prime_routing_source", None)
+                if callable(prime):
+                    prime(source)
+            return adapter
+        # Only an explicit deserialization marker proves this is a genuinely
+        # historical unstamped record. Fresh hand-built sources have no
+        # physical-owner authority and fail closed.
+        if source_is_legacy_unstamped(source):
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "profile", None),
+            )
+        return None
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -164,11 +244,25 @@ class GatewayAuthorizationMixin:
         intake-policy checks stay on that transport without weakening the
         fail-closed fallback for restored or hand-built sources.
         """
+        if not source_has_transport_owner(source):
+            return None
         adapter_ref = getattr(source, "_transport_adapter_ref", None)
         adapter = adapter_ref() if callable(adapter_ref) else None
-        platform = getattr(source, "platform", None)
+        source_attrs = getattr(source, "__dict__", {})
+        platform = source_attrs.get("_transport_platform")
         if adapter is None or platform is None:
             return None
+        expected_identity = (
+            source_attrs.get("_transport_identity")
+            if isinstance(source_attrs, dict)
+            else None
+        )
+        if platform == Platform.RELAY and expected_identity is not None:
+            matches_identity = getattr(adapter, "matches_transport_identity", None)
+            if not callable(matches_identity) or not matches_identity(
+                str(expected_identity)
+            ):
+                return None
         if adapter is (getattr(self, "adapters", None) or {}).get(platform):
             return adapter
         profile_maps = getattr(self, "_profile_adapters", None) or {}
@@ -179,8 +273,13 @@ class GatewayAuthorizationMixin:
 
     def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the transport-owning profile for adapter policy lookups."""
+        source_attrs = getattr(source, "__dict__", {})
+        platform = (
+            source_attrs.get("_transport_platform")
+            if source_has_transport_owner(source)
+            else getattr(source, "platform", None)
+        )
         adapter = self._registered_transport_adapter(source)
-        platform = getattr(source, "platform", None)
         if adapter is not None:
             if adapter is (getattr(self, "adapters", None) or {}).get(platform):
                 return None
@@ -189,7 +288,20 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
-        return getattr(source, "profile", None)
+        source_attrs = getattr(source, "__dict__", {})
+        if source_has_transport_owner(source):
+            transport_profile = source_attrs.get("_transport_profile")
+            transport_adapter = self._authorization_adapter(
+                platform, transport_profile
+            )
+            if transport_adapter is not None and transport_adapter is (
+                getattr(self, "adapters", None) or {}
+            ).get(platform):
+                return None
+            return transport_profile
+        if source_is_legacy_unstamped(source):
+            return getattr(source, "profile", None)
+        return None
 
     def _adapter_authorization_is_upstream(
         self,
@@ -369,18 +481,38 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore owned by the source's receiving transport.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        ``source.profile`` is the routed runtime/session namespace and may differ
+        from the bot credential that received the message. Live adapter sources
+        stamp ``_transport_profile``; that owner is authoritative for pairing
+        isolation. A missing stamped secondary store fails closed rather than
+        consulting the active profile's global whitelist. Unstamped legacy
+        sources retain the historical runtime-profile/global fallback.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        source_attrs = getattr(source, "__dict__", {})
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
+        profile = (
+            source_attrs.get("_transport_profile")
+            if has_transport_owner
+            else getattr(source, "profile", None) if is_legacy else None
+        )
         if profile and profile in per_profile:
             return per_profile[profile]
+        if has_transport_owner and profile:
+            active_profile = None
+            active_profile_fn = getattr(self, "_active_profile_name", None)
+            if callable(active_profile_fn):
+                try:
+                    active_profile = active_profile_fn()
+                except Exception:
+                    active_profile = None
+            if profile != active_profile:
+                return None
+        if not has_transport_owner and not is_legacy:
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -395,48 +527,64 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
-        # Home Assistant events are system-generated (state changes), not
-        # user-initiated messages.  The HASS_TOKEN already authenticates the
-        # connection, so HA events are always authorized.
-        # Webhook events are authenticated via HMAC signature validation in
-        # the adapter itself — no user allowlist applies.
+        # Every network/platform authorization path depends on the physical
+        # credential that received the message. Historical unstamped records may
+        # use the narrowly-scoped compatibility path; fresh ownerless sources
+        # fail closed before adapter-level trust or allowlist policy is consulted.
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
+        if not has_transport_owner and not is_legacy:
+            return False
+
+        # Home Assistant and webhook adapters authenticate the transport itself
+        # (bearer token / HMAC), so no per-user allowlist applies after provenance
+        # proves this source actually crossed that adapter boundary.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
 
-        # Relay (and any adapter whose authorization is enforced by a trusted
-        # authenticated upstream): the Team Gateway connector authenticates this
-        # gateway's WS with a per-instance secret and resolves owner-only author
-        # bindings BEFORE delivering, so an inbound relay event was already
-        # authorized as this instance's bound user (the author id is the one the
-        # connector observed, never gateway-asserted). There is no local
-        # RELAY_ALLOWED_USERS env allowlist to consult, and default-denying for
-        # its absence is the bug this branch fixes. This is delegation to a
-        # trusted upstream, NOT a fail-open: it fires only for an event that was
-        # actually delivered over the authenticated relay WS (the transport
-        # stamps ``delivered_via_upstream_relay``), or whose platform's adapter
-        # explicitly declares ``authorization_is_upstream=True``; every direct
-        # network-exposed adapter leaves the flag False and its events unmarked,
-        # so the env-allowlist default-deny below still applies unchanged.
-        #
-        # The delivery marker is the PRIMARY signal: a relay *message* inbound
-        # carries the UNDERLYING platform (``source.platform`` == discord/…),
-        # NOT ``Platform.RELAY``, because that's what session-keying and egress
-        # need — so keying authz off ``source.platform`` would miss (the relay
-        # adapter is registered under ``Platform.RELAY``) and default-deny the
-        # user ("Unauthorized user <id> on discord"). The adapter-flag check is
-        # retained for events whose ``source.platform`` IS ``Platform.RELAY``
-        # (e.g. the interaction-passthrough path).
-        # ``is True`` (not just truthiness): the marker is a real bool on a
-        # SessionSource, and an explicit identity check refuses to authorize a
-        # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
-        # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
-            source.platform,
-            profile=adapter_profile,
-        ):
-            return True
+        # Honor upstream authorization only from the current PHYSICAL owner.
+        # Logical platform data and the relay-delivery marker are routing hints,
+        # not authority by themselves. Underlying-platform Relay ingress must
+        # prove the exact connector account plus advertised platform; passthrough
+        # ``Platform.RELAY`` events have no restorable underlying identity and
+        # therefore require the exact same-process RelayAdapter generation.
+        if has_transport_owner:
+            source_attrs = getattr(source, "__dict__", {})
+            transport_platform = source_attrs.get("_transport_platform")
+            owner_adapter = self._adapter_for_source(source)
+            upstream_authorized = (
+                owner_adapter is not None
+                and getattr(owner_adapter, "authorization_is_upstream", False)
+                is True
+            )
+            if upstream_authorized and transport_platform == Platform.RELAY:
+                if source.platform == Platform.RELAY:
+                    if self._registered_transport_adapter(source) is owner_adapter:
+                        return True
+                elif source.delivered_via_upstream_relay is True:
+                    expected_identity = source_attrs.get("_transport_identity")
+                    matches_identity = getattr(
+                        owner_adapter, "matches_transport_identity", None
+                    )
+                    fronts = getattr(owner_adapter, "fronts_platform", None)
+                    if (
+                        expected_identity is not None
+                        and callable(matches_identity)
+                        and matches_identity(str(expected_identity))
+                        and callable(fronts)
+                        and fronts(source.platform)
+                    ):
+                        return True
+            elif (
+                upstream_authorized
+                and transport_platform == source.platform
+            ):
+                # Non-Relay upstream-authenticated adapters (for example A2A)
+                # retain their contract, but only through their trusted current
+                # owner rather than a logical platform lookup.
+                return True
 
         user_id = source.user_id
 
