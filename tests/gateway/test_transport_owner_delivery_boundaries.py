@@ -874,6 +874,420 @@ async def test_recovery_missing_secondary_owner_never_uses_primary(isolated_ledg
 
 
 @pytest.mark.asyncio
+async def test_recovery_persists_attempting_before_transport_egress(isolated_ledger):
+    dl.record_obligation(
+        obligation_id="pending-egress-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("pending-egress-row")
+
+    observed = []
+
+    async def inspect_state_at_egress(*_args, **_kwargs):
+        with dl._connect() as conn:
+            observed.append(
+                conn.execute(
+                    "SELECT state, attempts FROM delivery_obligations "
+                    "WHERE obligation_id='pending-egress-row'"
+                ).fetchone()
+            )
+        return SendResult(success=True)
+
+    primary = _adapter("primary")
+    primary.send.side_effect = inspect_state_at_egress
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    assert observed == [("attempting", 1)]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_checkpoint_refunds_before_transport_egress(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="cancelled-checkpoint-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("cancelled-checkpoint-row")
+
+    checkpoint_started = threading.Event()
+    allow_checkpoint = threading.Event()
+    checkpoint_finished = threading.Event()
+    real_mark_attempting = dl.mark_attempting
+
+    def blocked_mark_attempting(obligation_id, **kwargs):
+        checkpoint_started.set()
+        try:
+            assert allow_checkpoint.wait(timeout=5)
+            return real_mark_attempting(obligation_id, **kwargs)
+        finally:
+            checkpoint_finished.set()
+
+    monkeypatch.setattr(dl, "mark_attempting", blocked_mark_attempting)
+
+    primary = _adapter("primary")
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    recovery = asyncio.create_task(runner._redeliver_pending_obligations())
+    assert await asyncio.to_thread(checkpoint_started.wait, 5)
+    recovery.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await recovery
+
+        with dl._connect() as conn:
+            row = conn.execute(
+                "SELECT state, attempts, owner_pid, owner_started_at, "
+                "recovery_claim FROM delivery_obligations "
+                "WHERE obligation_id='cancelled-checkpoint-row'"
+            ).fetchone()
+        assert row == ("pending", 0, None, None, None)
+        primary.send.assert_not_awaited()
+    finally:
+        allow_checkpoint.set()
+        assert await asyncio.to_thread(checkpoint_finished.wait, 5)
+
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at, "
+            "recovery_claim FROM delivery_obligations "
+            "WHERE obligation_id='cancelled-checkpoint-row'"
+        ).fetchone()
+    assert row == ("pending", 0, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_recovery_checkpoint_error_refunds_before_transport_egress(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="failed-checkpoint-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("failed-checkpoint-row")
+
+    def fail_checkpoint(*_args, **_kwargs):
+        raise RuntimeError("checkpoint unavailable")
+
+    monkeypatch.setattr(dl, "mark_attempting", fail_checkpoint)
+
+    primary = _adapter("primary")
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 0
+    primary.send.assert_not_awaited()
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at, "
+            "recovery_claim FROM delivery_obligations "
+            "WHERE obligation_id='failed-checkpoint-row'"
+        ).fetchone()
+    assert row == ("pending", 0, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_releases_owner_but_preserves_ambiguity(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="cancelled-egress-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("cancelled-egress-row")
+
+    entered = asyncio.Event()
+    block = asyncio.Event()
+
+    async def block_after_egress(*_args, **_kwargs):
+        entered.set()
+        await block.wait()
+        return SendResult(success=True)
+
+    primary = _adapter("primary")
+    primary.send.side_effect = block_after_egress
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    recovery = asyncio.create_task(runner._redeliver_pending_obligations())
+    await entered.wait()
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at "
+            "FROM delivery_obligations "
+            "WHERE obligation_id='cancelled-egress-row'"
+        ).fetchone()
+    assert row == ("attempting", 1, None, None)
+
+    claimed = dl.sweep_recoverable()
+    assert len(claimed) == 1
+    assert claimed[0]["needs_marker"] is True
+    assert claimed[0]["attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_refunds_unprocessed_batch_claims(isolated_ledger):
+    for obligation_id, content in (
+        ("batch-current-row", "current answer"),
+        ("batch-unprocessed-row", "unprocessed answer"),
+    ):
+        dl.record_obligation(
+            obligation_id=obligation_id,
+            session_key=f"agent:main:slack:channel:{obligation_id}",
+            platform="slack",
+            chat_id=obligation_id,
+            thread_id=None,
+            content=content,
+        )
+        _orphan(obligation_id)
+
+    entered = asyncio.Event()
+    block = asyncio.Event()
+
+    async def block_first_send(*_args, **_kwargs):
+        entered.set()
+        await block.wait()
+        return SendResult(success=True)
+
+    primary = _adapter("primary")
+    primary.send.side_effect = block_first_send
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    recovery = asyncio.create_task(runner._redeliver_pending_obligations())
+    await entered.wait()
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+
+    with dl._connect() as conn:
+        rows = conn.execute(
+            "SELECT obligation_id, state, attempts, owner_pid, recovery_claim "
+            "FROM delivery_obligations ORDER BY obligation_id"
+        ).fetchall()
+    assert rows == [
+        ("batch-current-row", "attempting", 1, None, None),
+        ("batch-unprocessed-row", "pending", 0, 999999999, None),
+    ]
+
+    claimed = {
+        row["obligation_id"]: row for row in dl.sweep_recoverable()
+    }
+    assert claimed["batch-current-row"]["needs_marker"] is True
+    assert claimed["batch-current-row"]["attempts"] == 2
+    assert claimed["batch-unprocessed-row"]["needs_marker"] is False
+    assert claimed["batch-unprocessed-row"]["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_waits_for_claim_thread_and_refunds(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="cancelled-claim-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("cancelled-claim-row")
+
+    claimed_in_thread = threading.Event()
+    allow_claim_return = threading.Event()
+    claim_thread_finished = threading.Event()
+    real_sweep = dl.sweep_recoverable
+
+    def claim_then_block(*args, **kwargs):
+        rows = real_sweep(*args, **kwargs)
+        claimed_in_thread.set()
+        try:
+            assert allow_claim_return.wait(timeout=5)
+            return rows
+        finally:
+            claim_thread_finished.set()
+
+    monkeypatch.setattr(dl, "sweep_recoverable", claim_then_block)
+
+    primary = _adapter("primary")
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    recovery = asyncio.create_task(runner._redeliver_pending_obligations())
+    assert await asyncio.to_thread(claimed_in_thread.wait, 5)
+    recovery.cancel()
+    allow_claim_return.set()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    assert await asyncio.to_thread(claim_thread_finished.wait, 5)
+
+    primary.send.assert_not_awaited()
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at, "
+            "recovery_claim FROM delivery_obligations "
+            "WHERE obligation_id='cancelled-claim-row'"
+        ).fetchone()
+    assert row == ("pending", 0, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recovery_settlement_cannot_strand_or_stale_finalize_claim(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="cancelled-settlement-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("cancelled-settlement-row")
+
+    settlement_started = threading.Event()
+    allow_settlement = threading.Event()
+    settlement_finished = threading.Event()
+    real_mark_delivered = dl.mark_delivered
+
+    def blocked_mark_delivered(obligation_id, **kwargs):
+        settlement_started.set()
+        try:
+            assert allow_settlement.wait(timeout=5)
+            return real_mark_delivered(obligation_id, **kwargs)
+        finally:
+            settlement_finished.set()
+
+    monkeypatch.setattr(dl, "mark_delivered", blocked_mark_delivered)
+
+    primary = _adapter("primary")
+    primary.send.return_value = SendResult(success=True)
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    recovery = asyncio.create_task(runner._redeliver_pending_obligations())
+    assert await asyncio.to_thread(settlement_started.wait, 5)
+    recovery.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await recovery
+
+        with dl._connect() as conn:
+            row = conn.execute(
+                "SELECT state, attempts, owner_pid, owner_started_at "
+                "FROM delivery_obligations "
+                "WHERE obligation_id='cancelled-settlement-row'"
+            ).fetchone()
+        assert row == ("attempting", 1, None, None)
+    finally:
+        allow_settlement.set()
+        assert await asyncio.to_thread(settlement_finished.wait, 5)
+
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at "
+            "FROM delivery_obligations "
+            "WHERE obligation_id='cancelled-settlement-row'"
+        ).fetchone()
+    assert row == ("attempting", 1, None, None)
+
+
+@pytest.mark.asyncio
+async def test_recovery_settlement_error_releases_ambiguous_claim(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="failed-settlement-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    _orphan("failed-settlement-row")
+
+    def fail_settlement(*_args, **_kwargs):
+        raise RuntimeError("settlement unavailable")
+
+    monkeypatch.setattr(dl, "mark_delivered", fail_settlement)
+
+    primary = _adapter("primary")
+    primary.send.return_value = SendResult(success=True)
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 0
+    primary.send.assert_awaited_once()
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at, "
+            "recovery_claim FROM delivery_obligations "
+            "WHERE obligation_id='failed-settlement-row'"
+        ).fetchone()
+    assert row == ("attempting", 1, None, None, None)
+
+    claimed = dl.sweep_recoverable()
+    assert len(claimed) == 1
+    assert claimed[0]["needs_marker"] is True
+    assert claimed[0]["attempts"] == 2
+
+
+@pytest.mark.asyncio
 async def test_recovery_route_disappearing_after_claim_releases_budget(
     isolated_ledger, monkeypatch
 ):
@@ -1008,6 +1422,89 @@ async def test_recovery_owner_disappearing_immediately_before_send_releases_budg
             ("pre-send-vanished-row",),
         ).fetchone()
     assert row == (0, None, None)
+
+
+@pytest.mark.asyncio
+async def test_recovery_re_resolves_stamped_owner_after_attempting_checkpoint(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="checkpoint-reconnect-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_platform="slack",
+        transport_profile="coder",
+        transport_profile_stamped=True,
+    )
+    _orphan("checkpoint-reconnect-row")
+
+    stale = _adapter("stale")
+    replacement = _adapter("replacement")
+    runner = _runner(coder=stale)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+    real_mark_attempting = dl.mark_attempting
+
+    def checkpoint_then_reconnect(obligation_id, **kwargs):
+        transitioned = real_mark_attempting(obligation_id, **kwargs)
+        runner._profile_adapters["coder"][Platform.SLACK] = replacement
+        return transitioned
+
+    monkeypatch.setattr(dl, "mark_attempting", checkpoint_then_reconnect)
+
+    assert await runner._redeliver_pending_obligations() == 1
+    stale.send.assert_not_awaited()
+    replacement.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_owner_disappearing_during_checkpoint_refunds_claim(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="checkpoint-vanished-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_platform="slack",
+        transport_profile="coder",
+        transport_profile_stamped=True,
+    )
+    _orphan("checkpoint-vanished-row")
+
+    stale = _adapter("stale")
+    runner = _runner(coder=stale)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+    real_mark_attempting = dl.mark_attempting
+
+    def checkpoint_then_disconnect(obligation_id, **kwargs):
+        transitioned = real_mark_attempting(obligation_id, **kwargs)
+        runner._profile_adapters = {}
+        return transitioned
+
+    monkeypatch.setattr(dl, "mark_attempting", checkpoint_then_disconnect)
+
+    assert await runner._redeliver_pending_obligations() == 0
+    stale.send.assert_not_awaited()
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT state, attempts, owner_pid, owner_started_at, "
+            "recovery_claim FROM delivery_obligations "
+            "WHERE obligation_id='checkpoint-vanished-row'"
+        ).fetchone()
+    assert row == ("pending", 0, None, None, None)
 
 
 def test_release_claim_rejects_foreign_owner(isolated_ledger):

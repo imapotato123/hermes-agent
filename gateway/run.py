@@ -10959,6 +10959,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_attempting,
                 mark_delivered,
                 mark_failed,
                 release_claim,
@@ -11030,19 +11031,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             None,
                         )
                     )
-            claimed = await asyncio.to_thread(
-                sweep_recoverable,
-                None,
-                deliverable_routes=_deliverable_routes,
-            )
         except Exception:
-            logger.debug("delivery ledger sweep failed", exc_info=True)
-            return 0
-        if not claimed:
+            logger.debug("delivery ledger setup failed", exc_info=True)
             return 0
 
         redelivered = 0
-        for row in claimed:
+        considered_obligation_ids: set[str] = set()
+        while True:
+            claim_task = asyncio.create_task(
+                asyncio.to_thread(
+                    sweep_recoverable,
+                    None,
+                    deliverable_routes=_deliverable_routes,
+                    max_claims=1,
+                    exclude_obligation_ids=considered_obligation_ids,
+                )
+            )
+            try:
+                claimed = await asyncio.shield(claim_task)
+            except asyncio.CancelledError:
+                try:
+                    claimed = await asyncio.shield(claim_task)
+                    for claimed_row in claimed:
+                        recovery_claim = claimed_row.get("recovery_claim")
+                        claimed_state = claimed_row.get("claimed_state")
+                        if isinstance(recovery_claim, str) and recovery_claim:
+                            await asyncio.shield(
+                                asyncio.to_thread(
+                                    release_claim,
+                                    claimed_row["obligation_id"],
+                                    recovery_claim=recovery_claim,
+                                    restore_state=claimed_state,
+                                )
+                            )
+                except Exception:
+                    logger.debug(
+                        "delivery ledger cancelled-claim cleanup failed",
+                        exc_info=True,
+                    )
+                raise
+            except Exception:
+                logger.debug("delivery ledger sweep failed", exc_info=True)
+                return redelivered
+            if not claimed:
+                return redelivered
+            row = claimed[0]
+            considered_obligation_ids.add(str(row.get("obligation_id", "")))
+            _recovery_claim = row.get("recovery_claim")
+            _claimed_state = row.get("claimed_state")
+            if not isinstance(_recovery_claim, str) or not _recovery_claim:
+                logger.error(
+                    "obligation %s: sweep returned no recovery claim",
+                    row.get("obligation_id"),
+                )
+                continue
+            if _claimed_state not in {"pending", "attempting", "failed"}:
+                logger.error(
+                    "obligation %s: sweep returned invalid claimed state %r",
+                    row.get("obligation_id"),
+                    _claimed_state,
+                )
+                continue
             _recovery_source: Optional[SessionSource] = None
             try:
                 platform = Platform(row["platform"])
@@ -11053,7 +11102,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     await asyncio.to_thread(
-                        release_claim, row["obligation_id"]
+                        release_claim,
+                        row["obligation_id"],
+                        recovery_claim=_recovery_claim,
                     )
                 except Exception:
                     logger.debug(
@@ -11083,7 +11134,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     try:
                         await asyncio.to_thread(
-                            release_claim, row["obligation_id"]
+                            release_claim,
+                            row["obligation_id"],
+                            recovery_claim=_recovery_claim,
                         )
                     except Exception:
                         logger.debug(
@@ -11111,7 +11164,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Fail closed and restore the recovery budget for a later boot.
                 try:
                     await asyncio.to_thread(
-                        release_claim, row["obligation_id"]
+                        release_claim,
+                        row["obligation_id"],
+                        recovery_claim=_recovery_claim,
                     )
                 except Exception:
                     logger.debug(
@@ -11132,6 +11187,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else None
                 )
             )
+            _egress_started = False
             try:
                 if row.get("transport_profile_stamped"):
                     assert _recovery_source is not None
@@ -11140,48 +11196,182 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if send is None:
                         await asyncio.to_thread(
-                            release_claim, row["obligation_id"]
+                            release_claim,
+                            row["obligation_id"],
+                            recovery_claim=_recovery_claim,
                         )
                         continue
                     if adapter is not None:
                         prime = getattr(adapter, "prime_routing_source", None)
                         if callable(prime):
                             prime(_recovery_source)
+                    transitioned = await asyncio.to_thread(
+                        mark_attempting,
+                        row["obligation_id"],
+                        recovery_claim=_recovery_claim,
+                    )
+                    if not transitioned:
+                        logger.warning(
+                            "obligation %s: recovery claim changed before egress",
+                            row["obligation_id"],
+                        )
+                        continue
+                    adapter, send = self._live_delivery_operation(
+                        _recovery_source, adapter, "send"
+                    )
+                    if send is None:
+                        await asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            recovery_claim=_recovery_claim,
+                            restore_state=_claimed_state,
+                        )
+                        continue
+                    if adapter is not None:
+                        prime = getattr(adapter, "prime_routing_source", None)
+                        if callable(prime):
+                            prime(_recovery_source)
+                    _egress_started = True
                     result = await send(
                         chat_id=row["chat_id"],
                         content=content,
                         metadata=metadata,
                     )
                 else:
-                    result = await cast(Any, adapter).send(
+                    transitioned = await asyncio.to_thread(
+                        mark_attempting,
+                        row["obligation_id"],
+                        recovery_claim=_recovery_claim,
+                    )
+                    if not transitioned:
+                        logger.warning(
+                            "obligation %s: recovery claim changed before egress",
+                            row["obligation_id"],
+                        )
+                        continue
+                    adapter = self.adapters.get(platform)
+                    send = getattr(adapter, "send", None)
+                    if adapter is None or not callable(send):
+                        await asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            recovery_claim=_recovery_claim,
+                            restore_state=_claimed_state,
+                        )
+                        continue
+                    _egress_started = True
+                    result = await cast(Any, send)(
                         chat_id=row["chat_id"],
                         content=content,
                         metadata=metadata,
                     )
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            consume_attempt=_egress_started,
+                            recovery_claim=_recovery_claim,
+                            restore_state=(
+                                None if _egress_started else _claimed_state
+                            ),
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: cancelled-send claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
+                raise
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
                     row["obligation_id"], send_err,
                 )
+                if not _egress_started:
+                    try:
+                        await asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            recovery_claim=_recovery_claim,
+                            restore_state=_claimed_state,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: pre-egress claim release failed",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                    continue
                 result = None
             try:
                 if result is not None and getattr(result, "success", False):
-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
-                    redelivered += 1
-                    logger.info(
-                        "Redelivered recovered final response to %s:%s "
-                        "(obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"],
-                        row["obligation_id"], row["attempts"],
+                    settled = await asyncio.to_thread(
+                        mark_delivered,
+                        row["obligation_id"],
+                        recovery_claim=_recovery_claim,
                     )
+                    if settled:
+                        redelivered += 1
+                        logger.info(
+                            "Redelivered recovered final response to %s:%s "
+                            "(obligation %s, attempt %d)",
+                            row["platform"], row["chat_id"],
+                            row["obligation_id"], row["attempts"],
+                        )
+                    else:
+                        logger.warning(
+                            "obligation %s: recovery claim changed before settlement",
+                            row["obligation_id"],
+                        )
                 else:
-                    await asyncio.to_thread(
+                    settled = await asyncio.to_thread(
                         mark_failed,
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
+                        recovery_claim=_recovery_claim,
                     )
+                    if not settled:
+                        logger.warning(
+                            "obligation %s: recovery claim changed before failure settlement",
+                            row["obligation_id"],
+                        )
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            consume_attempt=True,
+                            recovery_claim=_recovery_claim,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: cancelled-settlement claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
+                raise
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(
+                            release_claim,
+                            row["obligation_id"],
+                            consume_attempt=True,
+                            recovery_claim=_recovery_claim,
+                        )
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: failed-settlement claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
 
             # The answer reached (or was owed to) this session. Its resume
             # marker was cleared before sweeping, including for unavailable
