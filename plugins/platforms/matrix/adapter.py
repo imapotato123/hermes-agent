@@ -2494,6 +2494,8 @@ class MatrixAdapter(BasePlatformAdapter):
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send multiple Matrix images as one ordered logical batch."""
         if not images:
@@ -2504,6 +2506,14 @@ class MatrixAdapter(BasePlatformAdapter):
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
                 await asyncio.sleep(human_delay)
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images[idx - 1 :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             caption = alt_text or None
             if total > 1 and caption:
                 caption = f"{caption} ({idx}/{total})"

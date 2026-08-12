@@ -11,7 +11,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -23,6 +23,7 @@ def _make_event(text="/background", platform=Platform.TELEGRAM,
         chat_id=chat_id,
         user_name="testuser",
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(text=text, source=source)
 
 
@@ -105,6 +106,7 @@ class TestRunBackgroundTask:
             chat_id="67890",
             user_name="testuser",
         )
+        stamp_source_transport_owner(source, profile=None)
 
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
             await runner._run_background_task("test prompt", source, "bg_test")
@@ -130,6 +132,7 @@ class TestRunBackgroundTask:
             chat_id="67890",
             user_name="testuser",
         )
+        stamp_source_transport_owner(source, profile=None)
 
         mock_result = {"final_response": "Hello from background!", "messages": []}
 

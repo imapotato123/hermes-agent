@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_adapter(
@@ -269,6 +269,7 @@ def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkey
         user_id=None,
         user_name=None,
     )
+    stamp_source_transport_owner(source, profile=None)
 
     monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100")
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)

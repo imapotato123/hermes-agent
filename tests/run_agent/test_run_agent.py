@@ -4514,6 +4514,20 @@ class TestHookPayloadSanitizesSimpleNamespace:
         result = AIAgent._sanitize_hook_payload(ns)
         assert result == {"id": "call_1", "value": 42, "nested": {"name": "x"}}
 
+    def test_hook_jsonable_omits_nonserializable_dataclass_fields(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource, stamp_source_transport_owner
+
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        stamp_source_transport_owner(source, profile="coder")
+
+        result = AIAgent._sanitize_hook_payload(source)
+        assert result["platform"] == "slack"
+        assert result["chat_id"] == "C1"
+        assert "_transport_profile" not in result
+        assert "_transport_profile_stamped" not in result
+        assert "_transport_adapter_ref" not in result
+
     def test_api_response_payload_for_hook_normalizes_simplenamespace_tool_calls(self, agent):
         # Shape mirrors agent/bedrock_adapter.py::normalize_converse_response and
         # agent/codex_responses_adapter.py — raw SDK objects are SimpleNamespace.
@@ -4599,6 +4613,96 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "Invalid API response" in result["error"]
         assert result.get("final_response") == result["error"]
+        assert result["failure_reason"] == "unknown"
+
+    @pytest.mark.parametrize(
+        ("status_code", "failure_reason"),
+        [
+            (401, "auth"),
+            (402, "billing"),
+            (408, "timeout"),
+            (429, "rate_limit"),
+            (500, "server_error"),
+            (502, "server_error"),
+            (503, "overloaded"),
+            (504, "timeout"),
+            (524, "timeout"),
+            (529, "overloaded"),
+        ],
+    )
+    def test_invalid_response_status_carries_structured_reason(
+        self, agent, status_code, failure_reason
+    ):
+        """Production invalid-response returns preserve status taxonomy."""
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+        bad_resp = SimpleNamespace(
+            choices=[],
+            error=SimpleNamespace(code=status_code),
+            model="test/model",
+            usage=None,
+        )
+        agent.client.chat.completions.create.return_value = bad_resp
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == failure_reason
+
+    def test_transient_failure_result_carries_structured_reason(self, agent):
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=TimeoutError("provider request timed out"),
+            ),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "timeout"
+
+    def test_nonretryable_auth_result_carries_structured_excluded_reason(self, agent):
+        self._setup_agent(agent)
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+
+        class UnauthorizedError(RuntimeError):
+            status_code = 401
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=UnauthorizedError("invalid API key"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "auth"
 
     def test_invalid_response_retry_completes_one_logical_call(self, agent):
         self._setup_agent(agent)

@@ -21,7 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import SessionSource, source_has_transport_owner
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -106,7 +106,7 @@ class GatewayAuthorizationMixin:
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name and profile_name != "default":
+        if profile_name:
             active_profile = None
             active_profile_fn = getattr(self, "_active_profile_name", None)
             if callable(active_profile_fn):
@@ -120,9 +120,11 @@ class GatewayAuthorizationMixin:
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
-            # Fail closed: a stamped secondary profile with no registry entry
-            # (e.g. its adapter failed to connect) must NOT fall back to the
-            # default profile's adapter — that sends replies out the wrong bot.
+            # Fail closed: any explicitly stamped non-active profile with no
+            # registry entry (e.g. its adapter failed to connect) must NOT fall
+            # back to the active profile's adapter. ``default`` is a literal
+            # profile name, not an alias for ``self.adapters`` when another
+            # named profile is active.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)
@@ -147,12 +149,22 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
-        )
+        # ``source.profile`` names the runtime selected by profile_routes, not
+        # necessarily the credential that received the message. build_source()
+        # stamps the transport owner's profile separately and does not serialize
+        # it. If the original weakref is stale after reconnect, resolve the new
+        # generation from that owner instead of an unrelated routed profile.
+        if source_has_transport_owner(source):
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "_transport_profile", None),
+            )
+        # ``source.profile`` is only the routed runtime/session namespace. An
+        # unstamped restored or hand-built source has no authoritative physical
+        # credential owner, so it must not borrow that runtime's same-platform
+        # adapter. Trusted synthetic ingress is stamped by the selected live
+        # adapter before it reaches this resolver.
+        return None
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -164,6 +176,8 @@ class GatewayAuthorizationMixin:
         intake-policy checks stay on that transport without weakening the
         fail-closed fallback for restored or hand-built sources.
         """
+        if not source_has_transport_owner(source):
+            return None
         adapter_ref = getattr(source, "_transport_adapter_ref", None)
         adapter = adapter_ref() if callable(adapter_ref) else None
         platform = getattr(source, "platform", None)
@@ -189,7 +203,20 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
-        return getattr(source, "profile", None)
+        if source_has_transport_owner(source):
+            transport_profile = getattr(source, "_transport_profile", None)
+            transport_adapter = self._authorization_adapter(
+                platform, transport_profile
+            )
+            if transport_adapter is not None and transport_adapter is (
+                getattr(self, "adapters", None) or {}
+            ).get(platform):
+                return None
+            return transport_profile
+        # Runtime routing is not physical credential ownership. Returning the
+        # logical profile here would let restored/hand-built sources inherit its
+        # policy, allowlist, or pairing store.
+        return None
 
     def _adapter_authorization_is_upstream(
         self,
@@ -369,18 +396,32 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore owned by the source's receiving transport.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        ``source.profile`` is the routed runtime/session namespace and may differ
+        from the bot credential that received the message. Live adapter sources
+        stamp ``_transport_profile``; that owner is authoritative for pairing
+        isolation. A missing stamped secondary store fails closed rather than
+        consulting the active profile's global whitelist. Unstamped legacy
+        sources retain the historical runtime-profile/global fallback.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        has_transport_owner = source_has_transport_owner(source)
+        if not has_transport_owner:
+            return None
+        profile = getattr(source, "_transport_profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+        if has_transport_owner and profile:
+            active_profile = None
+            active_profile_fn = getattr(self, "_active_profile_name", None)
+            if callable(active_profile_fn):
+                try:
+                    active_profile = active_profile_fn()
+                except Exception:
+                    active_profile = None
+            if profile != active_profile:
+                return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -402,8 +443,6 @@ class GatewayAuthorizationMixin:
         # the adapter itself — no user allowlist applies.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
-
-        adapter_profile = self._adapter_profile_for_source(source)
 
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
@@ -432,7 +471,20 @@ class GatewayAuthorizationMixin:
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
+        if source.delivered_via_upstream_relay is True:
+            return True
+
+        # Every remaining network/platform authorization path depends on the
+        # physical adapter that received the message. A restored or hand-built
+        # source whose runtime-only owner stamp is absent cannot safely inherit
+        # the routed runtime's credentials, policy, pairing store, or upstream
+        # trust declaration.
+        if not source_has_transport_owner(source):
+            return False
+
+        adapter_profile = self._adapter_profile_for_source(source)
+
+        if self._adapter_authorization_is_upstream(
             source.platform,
             profile=adapter_profile,
         ):

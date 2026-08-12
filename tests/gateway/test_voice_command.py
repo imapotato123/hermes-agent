@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+import weakref
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -53,6 +54,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.session import stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +62,14 @@ from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 # ---------------------------------------------------------------------------
 
 def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") -> MessageEvent:
+    from gateway.config import Platform
+
     source = SessionSource(
         chat_id=chat_id,
         user_id="user1",
-        platform=MagicMock(),
+        platform=Platform.TELEGRAM,
     )
-    source.platform.value = "telegram"
+    stamp_source_transport_owner(source, profile=None)
     source.thread_id = None
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
@@ -173,9 +177,11 @@ class TestHandleVoiceCommand:
     @pytest.mark.asyncio
     async def test_platform_isolation(self, runner):
         """Same chat_id on different platforms must not collide (#12542)."""
+        from gateway.config import Platform
+
         telegram_event = _make_event("/voice on", chat_id="999")
         slack_event = _make_event("/voice off", chat_id="999")
-        slack_event.source.platform.value = "slack"
+        slack_event.source.platform = Platform.SLACK
 
         await runner._handle_voice_command(telegram_event)
         await runner._handle_voice_command(slack_event)
@@ -300,10 +306,12 @@ class TestSendVoiceReply:
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send_voice = AsyncMock()
         event = _make_event()
         event.source.platform = Platform.TELEGRAM
         runner.adapters[event.source.platform] = mock_adapter
+        event.source._transport_adapter_ref = weakref.ref(mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -325,6 +333,7 @@ class TestSendVoiceReply:
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send_voice = AsyncMock()
         event = _make_event()
         event.source.platform = Platform.TELEGRAM
@@ -332,6 +341,7 @@ class TestSendVoiceReply:
         event.source.thread_id = "20197"
         event.message_id = "462"
         runner.adapters[event.source.platform] = mock_adapter
+        event.source._transport_adapter_ref = weakref.ref(mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -535,12 +545,14 @@ class TestVoiceChannelCommands:
     def _make_discord_event(self, text="/voice channel", chat_id="123",
                             guild_id=111, user_id="user1"):
         """Create event with raw_message carrying guild info."""
+        from gateway.config import Platform
+
         source = SessionSource(
             chat_id=chat_id,
             user_id=user_id,
-            platform=MagicMock(),
+            platform=Platform.DISCORD,
         )
-        source.platform.value = "discord"
+        stamp_source_transport_owner(source, profile=None)
         source.thread_id = None
         event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
         event.message_id = "msg42"
@@ -680,6 +692,202 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "group"
         assert event.source.chat_name == "Hermes Server / #general"
         assert event.source.user_id == "42"
+
+    @pytest.mark.asyncio
+    async def test_input_authorizes_against_bound_transport_owner(
+        self, monkeypatch
+    ):
+        """Restored voice metadata must not authorize through its routed runtime."""
+        import weakref
+
+        from gateway.config import GatewayConfig, Platform
+        from gateway.run import GatewayRunner
+
+        for key in (
+            "DISCORD_ALLOWED_USERS",
+            "DISCORD_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        class VoiceAdapter:
+            authorization_is_upstream = False
+            enforces_own_access_policy = False
+            platform = Platform.DISCORD
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._active_profile_name = lambda: "main"
+        runner._recent_voice_transcripts = {}
+
+        primary = VoiceAdapter()
+        primary._transport_profile = "main"
+        primary._voice_text_channels = {111: 123}
+        primary._voice_sources = {
+            111: SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                user_id="original-user",
+                chat_type="channel",
+                profile="routed",
+            ).to_dict()
+        }
+        primary._client = SimpleNamespace(get_channel=lambda _chat_id: None)
+        primary.handle_message = AsyncMock()
+
+        routed = VoiceAdapter()
+        routed.authorization_is_upstream = True
+        runner.adapters = {Platform.DISCORD: primary}
+        runner._profile_adapters = {
+            "routed": {Platform.DISCORD: routed},
+        }
+
+        primary_store = MagicMock()
+        primary_store.is_approved.return_value = False
+        routed_store = MagicMock()
+        routed_store.is_approved.return_value = True
+        runner.pairing_store = primary_store
+        runner.pairing_stores = {
+            "main": primary_store,
+            "routed": routed_store,
+        }
+
+        await runner._handle_voice_channel_input(
+            111,
+            42,
+            "authorization probe",
+            transport_adapter_ref=weakref.ref(primary),
+            transport_profile="main",
+        )
+
+        primary.handle_message.assert_not_awaited()
+        primary_store.is_approved.assert_called_once_with("discord", "42")
+        routed_store.is_approved.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport_profile", ["coder", "default"])
+    async def test_bound_secondary_callback_stamps_its_transport_owner(
+        self, monkeypatch, transport_profile
+    ):
+        """A secondary callback carries exact credential identity into authz."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.run import GatewayRunner
+
+        for key in (
+            "DISCORD_ALLOWED_USERS",
+            "DISCORD_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        class VoiceAdapter:
+            authorization_is_upstream = False
+            enforces_own_access_policy = False
+            platform = Platform.DISCORD
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._active_profile_name = lambda: "main"
+        runner._recent_voice_transcripts = {}
+
+        primary = VoiceAdapter()
+        secondary = VoiceAdapter()
+        secondary._transport_profile = transport_profile
+        secondary._voice_input_callback = None
+        secondary._voice_text_channels = {111: 123}
+        secondary._voice_sources = {
+            111: SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                user_id="original-user",
+                chat_type="channel",
+                profile="routed",
+            ).to_dict()
+        }
+        secondary._client = SimpleNamespace(get_channel=lambda _chat_id: None)
+        secondary.handle_message = AsyncMock()
+
+        runner.adapters = {Platform.DISCORD: primary}
+        runner._profile_adapters = {
+            transport_profile: {Platform.DISCORD: secondary},
+        }
+
+        primary_store = MagicMock()
+        primary_store.is_approved.return_value = False
+        routed_store = MagicMock()
+        routed_store.is_approved.return_value = False
+        owner_store = MagicMock()
+        owner_store.is_approved.return_value = True
+        runner.pairing_store = primary_store
+        runner.pairing_stores = {
+            "main": primary_store,
+            "routed": routed_store,
+            transport_profile: owner_store,
+        }
+
+        runner._bind_voice_input_callback(secondary)
+        await secondary._voice_input_callback(
+            guild_id=111,
+            user_id=42,
+            transcript="secondary probe",
+        )
+
+        secondary.handle_message.assert_awaited_once()
+        event = secondary.handle_message.await_args.args[0]
+        assert event.source.profile == "routed"
+        assert event.source._transport_profile == transport_profile
+        assert event.source._transport_adapter_ref() is secondary
+        assert "_transport_profile" not in event.source.to_dict()
+        assert "_transport_adapter_ref" not in event.source.to_dict()
+        owner_store.is_approved.assert_called_once_with("discord", "42")
+        primary_store.is_approved.assert_not_called()
+        routed_store.is_approved.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_bound_callback_fails_closed_after_replacement(self):
+        """A disconnected voice generation cannot authorize after replacement."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.run import GatewayRunner
+
+        class VoiceAdapter:
+            authorization_is_upstream = False
+            enforces_own_access_policy = False
+            platform = Platform.DISCORD
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._active_profile_name = lambda: "main"
+        runner._recent_voice_transcripts = {}
+
+        stale = VoiceAdapter()
+        stale._transport_profile = "coder"
+        stale._voice_input_callback = None
+        stale.handle_message = AsyncMock()
+        replacement = VoiceAdapter()
+
+        owner_store = MagicMock()
+        owner_store.is_approved.return_value = True
+        runner.pairing_store = MagicMock()
+        runner.pairing_stores = {"coder": owner_store}
+        runner.adapters = {}
+        runner._profile_adapters = {
+            "coder": {Platform.DISCORD: stale},
+        }
+
+        runner._bind_voice_input_callback(stale)
+        callback = stale._voice_input_callback
+        runner._profile_adapters["coder"][Platform.DISCORD] = replacement
+
+        await callback(
+            guild_id=111,
+            user_id=42,
+            transcript="stale probe",
+        )
+
+        stale.handle_message.assert_not_awaited()
+        owner_store.is_approved.assert_not_called()
 
 
     # -- _get_guild_id --

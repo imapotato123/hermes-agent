@@ -184,7 +184,12 @@ class SessionSource:
     profile: Optional[str] = None
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
-    profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    profile_route_rejected: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -217,7 +222,34 @@ class SessionSource:
     # Set locally by the relay transport (``ws_transport._event_from_wire``);
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
-    delivered_via_upstream_relay: bool = False
+    delivered_via_upstream_relay: bool = field(
+        default=False,
+        metadata={"serialize": False},
+    )
+
+    # Runtime-only physical transport provenance. Append these after all public
+    # fields so existing positional SessionSource constructors keep their exact
+    # argument mapping. Dataclasses.replace() retains them, while repr/equality
+    # and all wire/hook serializers omit them. The explicit sentinel separates
+    # unstamped, stamped primary (profile=None), and stamped named ownership.
+    _transport_adapter_ref: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
+    _transport_profile: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
+    _transport_profile_stamped: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -310,6 +342,33 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+
+
+def source_has_transport_owner(source: Any) -> bool:
+    """Whether *source* carries an explicit in-process transport-owner stamp."""
+    # Require the literal bool so duck-typed/MagicMock sources cannot fabricate
+    # provenance through a truthy auto-created attribute.
+    return getattr(source, "_transport_profile_stamped", False) is True
+
+
+def stamp_source_transport_owner(
+    source: Any,
+    *,
+    profile: Optional[str],
+    adapter_ref: Optional[Any] = None,
+) -> Any:
+    """Attach nonserialized physical transport provenance to *source*.
+
+    ``profile=None`` is a valid stamped primary/default owner; the separate
+    boolean sentinel is therefore authoritative. Returning *source* keeps this
+    convenient for synthetic-source construction without changing identity.
+    """
+    source._transport_profile = (
+        profile.strip() if isinstance(profile, str) and profile.strip() else None
+    )
+    source._transport_adapter_ref = adapter_ref
+    source._transport_profile_stamped = True
+    return source
     
 
 
@@ -862,6 +921,15 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
+    # Durable physical transport ownership for restart recovery. This belongs
+    # to the gateway's private routing entry, not SessionSource's public/wire
+    # serialization: the presence bit distinguishes legacy/unknown ownership
+    # from a valid unnamed primary owner (profile=None), while transport_platform
+    # distinguishes relay-fronted ingress from a native same-platform adapter.
+    transport_owner_stamped: bool = False
+    transport_platform: Optional[str] = None
+    transport_profile: Optional[str] = None
+
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -904,6 +972,9 @@ class SessionEntry:
                 if self.active_turn_started_at
                 else None
             ),
+            "transport_owner_stamped": self.transport_owner_stamped,
+            "transport_platform": self.transport_platform,
+            "transport_profile": self.transport_profile,
             "is_fresh_reset": self.is_fresh_reset,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
@@ -953,6 +1024,31 @@ class SessionEntry:
             active_turn_token = None
             active_turn_started_at = None
 
+        transport_owner_stamped = data.get("transport_owner_stamped") is True
+        transport_platform = data.get("transport_platform")
+        transport_profile = data.get("transport_profile")
+        if not isinstance(transport_platform, str) or not transport_platform.strip():
+            transport_owner_stamped = False
+            transport_platform = None
+        else:
+            transport_platform = transport_platform.strip()
+            try:
+                Platform(transport_platform)
+            except ValueError:
+                transport_owner_stamped = False
+                transport_platform = None
+        if transport_profile is None:
+            pass
+        elif isinstance(transport_profile, str):
+            transport_profile = transport_profile.strip() or None
+        else:
+            transport_owner_stamped = False
+            transport_platform = None
+            transport_profile = None
+        if not transport_owner_stamped:
+            transport_platform = None
+            transport_profile = None
+
         session_key = data["session_key"]
         session_id = data["session_id"]
 
@@ -997,6 +1093,9 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            transport_owner_stamped=transport_owner_stamped,
+            transport_platform=transport_platform,
+            transport_profile=transport_profile,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -2928,7 +3027,12 @@ class SessionStore:
                 return True
         return False
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(
+        self,
+        session_key: str,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
         The opaque token is returned to the caller and must be supplied to
@@ -2945,6 +3049,24 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            transport_owner_stamped = False
+            transport_platform = None
+            transport_profile = None
+            if source_has_transport_owner(source):
+                platform = getattr(source, "platform", None)
+                platform_value = getattr(platform, "value", None)
+                if isinstance(platform_value, str) and platform_value:
+                    transport_owner_stamped = True
+                    transport_platform = platform_value
+                    transport_profile = getattr(
+                        source, "_transport_profile", None
+                    )
+            elif getattr(source, "delivered_via_upstream_relay", False) is True:
+                transport_owner_stamped = True
+                transport_platform = Platform.RELAY.value
+            candidate["transport_owner_stamped"] = transport_owner_stamped
+            candidate["transport_platform"] = transport_platform
+            candidate["transport_profile"] = transport_profile
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -2960,6 +3082,9 @@ class SessionStore:
             entry.active_turn_token = token
             entry.active_turn_started_at = now
             entry.updated_at = now
+            entry.transport_owner_stamped = transport_owner_stamped
+            entry.transport_platform = transport_platform
+            entry.transport_profile = transport_profile
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session import Platform, SessionSource
+from gateway.session import Platform, SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -59,24 +59,30 @@ def _make_bare_runner():
 
 
 def _make_discord_bot_source(bot_id: str = "999888777"):
-    return SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="123",
-        chat_type="channel",
-        user_id=bot_id,
-        user_name="SomeBot",
-        is_bot=True,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="channel",
+            user_id=bot_id,
+            user_name="SomeBot",
+            is_bot=True,
+        ),
+        profile=None,
     )
 
 
 def _make_discord_human_source(user_id: str = "100200300"):
-    return SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="123",
-        chat_type="channel",
-        user_id=user_id,
-        user_name="SomeHuman",
-        is_bot=False,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_type="channel",
+            user_id=user_id,
+            user_name="SomeHuman",
+            is_bot=False,
+        ),
+        profile=None,
     )
 
 
