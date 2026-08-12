@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import sqlite3
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -92,6 +93,44 @@ class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+    def test_existing_schema_migrates_transport_owner_columns(self):
+        path = dl._db_path()
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                content TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                last_error TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        _record()
+        with dl._connect() as migrated:
+            columns = {
+                row[1]
+                for row in migrated.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                ).fetchall()
+            }
+            owner = migrated.execute(
+                "SELECT transport_profile, transport_profile_stamped "
+                "FROM delivery_obligations WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert {"transport_profile", "transport_profile_stamped"} <= columns
+        assert owner == (None, 0)
 
 
 class TestObligationId:

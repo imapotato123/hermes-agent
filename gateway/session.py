@@ -184,7 +184,12 @@ class SessionSource:
     profile: Optional[str] = None
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
-    profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    profile_route_rejected: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -217,7 +222,34 @@ class SessionSource:
     # Set locally by the relay transport (``ws_transport._event_from_wire``);
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
-    delivered_via_upstream_relay: bool = False
+    delivered_via_upstream_relay: bool = field(
+        default=False,
+        metadata={"serialize": False},
+    )
+
+    # Runtime-only physical transport provenance. Append these after all public
+    # fields so existing positional SessionSource constructors keep their exact
+    # argument mapping. Dataclasses.replace() retains them, while repr/equality
+    # and all wire/hook serializers omit them. The explicit sentinel separates
+    # unstamped, stamped primary (profile=None), and stamped named ownership.
+    _transport_adapter_ref: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
+    _transport_profile: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
+    _transport_profile_stamped: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        metadata={"serialize": False},
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -310,6 +342,33 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+
+
+def source_has_transport_owner(source: Any) -> bool:
+    """Whether *source* carries an explicit in-process transport-owner stamp."""
+    # Require the literal bool so duck-typed/MagicMock sources cannot fabricate
+    # provenance through a truthy auto-created attribute.
+    return getattr(source, "_transport_profile_stamped", False) is True
+
+
+def stamp_source_transport_owner(
+    source: Any,
+    *,
+    profile: Optional[str],
+    adapter_ref: Optional[Any] = None,
+) -> Any:
+    """Attach nonserialized physical transport provenance to *source*.
+
+    ``profile=None`` is a valid stamped primary/default owner; the separate
+    boolean sentinel is therefore authoritative. Returning *source* keeps this
+    convenient for synthetic-source construction without changing identity.
+    """
+    source._transport_profile = (
+        profile.strip() if isinstance(profile, str) and profile.strip() else None
+    )
+    source._transport_adapter_ref = adapter_ref
+    source._transport_profile_stamped = True
+    return source
     
 
 

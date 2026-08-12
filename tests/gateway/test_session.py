@@ -1,5 +1,6 @@
 """Tests for gateway session management."""
 import json
+import weakref
 import pytest
 from dataclasses import replace
 from datetime import datetime
@@ -17,6 +18,8 @@ from gateway.session import (
     build_session_key,
     canonical_whatsapp_identifier,
     neutralize_untrusted_inline_text,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
 )
 
 # Legacy name preserved for these tests; product renamed the function to
@@ -55,6 +58,63 @@ class TestSessionSourceRoundtrip:
         assert restored.platform == Platform.LOCAL
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
+
+    def test_transport_owner_survives_replace_but_not_wire_roundtrip(self):
+        class Owner:
+            pass
+
+        owner = Owner()
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="routed",
+        )
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            adapter_ref=weakref.ref(owner),
+        )
+
+        copied = replace(source, chat_id="C2")
+        assert source_has_transport_owner(copied) is True
+        assert copied._transport_profile is None
+        assert copied._transport_adapter_ref() is owner
+        assert "_transport_profile" not in copied.to_dict()
+        assert "_transport_profile_stamped" not in copied.to_dict()
+        assert "_transport_adapter_ref" not in copied.to_dict()
+
+        restored = SessionSource.from_dict(copied.to_dict())
+        assert source_has_transport_owner(restored) is False
+        assert restored._transport_profile is None
+        assert restored._transport_adapter_ref is None
+
+        forged = dict(copied.to_dict())
+        forged.update(
+            {
+                "_transport_profile": "coder",
+                "_transport_profile_stamped": True,
+                "_transport_adapter_ref": "attacker-controlled",
+            }
+        )
+        restored_forgery = SessionSource.from_dict(forged)
+        assert source_has_transport_owner(restored_forgery) is False
+        assert restored_forgery._transport_profile is None
+        assert restored_forgery._transport_adapter_ref is None
+
+    def test_transport_owner_does_not_affect_source_equality(self):
+        plain = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        stamped = replace(plain)
+        stamp_source_transport_owner(stamped, profile="coder")
+
+        assert stamped == plain
+
+    def test_transport_owner_stamp_requires_literal_true(self):
+        source = MagicMock()
+        assert source_has_transport_owner(source) is False
+        source._transport_profile_stamped = 1
+        assert source_has_transport_owner(source) is False
+        source._transport_profile_stamped = True
+        assert source_has_transport_owner(source) is True
 
 
 class TestSessionSourceDescription:

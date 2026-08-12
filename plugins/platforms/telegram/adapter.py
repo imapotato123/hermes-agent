@@ -7109,6 +7109,8 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images natively via Telegram's media group API.
 
@@ -7121,9 +7123,17 @@ class TelegramAdapter(BasePlatformAdapter):
         opened as byte streams. On failure the whole batch falls back to
         the base adapter's per-image loop.
         """
-        if not self._bot:
-            return
         if not images:
+            return
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
+            return
+        if not self._bot:
             return
 
         try:
@@ -7133,7 +7143,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(
+                chat_id, images, metadata, human_delay, source=source
+            )
             return
 
         # Peel off animations — they need send_animation, not send_media_group
@@ -7149,6 +7161,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if animations:
             await super().send_multiple_images(
                 chat_id, animations, metadata, human_delay=human_delay,
+                source=source,
             )
 
         if not photos:
@@ -7162,6 +7175,14 @@ class TelegramAdapter(BasePlatformAdapter):
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
 
         for chunk_idx, chunk in enumerate(chunks):
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=photos[chunk_idx * CHUNK :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
@@ -7186,6 +7207,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 if not media:
                     continue
+
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=photos[chunk_idx * CHUNK :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
 
                 logger.info(
                     "[%s] Sending media group of %d photo(s) (chunk %d/%d)",
@@ -7231,6 +7261,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Fallback: send each photo in this chunk individually
                 await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay,
+                    source=source,
                 )
             finally:
                 for fh in opened_files:

@@ -1179,6 +1179,8 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images via chunked Signal RPC calls.
 
@@ -1189,6 +1191,14 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
+            return
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
             return
 
         scheduler = get_scheduler()
@@ -1243,6 +1253,15 @@ class SignalAdapter(BasePlatformAdapter):
             len(attachments), len(images),
         )
 
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
+            return
+
         base_params: Dict[str, Any] = {
             "account": self.account,
             "message": "",
@@ -1258,6 +1277,14 @@ class SignalAdapter(BasePlatformAdapter):
         ]
 
         for idx, att_batch in enumerate(att_batches):
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             n = len(att_batch)
             estimated = scheduler.estimate_wait(n)
             logger.debug(
@@ -1265,6 +1292,14 @@ class SignalAdapter(BasePlatformAdapter):
                 idx + 1, len(att_batches), n, estimated,
             )
             if estimated >= SIGNAL_BATCH_PACING_NOTICE_THRESHOLD:
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
                 await self._notify_batch_pacing(
                     chat_id, idx + 1, len(att_batches), estimated
                 )
@@ -1274,6 +1309,14 @@ class SignalAdapter(BasePlatformAdapter):
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
                 try:
                     _rpc_t0 = time.monotonic()
                     result = await self._rpc(
