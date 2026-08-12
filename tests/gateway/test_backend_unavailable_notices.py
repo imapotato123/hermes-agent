@@ -3,6 +3,7 @@
 import asyncio
 import time
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -279,6 +280,55 @@ async def test_failed_notice_delivery_does_not_arm_cooldown(monkeypatch, tmp_pat
         await adapter._process_message_background(event, build_session_key(event.source))
 
     assert [message["content"] for message in adapter.sent] == [_NOTICE]
+
+
+@pytest.mark.asyncio
+async def test_malformed_notice_result_releases_claim_for_retry(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    _wire_runner(
+        monkeypatch,
+        tmp_path,
+        adapter,
+        [
+            _backend_failure("ConnectError: connection refused"),
+            _backend_failure("ConnectError: connection refused"),
+        ],
+    )
+
+    class ExplodingSuccessResult:
+        @property
+        def success(self):
+            raise RuntimeError("malformed send result success")
+
+    delivery_results = iter(
+        [ExplodingSuccessResult(), SendResult(success=True, message_id="slack-2")]
+    )
+
+    async def malformed_then_success(*_args, **kwargs):
+        result = next(delivery_results)
+        if isinstance(result, SendResult) and result.success:
+            adapter.sent.append({"content": kwargs["content"]})
+        return result
+
+    cast(Any, adapter)._send_with_retry = malformed_then_success
+
+    first = _make_event("m-1")
+    await adapter._process_message_background(first, build_session_key(first.source))
+
+    assert adapter._backend_notice_state.inflight == set()
+    assert adapter._backend_notice_state._claim_results == {}
+    assert adapter._llm_error_last_posted == {}
+
+    second = _make_event("m-2")
+    await adapter._process_message_background(second, build_session_key(second.source))
+
+    contents = [message["content"] for message in adapter.sent]
+    assert contents == [
+        "Sorry, I encountered an internal error. "
+        "Please try again or use /reset to start a fresh session.",
+        _NOTICE,
+    ]
+    assert "malformed send result success" not in contents[0]
 
 
 @pytest.mark.asyncio
@@ -591,8 +641,8 @@ async def test_shared_runner_state_does_not_cross_suppress_profiles():
     assert [message["content"] for message in first.sent] == [_NOTICE]
     assert [message["content"] for message in second.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:alpha:agent:main:slack:channel:C123:171717",
-        "profile:beta:agent:main:slack:channel:C123:171717",
+        "profile:5:alpha:agent:main:slack:channel:C123:171717",
+        "profile:4:beta:agent:main:slack:channel:C123:171717",
     }
 
 
@@ -627,9 +677,726 @@ async def test_default_profile_does_not_collide_with_named_main_profile():
     assert [message["content"] for message in default_adapter.sent] == [_NOTICE]
     assert [message["content"] for message in named_main_adapter.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:default:agent:main:slack:channel:C123:171717",
-        "profile:main:agent:main:slack:channel:C123:171717",
+        "profile:7:default:agent:main:slack:channel:C123:171717",
+        "profile:4:main:agent:main:slack:channel:C123:171717",
     }
+
+
+def test_shared_notice_state_wiring_attaches_runner_for_direct_builtins():
+    adapter = CaptureSlackAdapter()
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner._backend_notice_state = BackendNoticeState()
+
+    runner._share_backend_notice_state(adapter, profile_name="default")
+
+    assert cast(Any, adapter).gateway_runner is runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routed_profile_has_slack", [False, True])
+async def test_routed_runtime_reconnect_uses_primary_transport_replacement(
+    monkeypatch,
+    tmp_path,
+    routed_profile_has_slack,
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    runner._profile_name_for_source = lambda source: "routed"
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="default")
+
+    routed_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(routed_adapter, profile_name="routed")
+    runner._profile_adapters = (
+        {"routed": {Platform.SLACK: routed_adapter}}
+        if routed_profile_has_slack
+        else {}
+    )
+
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-routed",
+    )
+    assert source.profile == "routed"
+    assert "_transport_profile" not in source.to_dict()
+    event = MessageEvent(text="hello", source=source, message_id="m-routed")
+    session_key = build_session_key(source)
+
+    # The runtime route is independent from the bot credential that received
+    # this turn. A primary reconnect must retain the primary transport even if
+    # the routed profile happens to own another adapter for the same platform.
+    runner.adapters[Platform.SLACK] = replacement
+    assert runner._adapter_for_source(source) is replacement
+    assert runner._adapter_profile_for_source(source) is None
+    await stale_adapter._process_message_background(event, session_key)
+
+    assert stale_adapter.sent == []
+    assert routed_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [_NOTICE]
+    assert replacement._llm_error_notice_suppressed(
+        session_key,
+        "backend_unavailable",
+        time.monotonic(),
+        source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_routed_runtime_reconnect_uses_secondary_transport_replacement(
+    monkeypatch,
+    tmp_path,
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    runner._profile_name_for_source = lambda source: "routed"
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters[Platform.SLACK] = primary_adapter
+
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    routed_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(routed_adapter, profile_name="routed")
+    runner._profile_adapters = {
+        "coder": {Platform.SLACK: stale_adapter},
+        "routed": {Platform.SLACK: routed_adapter},
+    }
+
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-secondary-routed",
+    )
+    assert source.profile == "routed"
+    assert "_transport_profile" not in source.to_dict()
+    event = MessageEvent(
+        text="hello",
+        source=source,
+        message_id="m-secondary-routed",
+    )
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    runner._profile_adapters["coder"][Platform.SLACK] = replacement
+
+    assert runner._adapter_for_source(source) is replacement
+    assert runner._adapter_profile_for_source(source) == "coder"
+    await stale_adapter._process_message_background(event, build_session_key(source))
+
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+    assert routed_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [_NOTICE]
+    assert replacement._llm_error_notice_suppressed(
+        build_session_key(source),
+        "backend_unavailable",
+        time.monotonic(),
+        source=source,
+    )
+
+
+def test_missing_secondary_transport_owner_keeps_secondary_policy_scope():
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    source = SessionSource(platform=Platform.SLACK, chat_id="C123")
+    setattr(source, "_transport_profile", "coder")
+
+    assert runner._adapter_for_source(source) is None
+    assert runner._adapter_profile_for_source(source) == "coder"
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_owner_withholds_final_notice(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-missing-owner",
+    )
+    assert getattr(source, "_transport_profile") == "coder"
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {}
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-missing-owner",
+        ),
+        build_session_key(source),
+    )
+
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+    assert runner._backend_notice_state.inflight == set()
+    assert runner._backend_notice_state.posted == {}
+
+
+@pytest.mark.asyncio
+async def test_owner_vanishes_after_notice_claim_releases_claim(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-owner-vanishes-after-claim",
+    )
+    live_adapter = CaptureSlackAdapter()
+    resolver = MagicMock(side_effect=[live_adapter, live_adapter, None])
+    monkeypatch.setattr(stale_adapter, "_final_delivery_adapter", resolver)
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-owner-vanishes-after-claim",
+        ),
+        build_session_key(source),
+    )
+
+    assert resolver.call_count == 3
+    assert stale_adapter.sent == []
+    assert live_adapter.sent == []
+    assert runner._backend_notice_state.inflight == set()
+    assert runner._backend_notice_state._claim_results == {}
+    assert runner._backend_notice_state.posted == {}
+
+
+@pytest.mark.asyncio
+async def test_owner_appearing_after_initial_probe_receives_final_text(
+    monkeypatch, tmp_path
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("late owner reply")],
+    )
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-owner-appears-after-probe",
+    )
+    live_adapter = CaptureSlackAdapter()
+    resolver = MagicMock(side_effect=[None, live_adapter, live_adapter])
+    monkeypatch.setattr(stale_adapter, "_final_delivery_adapter", resolver)
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-owner-appears-after-probe",
+        ),
+        build_session_key(source),
+    )
+
+    assert resolver.call_count == 3
+    assert stale_adapter.sent == []
+    assert [message["content"] for message in live_adapter.sent] == [
+        "late owner reply"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_owner_withholds_auto_tts(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("secret reply")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-missing-owner-tts",
+    )
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {}
+
+    audio_path = tmp_path / "reply.mp3"
+
+    def fake_tts(*, text, output_path):
+        Path(output_path).write_bytes(b"audio")
+        return f'{{"success": true, "file_path": "{output_path}"}}'
+
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    monkeypatch.setattr(
+        "gateway.platforms.base.build_auto_tts_output_path",
+        lambda _platform: str(audio_path),
+    )
+    stale_adapter._should_auto_tts_for_chat = lambda chat_id: True
+    stale_adapter.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="tts-1")
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=source,
+        message_id="m-missing-owner-tts",
+        message_type=MessageType.VOICE,
+    )
+    await stale_adapter._process_message_background(
+        event,
+        build_session_key(source),
+    )
+
+    stale_adapter.play_tts.assert_not_awaited()
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_owner_withholds_attachments(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("secret attachment")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-missing-owner-image",
+    )
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {}
+    stale_adapter.extract_images = lambda content: (
+        [("https://example.invalid/private.png", "private")],
+        "",
+    )
+    stale_adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="image-1")
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-missing-owner-image",
+        ),
+        build_session_key(source),
+    )
+
+    stale_adapter.send_multiple_images.assert_not_awaited()
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_owner_withholds_error_fallback(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(monkeypatch, tmp_path, stale_adapter, [])
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-missing-owner-error",
+    )
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {}
+    stale_adapter.set_message_handler(
+        AsyncMock(side_effect=RuntimeError("handler exploded"))
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-missing-owner-error",
+        ),
+        build_session_key(source),
+    )
+
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replacement_owns_auto_tts_and_text(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("replacement reply")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-replacement-tts",
+    )
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {"coder": {Platform.SLACK: replacement}}
+    stale_adapter._should_auto_tts_for_chat = lambda chat_id: True
+    stale_adapter.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-tts")
+    )
+    replacement.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="live-tts")
+    )
+    audio_path = tmp_path / "replacement.mp3"
+
+    def fake_tts(*, text, output_path):
+        Path(output_path).write_bytes(b"audio")
+        return f'{{"success": true, "file_path": "{output_path}"}}'
+
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    monkeypatch.setattr(
+        "gateway.platforms.base.build_auto_tts_output_path",
+        lambda platform: str(audio_path),
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-replacement-tts",
+            message_type=MessageType.VOICE,
+        ),
+        build_session_key(source),
+    )
+
+    stale_adapter.play_tts.assert_not_awaited()
+    replacement.play_tts.assert_awaited_once()
+    assert stale_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [
+        "replacement reply"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_tts_uses_latest_replacement(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("latest reply")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-latest-tts",
+    )
+
+    initial_replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(initial_replacement, profile_name="coder")
+    latest_replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(latest_replacement, profile_name="coder")
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {
+        "coder": {Platform.SLACK: initial_replacement}
+    }
+    stale_adapter._should_auto_tts_for_chat = lambda chat_id: True
+    initial_replacement.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="initial-tts")
+    )
+    latest_replacement.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="latest-tts")
+    )
+    audio_path = tmp_path / "latest.mp3"
+
+    def fake_tts(*, text, output_path):
+        runner._profile_adapters["coder"][Platform.SLACK] = latest_replacement
+        Path(output_path).write_bytes(b"audio")
+        return f'{{"success": true, "file_path": "{output_path}"}}'
+
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    monkeypatch.setattr(
+        "gateway.platforms.base.build_auto_tts_output_path",
+        lambda platform: str(audio_path),
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-latest-tts",
+            message_type=MessageType.VOICE,
+        ),
+        build_session_key(source),
+    )
+
+    initial_replacement.play_tts.assert_not_awaited()
+    latest_replacement.play_tts.assert_awaited_once()
+    assert initial_replacement.sent == []
+    assert [message["content"] for message in latest_replacement.sent] == [
+        "latest reply"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replacement_owns_attachments(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("replacement attachment")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-replacement-image",
+    )
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {"coder": {Platform.SLACK: replacement}}
+    stale_adapter.extract_images = lambda content: (
+        [("https://example.invalid/private.png", "private")],
+        "",
+    )
+    stale_adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-image")
+    )
+    replacement.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="live-image")
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-replacement-image",
+        ),
+        build_session_key(source),
+    )
+
+    stale_adapter.send_multiple_images.assert_not_awaited()
+    replacement.send_multiple_images.assert_awaited_once()
+    assert stale_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_text_uses_latest_adapter_for_attachment(
+    monkeypatch, tmp_path
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_successful_result("text plus image")],
+    )
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-latest-image",
+    )
+
+    initial_replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(initial_replacement, profile_name="coder")
+    latest_replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(latest_replacement, profile_name="coder")
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {
+        "coder": {Platform.SLACK: initial_replacement}
+    }
+    stale_adapter.extract_images = lambda content: (
+        [("https://example.invalid/private.png", "private")],
+        content,
+    )
+
+    async def send_text_then_reconnect(*args, **kwargs):
+        result = await initial_replacement.send(*args, **kwargs)
+        runner._profile_adapters["coder"][Platform.SLACK] = latest_replacement
+        return result
+
+    initial_replacement._send_with_retry = send_text_then_reconnect
+    initial_replacement.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="initial-image")
+    )
+    latest_replacement.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="latest-image")
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-latest-image",
+        ),
+        build_session_key(source),
+    )
+
+    assert [message["content"] for message in initial_replacement.sent] == [
+        "text plus image"
+    ]
+    initial_replacement.send_multiple_images.assert_not_awaited()
+    latest_replacement.send_multiple_images.assert_awaited_once()
+    assert stale_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_replacement_owns_error_fallback(monkeypatch, tmp_path):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(monkeypatch, tmp_path, stale_adapter, [])
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-replacement-error",
+    )
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters = {Platform.SLACK: primary_adapter}
+    runner._profile_adapters = {"coder": {Platform.SLACK: replacement}}
+    stale_adapter.set_message_handler(
+        AsyncMock(side_effect=RuntimeError("handler exploded"))
+    )
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-replacement-error",
+        ),
+        build_session_key(source),
+    )
+
+    assert stale_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [
+        "Sorry, I encountered an internal error. "
+        "Please try again or use /reset to start a fresh session."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_duck_typed_reconnect_replacement_delivers_final_notice(
+    monkeypatch, tmp_path
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-duck-replacement",
+    )
+
+    replacement_send = AsyncMock(
+        return_value=SendResult(success=True, message_id="duck-1")
+    )
+    replacement = SimpleNamespace(
+        platform=Platform.SLACK,
+        name="duck-slack",
+        _send_with_retry=replacement_send,
+    )
+    runner._share_backend_notice_state(replacement, profile_name="default")
+    cast(Any, runner.adapters)[Platform.SLACK] = replacement
+
+    await stale_adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-duck-replacement",
+        ),
+        build_session_key(source),
+    )
+
+    assert stale_adapter.sent == []
+    replacement_send.assert_awaited_once()
+    assert replacement_send.await_args is not None
+    assert replacement_send.await_args.kwargs["content"] == _NOTICE
+    assert len(runner._backend_notice_state.posted) == 1
 
 
 @pytest.mark.asyncio
@@ -720,7 +1487,7 @@ def test_notice_tracker_prunes_expired_sessions():
 
     adapter._record_llm_error_notice("live", "backend_unavailable", now)
 
-    assert set(adapter._llm_error_last_posted) == {"profile:default:live"}
+    assert set(adapter._llm_error_last_posted) == {"profile:7:default:live"}
 
 
 def test_notice_tracker_is_bounded():
@@ -737,7 +1504,7 @@ def test_notice_tracker_is_bounded():
 
     assert len(adapter._llm_error_last_posted) <= _LLM_ERROR_TRACKER_MAX_SESSIONS
     assert (
-        f"profile:default:session-{overflow - 1}"
+        f"profile:7:default:session-{overflow - 1}"
         in adapter._llm_error_last_posted
     )
     assert "session-0" not in adapter._llm_error_last_posted

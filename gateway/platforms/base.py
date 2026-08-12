@@ -570,7 +570,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, cast
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -3226,6 +3226,10 @@ class BasePlatformAdapter(ABC):
         # state. The adapter's local session key deliberately keeps the legacy
         # ``agent:main`` namespace, even for multiplexed secondary adapters.
         self._backend_notice_profile: Optional[str] = None
+        # Profile whose credential/connection owns this transport. Unlike a
+        # SessionSource's runtime ``profile``, this does not change when a chat
+        # route selects another agent profile for the turn.
+        self._transport_profile: Optional[str] = None
         self._llm_error_last_posted = self._backend_notice_state.posted
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
@@ -5524,7 +5528,7 @@ class BasePlatformAdapter(ABC):
 
     def _final_delivery_adapter(
         self, source: Optional[SessionSource]
-    ) -> "BasePlatformAdapter":
+    ) -> Optional[Any]:
         """Return the runner's current adapter for a new final-response send.
 
         A reconnect removes the failed adapter from the runner registry before
@@ -5538,16 +5542,26 @@ class BasePlatformAdapter(ABC):
         resolve = getattr(runner, "_adapter_for_source", None)
         if not callable(resolve):
             return self
+        source_attrs = getattr(source, "__dict__", {})
+        has_transport_owner = (
+            isinstance(source_attrs, dict)
+            and "_transport_profile" in source_attrs
+        )
         try:
             live_adapter = resolve(source)
         except Exception:
             logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
-            return self
-        if (
-            not isinstance(live_adapter, BasePlatformAdapter)
-            or live_adapter.platform != self.platform
-        ):
-            return self
+            return None if has_transport_owner else self
+        if live_adapter is None:
+            # An explicitly stamped live source must never fall back to the
+            # disconnected generation when its credential owner is missing.
+            return None if has_transport_owner else self
+        if getattr(live_adapter, "platform", None) != self.platform:
+            return None if has_transport_owner else self
+        if not callable(getattr(live_adapter, "_send_with_retry", None)):
+            return None if has_transport_owner else self
+        # Plugin adapters are intentionally duck-typed; requiring inheritance
+        # here would reject a valid replacement and revive the stale transport.
         return live_adapter
 
     async def _send_with_retry(
@@ -6313,22 +6327,19 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         source: Optional[SessionSource] = None,
     ) -> str:
-        """Restore the logical profile namespace for shared notice state.
+        """Return an injective profile/session key for runner-wide notice state.
 
-        ``handle_message`` builds its adapter-local key before a secondary
-        profile handler stamps ``source.profile`` and intentionally omits the
-        multiplex profile. Reusing that raw key in runner-wide state would let
-        independent profile credentials suppress each other's notices.
+        Adapter-local session keys are built before multiplex routing stamps the
+        source profile. Always prefix the logical profile, including ``default``.
+        Length-prefixing keeps the encoding unambiguous even if plugin profiles
+        or session keys contain separators.
         """
         profile = str(
             (getattr(source, "profile", None) if source is not None else None)
             or self._backend_notice_profile
             or "default"
         ).strip() or "default"
-        # Namespace even the default profile explicitly. Its legacy session key
-        # uses ``agent:main:...`` and would otherwise collide with a valid
-        # multiplex profile literally named ``main``.
-        return f"profile:{profile}:{session_key}"
+        return f"profile:{len(profile)}:{profile}:{session_key}"
 
     def set_backend_notice_state(
         self,
@@ -6534,6 +6545,18 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Resolve before TTS synthesis so a missing explicitly stamped
+                # owner cannot trigger stale-generation side effects. Preserve
+                # the payload, though: every actual send re-resolves below, so
+                # an owner registered meanwhile can still receive it safely.
+                delivery_adapter = self._final_delivery_adapter(event.source)
+                if delivery_adapter is None:
+                    logger.warning(
+                        "[%s] No live adapter at final-output start; each send "
+                        "will re-resolve the stamped transport owner",
+                        self.name,
+                    )
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -6543,7 +6566,14 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
+                tts_send = (
+                    getattr(delivery_adapter, "play_tts", None)
+                    if delivery_adapter is not None
+                    else None
+                )
                 if (not is_backend_unavailable_response
+                        and delivery_adapter is not None
+                        and callable(tts_send)
                         and self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
@@ -6567,7 +6597,7 @@ class BasePlatformAdapter(ABC):
                             # produced MP3 (audio attachment, not a native
                             # voice bubble) on Opus platforms (#57049, #36685).
                             _tts_requested_path = build_auto_tts_output_path(
-                                self.platform
+                                delivery_adapter.platform
                             )
                             tts_result_str = await asyncio.to_thread(
                                 text_to_speech_tool,
@@ -6592,6 +6622,21 @@ class BasePlatformAdapter(ABC):
                 _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
+                        # TTS synthesis runs off-thread and may outlive another
+                        # reconnect. Resolve again at the actual send boundary.
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        tts_send = (
+                            getattr(delivery_adapter, "play_tts", None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(tts_send):
+                            logger.warning(
+                                "[%s] Withholding auto-TTS: current transport "
+                                "owner has no live TTS delivery operation",
+                                self.name,
+                            )
+                            continue
                         # Caption eligibility and payload stay on the ORIGINAL
                         # reply text. The spoken script is for synthesis only:
                         # normalization can shrink a long reply below the
@@ -6607,7 +6652,7 @@ class BasePlatformAdapter(ABC):
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
+                        tts_result = await cast(Callable[..., Awaitable[Any]], tts_send)(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
@@ -6637,7 +6682,6 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
-                delivery_adapter = None
                 backend_notice_claimed = False
                 backend_notice_suppressed = False
                 backend_notice_session_key = session_key
@@ -6652,34 +6696,53 @@ class BasePlatformAdapter(ABC):
                     # adapter's tracker and then sending through a new one
                     # would bypass the replacement's live cooldown.
                     delivery_adapter = self._final_delivery_adapter(event.source)
-                    backend_notice_session_key = (
-                        delivery_adapter._backend_notice_session_key(
-                            session_key, event.source
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Withholding backend-unavailable notice: "
+                            "no live adapter for the stamped transport owner",
+                            self.name,
                         )
-                    )
-                    backend_notice_claimed = (
-                        await delivery_adapter._backend_notice_state.claim(
-                            backend_notice_session_key,
-                            "backend_unavailable",
-                        )
-                    )
-                    if not backend_notice_claimed:
                         backend_notice_suppressed = True
-                        logger.info(
-                            "[%s] Suppressing duplicate backend-unavailable "
-                            "notice for session %s",
-                            delivery_adapter.name,
-                            session_key,
+                        text_content = ""
+                    else:
+                        backend_notice_session_key = (
+                            self._backend_notice_session_key(
+                                session_key, event.source
+                            )
+                        )
+                        backend_notice_claimed = (
+                            await self._backend_notice_state.claim(
+                                backend_notice_session_key,
+                                "backend_unavailable",
+                            )
+                        )
+                        if not backend_notice_claimed:
+                            backend_notice_suppressed = True
+                            logger.info(
+                                "[%s] Suppressing duplicate backend-unavailable "
+                                "notice for session %s",
+                                getattr(delivery_adapter, "name", self.name),
+                                session_key,
+                            )
+                            text_content = ""
+                if (
+                    text_content
+                    and not _tts_caption_delivered
+                    and not backend_notice_claimed
+                ):
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Withholding final response: no live adapter "
+                            "for the stamped transport owner",
+                            self.name,
                         )
                         text_content = ""
                 if text_content and not _tts_caption_delivered:
-                    delivery_adapter = (
-                        delivery_adapter
-                        or self._final_delivery_adapter(event.source)
-                    )
+                    assert delivery_adapter is not None
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
-                        delivery_adapter.name,
+                        getattr(delivery_adapter, "name", self.name),
                         len(text_content),
                         event.source.chat_id,
                     )
@@ -6732,30 +6795,35 @@ class BasePlatformAdapter(ABC):
                             _obligation_id = None
                     if backend_notice_claimed:
                         async def _send_and_finish_backend_notice_claim():
+                            nonlocal delivery_adapter
+                            delivered = False
                             try:
-                                send_result = await delivery_adapter._send_with_retry(
+                                current_adapter = self._final_delivery_adapter(
+                                    event.source
+                                )
+                                if current_adapter is None:
+                                    return SendResult(
+                                        success=False,
+                                        error="transport owner unavailable",
+                                    )
+                                delivery_adapter = current_adapter
+                                send_result = await current_adapter._send_with_retry(
                                     chat_id=event.source.chat_id,
                                     content=text_content,
                                     reply_to=_reply_anchor,
                                     metadata=_final_thread_metadata,
                                 )
-                            except BaseException:
-                                delivery_adapter._backend_notice_state.finish_claim(
+                                delivered = bool(
+                                    getattr(send_result, "success", False)
+                                )
+                                return send_result
+                            finally:
+                                self._backend_notice_state.finish_claim(
                                     backend_notice_session_key,
                                     "backend_unavailable",
                                     time.monotonic(),
-                                    delivered=False,
+                                    delivered=delivered,
                                 )
-                                raise
-                            delivery_adapter._backend_notice_state.finish_claim(
-                                backend_notice_session_key,
-                                "backend_unavailable",
-                                time.monotonic(),
-                                delivered=bool(
-                                    getattr(send_result, "success", False)
-                                ),
-                            )
-                            return send_result
 
                         send_task = asyncio.create_task(
                             _send_and_finish_backend_notice_claim()
@@ -6768,17 +6836,24 @@ class BasePlatformAdapter(ABC):
                             # holds the send task across adapter replacement and
                             # resolves contenders only when the platform result
                             # is known, while this processor unwinds promptly.
-                            delivery_adapter._backend_notice_state.track_delivery_task(
+                            self._backend_notice_state.track_delivery_task(
                                 send_task
                             )
                             raise
                     else:
-                        result = await delivery_adapter._send_with_retry(
-                            chat_id=event.source.chat_id,
-                            content=text_content,
-                            reply_to=_reply_anchor,
-                            metadata=_final_thread_metadata,
-                        )
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        if delivery_adapter is None:
+                            result = SendResult(
+                                success=False,
+                                error="transport owner unavailable",
+                            )
+                        else:
+                            result = await delivery_adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=text_content,
+                                reply_to=_reply_anchor,
+                                metadata=_final_thread_metadata,
+                            )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6808,27 +6883,45 @@ class BasePlatformAdapter(ABC):
                         and result.success
                         and result.message_id
                     ):
-                        delivery_adapter._schedule_ephemeral_delete(
+                        assert delivery_adapter is not None
+                        schedule_delete = getattr(
+                            delivery_adapter, "_schedule_ephemeral_delete", None
+                        )
+                        if callable(schedule_delete):
+                            schedule_delete(
                             chat_id=event.source.chat_id,
                             message_id=result.message_id,
                             ttl_seconds=_ephemeral_ttl,
-                        )
+                            )
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
                 # Send extracted images as native attachments
                 if images:
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    image_send = (
+                        getattr(delivery_adapter, "send_multiple_images", None)
+                        if delivery_adapter is not None
+                        else None
+                    )
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-                    try:
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=images,
-                            metadata=_final_thread_metadata,
-                            human_delay=human_delay,
+                    if not callable(image_send):
+                        logger.warning(
+                            "[%s] Withholding images: current transport owner "
+                            "has no live image delivery operation",
+                            self.name,
                         )
-                    except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                    else:
+                        try:
+                            await cast(Callable[..., Awaitable[Any]], image_send)(
+                                chat_id=event.source.chat_id,
+                                images=images,
+                                metadata=_final_thread_metadata,
+                                human_delay=human_delay,
+                            )
+                        except Exception as batch_err:
+                            logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
                 # Send extracted media files — route by file type
@@ -6861,16 +6954,29 @@ class BasePlatformAdapter(ABC):
                         _non_image_local.append(file_path)
 
                 if _image_paths:
-                    try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_final_thread_metadata,
-                            human_delay=human_delay,
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    image_send = (
+                        getattr(delivery_adapter, "send_multiple_images", None)
+                        if delivery_adapter is not None
+                        else None
+                    )
+                    if not callable(image_send):
+                        logger.warning(
+                            "[%s] Withholding image files: current transport owner "
+                            "has no live image delivery operation",
+                            self.name,
                         )
-                    except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                    else:
+                        try:
+                            _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                            await cast(Callable[..., Awaitable[Any]], image_send)(
+                                chat_id=event.source.chat_id,
+                                images=_batch,
+                                metadata=_final_thread_metadata,
+                                human_delay=human_delay,
+                            )
+                        except Exception as batch_err:
+                            logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
                     logger.info(
@@ -6882,40 +6988,62 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        delivery_adapter = self._final_delivery_adapter(event.source)
                         ext = Path(media_path).suffix.lower()
-                        if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
-                                chat_id=event.source.chat_id,
-                                audio_path=media_path,
-                                metadata=_final_thread_metadata,
-                            )
+                        method_name = "send_document"
+                        path_arg = "file_path"
+                        if delivery_adapter is not None and should_send_media_as_audio(
+                            delivery_adapter.platform, ext, is_voice=is_voice
+                        ):
+                            method_name = "send_voice"
+                            path_arg = "audio_path"
                         elif ext in _VIDEO_EXTS:
+                            method_name = "send_video"
+                            path_arg = "video_path"
                             logger.info(
                                 "[%s] Sending video attachment (%s) to %s",
                                 self.name,
                                 ext,
                                 event.source.chat_id,
                             )
-                            media_result = await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=media_path,
-                                metadata=_final_thread_metadata,
+                        media_send = (
+                            getattr(delivery_adapter, method_name, None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(media_send):
+                            logger.warning(
+                                "[%s] Withholding media: current transport owner "
+                                "has no live %s operation",
+                                self.name,
+                                method_name,
                             )
-                        else:
-                            media_result = await self.send_document(
-                                chat_id=event.source.chat_id,
-                                file_path=media_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            continue
+                        media_result = await cast(
+                            Callable[..., Awaitable[Any]], media_send
+                        )(
+                            chat_id=event.source.chat_id,
+                            **{path_arg: media_path},
+                            metadata=_final_thread_metadata,
+                        )
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                media_path,
-                                is_voice=is_voice,
-                                metadata=_final_thread_metadata,
+                            delivery_adapter = self._final_delivery_adapter(event.source)
+                            notify_failure = (
+                                getattr(delivery_adapter, "_notify_media_delivery_failure", None)
+                                if delivery_adapter is not None
+                                else None
                             )
+                            if callable(notify_failure):
+                                await cast(
+                                    Callable[..., Awaitable[Any]], notify_failure
+                                )(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -6924,19 +7052,30 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        delivery_adapter = self._final_delivery_adapter(event.source)
                         ext = Path(file_path).suffix.lower()
-                        if ext in _VIDEO_EXTS:
-                            file_result = await self.send_video(
-                                chat_id=event.source.chat_id,
-                                video_path=file_path,
-                                metadata=_final_thread_metadata,
+                        method_name = "send_video" if ext in _VIDEO_EXTS else "send_document"
+                        path_arg = "video_path" if ext in _VIDEO_EXTS else "file_path"
+                        file_send = (
+                            getattr(delivery_adapter, method_name, None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(file_send):
+                            logger.warning(
+                                "[%s] Withholding local file: current transport "
+                                "owner has no live %s operation",
+                                self.name,
+                                method_name,
                             )
-                        else:
-                            file_result = await self.send_document(
-                                chat_id=event.source.chat_id,
-                                file_path=file_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            continue
+                        file_result = await cast(
+                            Callable[..., Awaitable[Any]], file_send
+                        )(
+                            chat_id=event.source.chat_id,
+                            **{path_arg: file_path},
+                            metadata=_final_thread_metadata,
+                        )
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -6944,11 +7083,20 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                file_path,
-                                metadata=_final_thread_metadata,
+                            delivery_adapter = self._final_delivery_adapter(event.source)
+                            notify_failure = (
+                                getattr(delivery_adapter, "_notify_media_delivery_failure", None)
+                                if delivery_adapter is not None
+                                else None
                             )
+                            if callable(notify_failure):
+                                await cast(
+                                    Callable[..., Awaitable[Any]], notify_failure
+                                )(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
@@ -7055,7 +7203,20 @@ class BasePlatformAdapter(ABC):
                 _thread_metadata = _thread_metadata_for_source(
                     event.source, _reply_anchor_for_event(event)
                 )
-                await self.send(
+                error_adapter = self._final_delivery_adapter(event.source)
+                if error_adapter is None:
+                    logger.warning(
+                        "[%s] Withholding error notification: no live adapter "
+                        "for the stamped transport owner",
+                        self.name,
+                    )
+                    return
+                error_send = getattr(error_adapter, "send", None)
+                if not callable(error_send):
+                    # Duck-typed adapters are guaranteed to expose the final
+                    # text-delivery operation, not necessarily BasePlatformAdapter.send.
+                    error_send = error_adapter._send_with_retry
+                await cast(Callable[..., Awaitable[Any]], error_send)(
                     chat_id=event.source.chat_id,
                     content=(
                         "Sorry, I encountered an internal error. "
@@ -7367,6 +7528,14 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. Preserve its owning profile independently so a turn
+        # that outlives a reconnect can resolve the replacement generation.
+        setattr(
+            source,
+            "_transport_profile",
+            getattr(self, "_transport_profile", None),
+        )
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched
