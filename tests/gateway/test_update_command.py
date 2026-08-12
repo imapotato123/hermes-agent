@@ -12,7 +12,11 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource, stamp_source_transport_owner
+from gateway.session import (
+    SessionSource,
+    session_source_to_trusted_marker,
+    stamp_source_transport_owner,
+)
 
 
 def _make_event(text="/update", platform=Platform.TELEGRAM,
@@ -313,8 +317,12 @@ class TestSendUpdateNotification:
             chat_type="dm",
         )
         stamp_source_transport_owner(source, profile="ops")
-        marker = source.to_dict()
-        marker["source"] = dict(marker)
+        marker = {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+            **session_source_to_trusted_marker(source),
+        }
         pending_path = hermes_home / ".update_pending.json"
         pending_path.write_text(json.dumps(marker))
         (hermes_home / ".update_output.txt").write_text("done")
@@ -322,6 +330,7 @@ class TestSendUpdateNotification:
         primary = AsyncMock()
         runner.adapters = {Platform.TELEGRAM: primary}
         runner._profile_adapters = {}
+        runner._active_profile_name = lambda: "main"
 
         with patch("gateway.run._hermes_home", hermes_home):
             result = await runner._send_update_notification()

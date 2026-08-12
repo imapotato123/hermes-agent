@@ -974,11 +974,9 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
     runner.session_store._entries[session_key] = MagicMock(
-        origin=SessionSource(
-            platform=Platform.TELEGRAM,
+        origin=make_restart_source(
             chat_id="999",
             chat_type="group",
-            user_id="u1",
             thread_id="topic-7",
         )
     )

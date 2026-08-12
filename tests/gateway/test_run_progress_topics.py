@@ -58,6 +58,18 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
 
+    def fronts_platform(self, platform) -> bool:
+        """Model the one Discord account acknowledged by this fake Relay."""
+        return self.platform == Platform.RELAY and platform == Platform.DISCORD
+
+    def transport_identity_for_platform(self, platform):
+        if self.fronts_platform(platform):
+            return "discord:progress-test-bot"
+        return None
+
+    def matches_transport_identity(self, identity: str) -> bool:
+        return identity == "discord:progress-test-bot"
+
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
     """Capture sends while exercising Discord's real preview formatter."""
@@ -402,19 +414,31 @@ def _make_runner(adapter):
 
     async def _run_agent_with_owner(*args, **kwargs):
         source = kwargs.get("source")
-        if (
-            source is not None
-            and getattr(source, "delivered_via_upstream_relay", False) is not True
-        ):
+        if source is not None:
+            # Model trusted adapter ingress. The public Relay routing hint is
+            # deliberately insufficient without this process-local stamp.
             stamp_source_transport_owner(
                 source,
                 profile=None,
                 adapter=adapter,
+                platform=adapter.platform,
             )
         return await original_run_agent(*args, **kwargs)
 
     runner._run_agent = _run_agent_with_owner
     return runner
+
+
+def test_relay_progress_hint_without_owner_capability_fails_closed():
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chan-parent",
+        delivered_via_upstream_relay=True,
+    )
+
+    assert runner._adapter_for_source(source) is None
 
 
 @pytest.mark.asyncio

@@ -11076,7 +11076,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row.get("transport_platform") or row["platform"]
                     )
                 except (TypeError, ValueError):
-                    _transport_platform = None
+                    logger.warning(
+                        "obligation %s: invalid stamped transport platform %r",
+                        row["obligation_id"],
+                        row.get("transport_platform"),
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            release_claim, row["obligation_id"]
+                        )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: invalid-owner claim release failed",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                    continue
                 stamp_source_transport_owner(
                     _recovery_source,
                     profile=row.get("transport_profile"),

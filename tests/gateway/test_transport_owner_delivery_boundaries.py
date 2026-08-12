@@ -166,6 +166,18 @@ def test_nonrelay_physical_platform_mismatch_fails_closed():
     assert runner._adapter_for_source(source) is None
 
 
+def test_registered_adapter_weakref_without_owner_capability_fails_closed():
+    adapter = _adapter("native")
+    runner = _runner(primary=adapter)
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    source._transport_adapter_ref = lambda: adapter
+    source._transport_platform = Platform.SLACK
+    source._transport_profile = None
+
+    assert source_has_transport_owner(source) is False
+    assert runner._adapter_for_source(source) is None
+
+
 @pytest.mark.parametrize("platform", [Platform.HOMEASSISTANT, Platform.WEBHOOK])
 def test_ownerless_authenticated_system_platforms_still_fail_closed(platform):
     runner = _runner()
@@ -239,6 +251,7 @@ def test_relay_replacement_primes_routing_from_inflight_source():
     relay = SimpleNamespace(
         platform=Platform.RELAY,
         fronts_platform=MagicMock(return_value=True),
+        matches_transport_identity=MagicMock(return_value=True),
         prime_routing_source=MagicMock(),
     )
     runner.adapters = {Platform.RELAY: relay}
@@ -255,8 +268,10 @@ def test_relay_replacement_primes_routing_from_inflight_source():
         profile=None,
         platform=Platform.RELAY,
     )
+    source._transport_identity = "discord:app-1"
 
     assert runner._adapter_for_source(source) is relay
+    relay.matches_transport_identity.assert_called_with("discord:app-1")
     relay.prime_routing_source.assert_called_once_with(source)
 
 
@@ -899,6 +914,53 @@ async def test_recovery_route_disappearing_after_claim_releases_budget(
         state, attempts, owner_pid = conn.execute(
             "SELECT state, attempts, owner_pid FROM delivery_obligations "
             "WHERE obligation_id='vanished-row'"
+        ).fetchone()
+    assert state == "pending"
+    assert attempts == 0
+    assert owner_pid is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_malformed_claimed_transport_platform_fails_closed(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="malformed-owner-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_platform="slack",
+        transport_profile=None,
+        transport_profile_stamped=True,
+    )
+    _orphan("malformed-owner-row")
+
+    primary = _adapter("primary")
+    primary._transport_profile = None
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+    real_sweep = dl.sweep_recoverable
+
+    def claim_then_corrupt(*args, **kwargs):
+        rows = real_sweep(*args, **kwargs)
+        assert len(rows) == 1
+        rows[0]["transport_platform"] = "not-a-platform"
+        return rows
+
+    monkeypatch.setattr(dl, "sweep_recoverable", claim_then_corrupt)
+
+    assert await runner._redeliver_pending_obligations() == 0
+    primary.send.assert_not_awaited()
+    with dl._connect() as conn:
+        state, attempts, owner_pid = conn.execute(
+            "SELECT state, attempts, owner_pid FROM delivery_obligations "
+            "WHERE obligation_id='malformed-owner-row'"
         ).fetchone()
     assert state == "pending"
     assert attempts == 0

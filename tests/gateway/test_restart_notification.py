@@ -12,6 +12,7 @@ from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import (
     SessionSource,
     build_session_key,
+    session_source_to_trusted_marker,
     stamp_source_transport_owner,
 )
 from tests.gateway.restart_test_helpers import (
@@ -396,8 +397,12 @@ async def test_restart_notification_uses_exact_stamped_secondary_owner(
         user_id="u1",
     )
     stamp_source_transport_owner(source, profile="ops", adapter=secondary)
-    marker = source.to_dict()
-    marker["source"] = dict(marker)
+    marker = {
+        "platform": source.platform.value,
+        "chat_id": source.chat_id,
+        "chat_type": source.chat_type,
+        **session_source_to_trusted_marker(source),
+    }
     (tmp_path / ".restart_notify.json").write_text(json.dumps(marker))
 
     delivered_target = await runner._send_restart_notification()

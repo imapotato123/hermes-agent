@@ -588,8 +588,11 @@ def session_source_from_trusted_marker(
     if not isinstance(data, dict):
         return None
 
+    source_present = "source" in data
     source_data = data.get("source")
-    if isinstance(source_data, dict):
+    if source_present:
+        if not isinstance(source_data, dict):
+            return None
         try:
             source = SessionSource.from_dict(source_data)
         except (KeyError, TypeError, ValueError):
@@ -630,6 +633,14 @@ def session_source_from_trusted_marker(
             source.delivered_via_upstream_relay = True
         return source
 
+    modern_owner_keys = {
+        "transport_owner_stamped",
+        "transport_platform",
+        "transport_profile",
+        "transport_identity",
+    }
+    if modern_owner_keys.intersection(data):
+        return None
     if not data.get("platform") or not data.get("chat_id"):
         return None
     try:

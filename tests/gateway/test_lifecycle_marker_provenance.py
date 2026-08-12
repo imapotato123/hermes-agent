@@ -251,3 +251,32 @@ def test_flat_marker_is_the_only_historical_compatibility_shape():
     assert modern is not None
     assert source_is_legacy_unstamped(modern) is False
     assert source_has_transport_owner(modern) is False
+
+
+def test_present_but_malformed_source_cannot_downgrade_to_flat_legacy():
+    for malformed in (None, "slack:C1", [], True):
+        restored = session_source_from_trusted_marker(
+            {
+                "source": malformed,
+                "platform": "slack",
+                "chat_id": "C1",
+            }
+        )
+        assert restored is None
+
+
+def test_flat_marker_with_modern_owner_envelope_is_not_historical():
+    for key, value in (
+        ("transport_owner_stamped", False),
+        ("transport_platform", "slack"),
+        ("transport_profile", "coder"),
+        ("transport_identity", "slack:bot-1"),
+    ):
+        restored = session_source_from_trusted_marker(
+            {
+                "platform": "slack",
+                "chat_id": "C1",
+                key: value,
+            }
+        )
+        assert restored is None

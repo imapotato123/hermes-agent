@@ -30,7 +30,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.session import SessionSource, stamp_source_transport_owner
+from gateway.session import (
+    SessionSource,
+    session_source_from_trusted_marker,
+    session_source_to_trusted_marker,
+    stamp_source_transport_owner,
+)
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -53,9 +58,19 @@ def _make_runner(*, platform: Platform, authorization_is_upstream: bool):
 
     runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(
+        platform=platform,
         send=AsyncMock(),
         authorization_is_upstream=authorization_is_upstream,
         enforces_own_access_policy=False,
+        _transport_profile=None,
+        fronts_platform=MagicMock(return_value=True),
+        matches_transport_identity=MagicMock(return_value=True),
+        prime_routing_source=MagicMock(),
+        transport_identity_for_platform=lambda logical: (
+            f"{getattr(logical, 'value', logical)}:app-1"
+            if logical != Platform.RELAY
+            else None
+        ),
     )
     runner.adapters = {platform: adapter}
     runner.pairing_store = MagicMock()
@@ -118,10 +133,10 @@ def test_non_upstream_adapter_still_default_denies(monkeypatch):
 # ws_transport._event_from_wire maps it straight onto SessionSource. The relay
 # adapter is registered ONLY under Platform.RELAY, so keying upstream-authz off
 # source.platform misses and the user hits default-deny ("Unauthorized user
-# <id> (<name>) on discord"). The authentic trust signal is that the event was
-# delivered over the per-instance-authenticated relay WS — carried by
-# source.delivered_via_upstream_relay, set by the relay transport, NOT by
-# source.platform.
+# <id> (<name>) on discord"). The public relay-delivery hint is routing context,
+# not authority. Trust comes from the capability-backed physical Relay owner,
+# whose registered adapter must still front the same platform and connector
+# identity.
 # ---------------------------------------------------------------------------
 
 
@@ -135,7 +150,10 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
     relay-delivery marker instead.
     """
     _clear_auth_env(monkeypatch)
-    runner, _ = _make_runner(platform=Platform.RELAY, authorization_is_upstream=True)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
     src = SessionSource(
         platform=Platform.DISCORD,  # underlying platform off the wire
         user_id="267171776755269633",
@@ -146,10 +164,89 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
     )
     stamp_source_transport_owner(
         src,
+        adapter=relay,
         profile=None,
         platform=Platform.RELAY,
     )
     assert runner._is_user_authorized(src) is True
+
+
+def test_native_owned_source_cannot_borrow_relay_upstream_authorization(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    native = SimpleNamespace(
+        platform=Platform.DISCORD,
+        _transport_profile=None,
+    )
+    runner.adapters[Platform.DISCORD] = native
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="267171776755269633",
+        chat_id="1400724139874058314",
+        chat_type="dm",
+        delivered_via_upstream_relay=True,
+    )
+    stamp_source_transport_owner(src, adapter=native)
+
+    assert runner._is_user_authorized(src) is False
+    relay.prime_routing_source.assert_not_called()
+
+
+def test_exact_live_relay_passthrough_owner_is_process_local_authority(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = _relay_source()
+    stamp_source_transport_owner(
+        src,
+        adapter=relay,
+        profile=None,
+        platform=Platform.RELAY,
+    )
+
+    assert runner._is_user_authorized(src) is True
+
+    restored = SessionSource.from_dict(src.to_dict())
+    assert runner._is_user_authorized(restored) is False
+
+
+def test_lifecycle_restored_relay_owner_authorizes_only_matching_identity(
+    monkeypatch,
+):
+    _clear_auth_env(monkeypatch)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="267171776755269633",
+        chat_id="1400724139874058314",
+        chat_type="dm",
+        delivered_via_upstream_relay=True,
+    )
+    stamp_source_transport_owner(
+        src,
+        adapter=relay,
+        profile=None,
+        platform=Platform.RELAY,
+    )
+    restored = session_source_from_trusted_marker(
+        session_source_to_trusted_marker(src)
+    )
+
+    assert restored is not None
+    assert runner._adapter_for_source(restored) is relay
+    assert runner._is_user_authorized(restored) is True
+
+    relay.matches_transport_identity.return_value = False
+    assert runner._adapter_for_source(restored) is None
+    assert runner._is_user_authorized(restored) is False
 
 
 def test_ownerless_relay_marker_cannot_grant_upstream_authorization(monkeypatch):

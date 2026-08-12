@@ -146,7 +146,12 @@ class GatewayAuthorizationMixin:
         # authenticated connector socket. Looking up the underlying platform
         # here silently disables streaming, typing, and tool progress when a
         # managed gateway does not also run that platform's native adapter.
-        if getattr(source, "delivered_via_upstream_relay", False) is True:
+        source_attrs = getattr(source, "__dict__", {})
+        if (
+            source_has_transport_owner(source)
+            and source_attrs.get("_transport_platform") == Platform.RELAY
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+        ):
             # One process-level RelayAdapter owns the connector socket for all
             # multiplexed profiles. Secondary profiles intentionally do not
             # register their own relay adapters, so profile-aware lookup would
@@ -155,20 +160,16 @@ class GatewayAuthorizationMixin:
             # state from this authenticated in-process source before delivery.
             adapters = getattr(self, "adapters", None) or {}
             adapter = adapters.get(Platform.RELAY)
-            source_attrs = getattr(source, "__dict__", {})
-            expected_identity = (
-                source_attrs.get("_transport_identity")
-                if isinstance(source_attrs, dict)
-                else None
+            expected_identity = source_attrs.get("_transport_identity")
+            if expected_identity is None:
+                return None
+            matches_identity = getattr(
+                adapter, "matches_transport_identity", None
             )
-            if expected_identity is not None:
-                matches_identity = getattr(
-                    adapter, "matches_transport_identity", None
-                )
-                if not callable(matches_identity) or not matches_identity(
-                    str(expected_identity)
-                ):
-                    return None
+            if not callable(matches_identity) or not matches_identity(
+                str(expected_identity)
+            ):
+                return None
             fronts = getattr(adapter, "fronts_platform", None)
             if not callable(fronts) or not fronts(
                 getattr(source, "platform", None)
@@ -243,14 +244,12 @@ class GatewayAuthorizationMixin:
         intake-policy checks stay on that transport without weakening the
         fail-closed fallback for restored or hand-built sources.
         """
+        if not source_has_transport_owner(source):
+            return None
         adapter_ref = getattr(source, "_transport_adapter_ref", None)
         adapter = adapter_ref() if callable(adapter_ref) else None
         source_attrs = getattr(source, "__dict__", {})
-        platform = (
-            source_attrs.get("_transport_platform")
-            if source_has_transport_owner(source)
-            else getattr(source, "platform", None)
-        )
+        platform = source_attrs.get("_transport_platform")
         if adapter is None or platform is None:
             return None
         expected_identity = (
@@ -545,38 +544,47 @@ class GatewayAuthorizationMixin:
 
         adapter_profile = self._adapter_profile_for_source(source)
 
-        # Relay (and any adapter whose authorization is enforced by a trusted
-        # authenticated upstream): the Team Gateway connector authenticates this
-        # gateway's WS with a per-instance secret and resolves owner-only author
-        # bindings BEFORE delivering, so an inbound relay event was already
-        # authorized as this instance's bound user (the author id is the one the
-        # connector observed, never gateway-asserted). There is no local
-        # RELAY_ALLOWED_USERS env allowlist to consult, and default-denying for
-        # its absence is the bug this branch fixes. This is delegation to a
-        # trusted upstream, NOT a fail-open: it fires only for an event that was
-        # actually delivered over the authenticated relay WS (the transport
-        # stamps ``delivered_via_upstream_relay``), or whose platform's adapter
-        # explicitly declares ``authorization_is_upstream=True``; every direct
-        # network-exposed adapter leaves the flag False and its events unmarked,
-        # so the env-allowlist default-deny below still applies unchanged.
-        #
-        # The delivery marker is the PRIMARY signal: a relay *message* inbound
-        # carries the UNDERLYING platform (``source.platform`` == discord/…),
-        # NOT ``Platform.RELAY``, because that's what session-keying and egress
-        # need — so keying authz off ``source.platform`` would miss (the relay
-        # adapter is registered under ``Platform.RELAY``) and default-deny the
-        # user ("Unauthorized user <id> on discord"). The adapter-flag check is
-        # retained for events whose ``source.platform`` IS ``Platform.RELAY``
-        # (e.g. the interaction-passthrough path).
-        # ``is True`` (not just truthiness): the marker is a real bool on a
-        # SessionSource, and an explicit identity check refuses to authorize a
-        # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
-        # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
-            source.platform,
-            profile=adapter_profile,
-        ):
-            return True
+        # Honor upstream authorization only from the current PHYSICAL owner.
+        # Logical platform data and the relay-delivery marker are routing hints,
+        # not authority by themselves. Underlying-platform Relay ingress must
+        # prove the exact connector account plus advertised platform; passthrough
+        # ``Platform.RELAY`` events have no restorable underlying identity and
+        # therefore require the exact same-process RelayAdapter generation.
+        if has_transport_owner:
+            source_attrs = getattr(source, "__dict__", {})
+            transport_platform = source_attrs.get("_transport_platform")
+            owner_adapter = self._adapter_for_source(source)
+            upstream_authorized = (
+                owner_adapter is not None
+                and getattr(owner_adapter, "authorization_is_upstream", False)
+                is True
+            )
+            if upstream_authorized and transport_platform == Platform.RELAY:
+                if source.platform == Platform.RELAY:
+                    if self._registered_transport_adapter(source) is owner_adapter:
+                        return True
+                elif source.delivered_via_upstream_relay is True:
+                    expected_identity = source_attrs.get("_transport_identity")
+                    matches_identity = getattr(
+                        owner_adapter, "matches_transport_identity", None
+                    )
+                    fronts = getattr(owner_adapter, "fronts_platform", None)
+                    if (
+                        expected_identity is not None
+                        and callable(matches_identity)
+                        and matches_identity(str(expected_identity))
+                        and callable(fronts)
+                        and fronts(source.platform)
+                    ):
+                        return True
+            elif (
+                upstream_authorized
+                and transport_platform == source.platform
+            ):
+                # Non-Relay upstream-authenticated adapters (for example A2A)
+                # retain their contract, but only through their trusted current
+                # owner rather than a logical platform lookup.
+                return True
 
         user_id = source.user_id
 

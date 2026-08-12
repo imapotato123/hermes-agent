@@ -17,7 +17,11 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, SendResult
-from gateway.session import SessionSource, stamp_source_transport_owner
+from gateway.session import (
+    SessionSource,
+    session_source_to_trusted_marker,
+    stamp_source_transport_owner,
+)
 
 
 def _make_event(text="/update", platform=Platform.TELEGRAM,
@@ -231,11 +235,13 @@ class TestWatchUpdateProgress:
             chat_type="dm",
         )
         stamp_source_transport_owner(source, adapter=first)
-        marker = source.to_dict()
-        marker.update(
-            source=dict(marker),
-            session_key="agent:main:telegram:dm:111",
-        )
+        marker = {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+            "session_key": "agent:main:telegram:dm:111",
+            **session_source_to_trusted_marker(source),
+        }
         (hermes_home / ".update_pending.json").write_text(json.dumps(marker))
         (hermes_home / ".update_output.txt").write_text("exact-unsent-output\n")
 
