@@ -3226,6 +3226,10 @@ class BasePlatformAdapter(ABC):
         # state. The adapter's local session key deliberately keeps the legacy
         # ``agent:main`` namespace, even for multiplexed secondary adapters.
         self._backend_notice_profile: Optional[str] = None
+        # Profile whose credential/connection owns this transport. Unlike a
+        # SessionSource's runtime ``profile``, this does not change when a chat
+        # route selects another agent profile for the turn.
+        self._transport_profile: Optional[str] = None
         self._llm_error_last_posted = self._backend_notice_state.posted
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
@@ -6313,22 +6317,19 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         source: Optional[SessionSource] = None,
     ) -> str:
-        """Restore the logical profile namespace for shared notice state.
+        """Return an injective profile/session key for runner-wide notice state.
 
-        ``handle_message`` builds its adapter-local key before a secondary
-        profile handler stamps ``source.profile`` and intentionally omits the
-        multiplex profile. Reusing that raw key in runner-wide state would let
-        independent profile credentials suppress each other's notices.
+        Adapter-local session keys are built before multiplex routing stamps the
+        source profile. Always prefix the logical profile, including ``default``.
+        Length-prefixing keeps the encoding unambiguous even if plugin profiles
+        or session keys contain separators.
         """
         profile = str(
             (getattr(source, "profile", None) if source is not None else None)
             or self._backend_notice_profile
             or "default"
         ).strip() or "default"
-        # Namespace even the default profile explicitly. Its legacy session key
-        # uses ``agent:main:...`` and would otherwise collide with a valid
-        # multiplex profile literally named ``main``.
-        return f"profile:{profile}:{session_key}"
+        return f"profile:{len(profile)}:{profile}:{session_key}"
 
     def set_backend_notice_state(
         self,
@@ -6732,6 +6733,7 @@ class BasePlatformAdapter(ABC):
                             _obligation_id = None
                     if backend_notice_claimed:
                         async def _send_and_finish_backend_notice_claim():
+                            delivered = False
                             try:
                                 send_result = await delivery_adapter._send_with_retry(
                                     chat_id=event.source.chat_id,
@@ -6739,23 +6741,17 @@ class BasePlatformAdapter(ABC):
                                     reply_to=_reply_anchor,
                                     metadata=_final_thread_metadata,
                                 )
-                            except BaseException:
+                                delivered = bool(
+                                    getattr(send_result, "success", False)
+                                )
+                                return send_result
+                            finally:
                                 delivery_adapter._backend_notice_state.finish_claim(
                                     backend_notice_session_key,
                                     "backend_unavailable",
                                     time.monotonic(),
-                                    delivered=False,
+                                    delivered=delivered,
                                 )
-                                raise
-                            delivery_adapter._backend_notice_state.finish_claim(
-                                backend_notice_session_key,
-                                "backend_unavailable",
-                                time.monotonic(),
-                                delivered=bool(
-                                    getattr(send_result, "success", False)
-                                ),
-                            )
-                            return send_result
 
                         send_task = asyncio.create_task(
                             _send_and_finish_backend_notice_claim()
@@ -7367,6 +7363,14 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. Preserve its owning profile independently so a turn
+        # that outlives a reconnect can resolve the replacement generation.
+        setattr(
+            source,
+            "_transport_profile",
+            getattr(self, "_transport_profile", None),
+        )
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

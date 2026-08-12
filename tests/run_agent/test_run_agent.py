@@ -4599,6 +4599,50 @@ class TestRetryExhaustion:
         assert "error" in result
         assert "Invalid API response" in result["error"]
         assert result.get("final_response") == result["error"]
+        assert result["failure_reason"] == "unknown"
+
+    @pytest.mark.parametrize(
+        ("status_code", "failure_reason"),
+        [
+            (401, "auth"),
+            (402, "billing"),
+            (408, "timeout"),
+            (429, "rate_limit"),
+            (500, "server_error"),
+            (502, "server_error"),
+            (503, "overloaded"),
+            (504, "timeout"),
+            (524, "timeout"),
+            (529, "overloaded"),
+        ],
+    )
+    def test_invalid_response_status_carries_structured_reason(
+        self, agent, status_code, failure_reason
+    ):
+        """Production invalid-response returns preserve status taxonomy."""
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+        bad_resp = SimpleNamespace(
+            choices=[],
+            error=SimpleNamespace(code=status_code),
+            model="test/model",
+            usage=None,
+        )
+        agent.client.chat.completions.create.return_value = bad_resp
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == failure_reason
 
     def test_transient_failure_result_carries_structured_reason(self, agent):
         self._setup_agent(agent)
