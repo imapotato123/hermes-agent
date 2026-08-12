@@ -269,6 +269,17 @@ def test_parse_session_key_with_extra_parts():
     assert result == {"platform": "discord", "chat_type": "group", "chat_id": "chan123"}
 
 
+def test_parse_session_key_ignores_relay_transport_identity_suffix():
+    result = _parse_session_key(
+        "agent:main:discord:dm:chan123:transport=discord%3AappA"
+    )
+    assert result == {
+        "platform": "discord",
+        "chat_type": "dm",
+        "chat_id": "chan123",
+    }
+
+
 # ---------------------------------------------------------------------------
 # api_server (stateless) wake routing — gateway/wake.py self-post path
 # ---------------------------------------------------------------------------

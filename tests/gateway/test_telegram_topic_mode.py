@@ -13,7 +13,12 @@ import pytest
 from hermes_state import SessionDB
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 def _make_source(*, thread_id: str | None = None) -> SessionSource:
@@ -607,8 +612,10 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
     runner = _make_runner(session_db=db)
     runner._telegram_topic_mode_enabled = lambda source: True
 
+    source = _make_source(thread_id="42")
+    stamp_source_transport_owner(source, profile=None)
     await runner._rename_telegram_topic_for_session_title(
-        _make_source(thread_id="42"),
+        source,
         "sess-topic",
         "  Build   Telegram Topic UX  ",
     )

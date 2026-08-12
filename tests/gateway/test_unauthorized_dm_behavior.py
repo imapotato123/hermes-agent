@@ -5,7 +5,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -48,10 +48,8 @@ def _make_event(
     *,
     profile: str | None = None,
 ) -> MessageEvent:
-    return MessageEvent(
-        text="hello",
-        message_id="m1",
-        source=SessionSource(
+    source = stamp_source_transport_owner(
+        SessionSource(
             platform=platform,
             user_id=user_id,
             chat_id=chat_id,
@@ -59,6 +57,12 @@ def _make_event(
             chat_type="dm",
             profile=profile,
         ),
+        profile=profile,
+    )
+    return MessageEvent(
+        text="hello",
+        message_id="m1",
+        source=source,
     )
 
 
@@ -113,6 +117,7 @@ def test_whatsapp_lid_user_matches_phone_allowlist_via_modern_session_mapping(
         user_name="tester",
         chat_type="dm",
     )
+    stamp_source_transport_owner(source, profile=None)
 
     assert runner._is_user_authorized(source) is True
 
@@ -152,6 +157,7 @@ def test_simplex_allowlist_accepts_display_name(monkeypatch):
         user_name="hujikuji",   # adapter sets this to displayName
         chat_type="dm",
     )
+    stamp_source_transport_owner(source, profile=None)
     assert runner._is_user_authorized(source) is True
 
 
@@ -177,6 +183,7 @@ def test_telegram_group_users_legacy_chat_ids_still_authorize(monkeypatch):
         user_name="tester",
         chat_type="forum",
     )
+    stamp_source_transport_owner(source, profile=None)
 
     assert runner._is_user_authorized(source) is True
 
@@ -199,6 +206,7 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
         user_name="tester",
         chat_type="group",
     )
+    stamp_source_transport_owner(legacy_chat_source, profile=None)
     assert runner._is_user_authorized(legacy_chat_source) is True
 
     # Sender path: listed sender user ID authorized in any group
@@ -209,6 +217,7 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
         user_name="tester",
         chat_type="group",
     )
+    stamp_source_transport_owner(sender_source, profile=None)
     assert runner._is_user_authorized(sender_source) is True
 
 

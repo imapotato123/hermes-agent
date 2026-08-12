@@ -93,9 +93,17 @@ HTTP call.
 
 Frames (connector → gateway, over the WS):
 
-- `{"type":"inbound", "event": <MessageEvent>, "bufferId"?}`
+- `{"type":"inbound", "botId"?, "event": <MessageEvent>, "bufferId"?}`
 - `{"type":"interrupt_inbound", "session_key", "chat_id"}` (§5)
 - `{"type":"passthrough_forward", "forward": <PassthroughForward>, "bufferId"?}` (§5.1)
+
+`botId` is REQUIRED on `inbound` whenever the authenticated relay session
+advertised more than one bot identity for the event's `source.platform`. The
+gateway combines `source.platform` + `botId` into the durable physical-owner
+identity and uses that exact pair on every later egress. Omitting `botId` in an
+ambiguous same-platform session, or naming a pair that was not acknowledged at
+handshake, fails closed. Single-identity-per-platform sessions retain the
+platform's unique advertised identity when `botId` is absent.
 
 **Channel context on inbound (design relay-channel-context).** When the source
 platform's descriptor advertised `supports_context` (§2) and the chat is

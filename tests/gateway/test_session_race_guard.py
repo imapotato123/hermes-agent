@@ -16,7 +16,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, stamp_source_transport_owner
 
 
 class _FakeAdapter:
@@ -72,6 +72,7 @@ def _make_event(text="hello", chat_id="12345"):
         platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm",
         user_id="u1",
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
 
 

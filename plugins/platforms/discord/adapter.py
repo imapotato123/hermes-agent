@@ -3633,6 +3633,8 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images as a single Discord message with multiple attachments.
 
@@ -3643,9 +3645,17 @@ class DiscordAdapter(BasePlatformAdapter):
         directly. On per-chunk failure the remaining images in that chunk
         fall back to the base per-image loop.
         """
-        if not self._client:
-            return
         if not images:
+            return
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
+            return
+        if not self._client:
             return
 
         try:
@@ -3653,7 +3663,9 @@ class DiscordAdapter(BasePlatformAdapter):
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(
+                chat_id, images, metadata, human_delay, source=source
+            )
             return
 
         try:
@@ -3665,13 +3677,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(
+                chat_id, images, metadata, human_delay, source=source
+            )
             return
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
         for chunk_idx, chunk in enumerate(chunks):
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images[chunk_idx * CHUNK :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
@@ -3728,6 +3750,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not files:
                     continue
 
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[chunk_idx * CHUNK :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
+
                 # Use the first caption if any (Discord only has one message body for the group)
                 content = captions[0] if captions else None
                 logger.info(
@@ -3749,7 +3780,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay,
+                    source=source,
+                )
             finally:
                 if aiohttp_session is not None:
                     try:
