@@ -4145,8 +4145,13 @@ class BasePlatformAdapter(ABC):
 
         Best-effort — failures (gateway restart, permission denied, message
         too old for Telegram's 48h window) are swallowed at debug level.
-        Does not block the caller.
+        Does not block the caller. Unsupported adapters degrade to a normal
+        persistent send; capability is checked here on the adapter that owns
+        the returned message ID, not while the response is still on an older
+        transport generation.
         """
+        if type(self).delete_message is BasePlatformAdapter.delete_message:
+            return
 
         async def _run_delete() -> None:
             try:
@@ -4430,6 +4435,8 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[SessionSource] = None,
     ) -> None:
         """Send a batch of images.
 
@@ -4449,6 +4456,20 @@ class BasePlatformAdapter(ABC):
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
+                # The default implementation fans out into physical sends. A
+                # reconnect during an earlier image must move the next image to
+                # the current stamped owner (or withhold it), not resume on self.
+                delivery_adapter = (
+                    self._final_delivery_adapter(source)
+                    if source is not None
+                    else self
+                )
+                if delivery_adapter is None:
+                    logger.warning(
+                        "[%s] Withholding image: no live transport owner",
+                        self.name,
+                    )
+                    continue
                 logger.info(
                     "[%s] Sending image: %s (alt=%s)",
                     self.name,
@@ -4456,21 +4477,21 @@ class BasePlatformAdapter(ABC):
                     alt_text[:30] if alt_text else "",
                 )
                 if image_url.startswith("file://"):
-                    img_result = await self.send_image_file(
+                    img_result = await delivery_adapter.send_image_file(
                         chat_id=chat_id,
                         image_path=_unquote(image_url[7:]),
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                elif self._is_animation_url(image_url):
-                    img_result = await self.send_animation(
+                elif delivery_adapter._is_animation_url(image_url):
+                    img_result = await delivery_adapter.send_animation(
                         chat_id=chat_id,
                         animation_url=image_url,
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
                 else:
-                    img_result = await self.send_image(
+                    img_result = await delivery_adapter.send_image(
                         chat_id=chat_id,
                         image_url=image_url,
                         caption=alt_text if alt_text else None,
@@ -5510,9 +5531,8 @@ class BasePlatformAdapter(ABC):
         Accepts a plain string, ``None``, or an :class:`EphemeralReply`.
         Returns ``(text, ttl)`` where ``ttl > 0`` means the caller should
         schedule a deletion via :meth:`_schedule_ephemeral_delete` after
-        the send succeeds.  ``ttl`` is forced to 0 when the adapter
-        doesn't override :meth:`delete_message` so non-supporting
-        platforms silently degrade to normal sends.
+        the send succeeds. Capability is decided by the adapter that actually
+        owns the returned message ID.
         """
         if isinstance(response, EphemeralReply):
             ttl = response.ttl_seconds
@@ -5521,7 +5541,11 @@ class BasePlatformAdapter(ABC):
                     ttl = int(self._get_ephemeral_system_ttl_default())
                 except Exception:
                     ttl = 0
-            if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
+            if (
+                ttl
+                and ttl > 0
+                and type(self).delete_message is BasePlatformAdapter.delete_message
+            ):
                 ttl = 0
             return response.text, int(ttl or 0)
         return response, 0
@@ -6437,7 +6461,19 @@ class BasePlatformAdapter(ABC):
             # downstream extract_media / text-processing logic sees a plain
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
+            _ephemeral_requested_ttl = None
+            if isinstance(response, EphemeralReply):
+                try:
+                    _ephemeral_requested_ttl = int(
+                        response.ttl_seconds
+                        if response.ttl_seconds is not None
+                        else self._get_ephemeral_system_ttl_default()
+                    )
+                except Exception:
+                    _ephemeral_requested_ttl = 0
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            if _ephemeral_requested_ttl is not None:
+                _ephemeral_ttl = _ephemeral_requested_ttl
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -6565,6 +6601,7 @@ class BasePlatformAdapter(ABC):
                 # (#60671) — the gateway streaming-TTS consumer sets the flag.
                 _tts_path = None
                 _tts_paths: List[str] = []
+                _tts_generated_paths: List[str] = []
                 _tts_requested_path = None
                 tts_send = (
                     getattr(delivery_adapter, "play_tts", None)
@@ -6574,7 +6611,16 @@ class BasePlatformAdapter(ABC):
                 if (not is_backend_unavailable_response
                         and delivery_adapter is not None
                         and callable(tts_send)
-                        and self._should_auto_tts_for_chat(event.source.chat_id)
+                        and callable(
+                            getattr(
+                                delivery_adapter,
+                                "_should_auto_tts_for_chat",
+                                None,
+                            )
+                        )
+                        and delivery_adapter._should_auto_tts_for_chat(
+                            event.source.chat_id
+                        )
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -6599,19 +6645,52 @@ class BasePlatformAdapter(ABC):
                             _tts_requested_path = build_auto_tts_output_path(
                                 delivery_adapter.platform
                             )
-                            tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool,
-                                text=speech_text,
-                                output_path=_tts_requested_path,
+                            _tts_task = asyncio.create_task(
+                                asyncio.to_thread(
+                                    text_to_speech_tool,
+                                    text=speech_text,
+                                    output_path=_tts_requested_path,
+                                )
                             )
+
+                            def _cleanup_cancelled_tts(task: asyncio.Task) -> None:
+                                cleanup_paths = {_tts_requested_path}
+                                try:
+                                    cancelled_data = _json.loads(task.result())
+                                    cleanup_paths.update(
+                                        str(path)
+                                        for path in (
+                                            cancelled_data.get("file_paths")
+                                            or [cancelled_data.get("file_path")]
+                                        )
+                                        if path
+                                    )
+                                except BaseException:
+                                    pass
+                                for cleanup_path in cleanup_paths - {None}:
+                                    try:
+                                        os.unlink(cleanup_path)
+                                    except OSError:
+                                        pass
+
+                            try:
+                                tts_result_str = await asyncio.shield(_tts_task)
+                            except asyncio.CancelledError:
+                                # ``to_thread`` cannot stop an in-flight engine.
+                                # Let it finish, then delete every reported path.
+                                _tts_task.add_done_callback(_cleanup_cancelled_tts)
+                                raise
                             tts_data = _json.loads(tts_result_str)
+                            raw_tts_paths = tts_data.get("file_paths") or [
+                                tts_data.get("file_path")
+                            ]
+                            _tts_generated_paths = [
+                                str(path) for path in raw_tts_paths if path
+                            ]
                             if tts_data.get("success", True):
-                                raw_tts_paths = tts_data.get("file_paths") or [
-                                    tts_data.get("file_path")
-                                ]
                                 _tts_paths = [
-                                    str(path) for path in raw_tts_paths
-                                    if path and Path(path).exists()
+                                    path for path in _tts_generated_paths
+                                    if Path(path).exists()
                                 ]
                                 _tts_path = _tts_paths[0] if _tts_paths else None
                     except Exception as tts_err:
@@ -6619,9 +6698,13 @@ class BasePlatformAdapter(ABC):
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
-                _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
-                for _tts_index, _tts_path in enumerate(_tts_paths):
-                    try:
+                _tts_cleanup_paths = {
+                    _tts_requested_path,
+                    *_tts_generated_paths,
+                    *_tts_paths,
+                } - {None}
+                try:
+                    for _tts_index, _tts_path in enumerate(_tts_paths):
                         # TTS synthesis runs off-thread and may outlive another
                         # reconnect. Resolve again at the actual send boundary.
                         delivery_adapter = self._final_delivery_adapter(event.source)
@@ -6638,21 +6721,18 @@ class BasePlatformAdapter(ABC):
                             )
                             continue
                         # Caption eligibility and payload stay on the ORIGINAL
-                        # reply text. The spoken script is for synthesis only:
-                        # normalization can shrink a long reply below the
-                        # 1024-char caption limit, and captioning that spoken
-                        # form would suppress the full formatted reply the
-                        # user is meant to receive as a separate message.
-                        # Caption only on the first file.
+                        # reply text. Caption only on the first file.
                         telegram_tts_caption = None
                         if (
                             _tts_index == 0
-                            and self.platform == Platform.TELEGRAM
+                            and delivery_adapter.platform == Platform.TELEGRAM
                             and text_content
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await cast(Callable[..., Awaitable[Any]], tts_send)(
+                        tts_result = await cast(
+                            Callable[..., Awaitable[Any]], tts_send
+                        )(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
@@ -6666,12 +6746,9 @@ class BasePlatformAdapter(ABC):
                                 and getattr(tts_result, "success", False)
                             )
                         )
-                    finally:
-                        try:
-                            os.remove(_tts_path)
-                        except OSError:
-                            pass
-                if not _tts_paths and _tts_cleanup_paths:
+                finally:
+                    # Cancellation or failure on an early segment must not
+                    # strand later generated files.
                     for _cleanup_path in _tts_cleanup_paths:
                         try:
                             os.remove(_cleanup_path)
@@ -6772,10 +6849,26 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if await asyncio.to_thread(ledger_enabled):
+                                _source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                _transport_profile_stamped = (
+                                    isinstance(_source_attrs, dict)
+                                    and "_transport_profile" in _source_attrs
+                                )
+                                _transport_profile = (
+                                    _source_attrs.get("_transport_profile")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
+                                    transport_profile=_transport_profile,
+                                    transport_profile_stamped=(
+                                        _transport_profile_stamped
+                                    ),
                                 )
                                 await asyncio.to_thread(
                                     record_obligation,
@@ -6788,6 +6881,10 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    transport_profile=_transport_profile,
+                                    transport_profile_stamped=(
+                                        _transport_profile_stamped
+                                    ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -6914,12 +7011,20 @@ class BasePlatformAdapter(ABC):
                         )
                     else:
                         try:
-                            await cast(Callable[..., Awaitable[Any]], image_send)(
-                                chat_id=event.source.chat_id,
-                                images=images,
-                                metadata=_final_thread_metadata,
-                                human_delay=human_delay,
-                            )
+                            _image_kwargs: Dict[str, Any] = {
+                                "chat_id": event.source.chat_id,
+                                "images": images,
+                                "metadata": _final_thread_metadata,
+                                "human_delay": human_delay,
+                            }
+                            if (
+                                getattr(image_send, "__func__", None)
+                                is BasePlatformAdapter.send_multiple_images
+                            ):
+                                _image_kwargs["source"] = event.source
+                            await cast(
+                                Callable[..., Awaitable[Any]], image_send
+                            )(**_image_kwargs)
                         except Exception as batch_err:
                             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -6969,12 +7074,20 @@ class BasePlatformAdapter(ABC):
                     else:
                         try:
                             _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                            await cast(Callable[..., Awaitable[Any]], image_send)(
-                                chat_id=event.source.chat_id,
-                                images=_batch,
-                                metadata=_final_thread_metadata,
-                                human_delay=human_delay,
-                            )
+                            _image_kwargs = {
+                                "chat_id": event.source.chat_id,
+                                "images": _batch,
+                                "metadata": _final_thread_metadata,
+                                "human_delay": human_delay,
+                            }
+                            if (
+                                getattr(image_send, "__func__", None)
+                                is BasePlatformAdapter.send_multiple_images
+                            ):
+                                _image_kwargs["source"] = event.source
+                            await cast(
+                                Callable[..., Awaitable[Any]], image_send
+                            )(**_image_kwargs)
                         except Exception as batch_err:
                             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
