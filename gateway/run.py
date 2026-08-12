@@ -2463,6 +2463,8 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
+    BackendNoticeState,
+    BackendUnavailableReply,
     BasePlatformAdapter,
     EphemeralReply,
     MessageEvent,
@@ -2499,6 +2501,31 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_BACKEND_UNAVAILABLE_FAILURE_REASONS = frozenset({
+    "overloaded",
+    "server_error",
+    "timeout",
+})
+_BACKEND_UNAVAILABLE_NOTICE = (
+    "The AI backend is temporarily unavailable. "
+    "Please try sending your message again in a moment."
+)
+
+
+def _is_backend_unavailable_agent_result(agent_result: dict) -> bool:
+    """Whether a failed agent result represents a transient backend outage.
+
+    The agent retry loop emits this structured classification.  Do not infer
+    it from exceptions at the adapter layer, where a connection failure may
+    belong to Slack, Telegram, media delivery, storage, or another subsystem.
+    """
+    return bool(
+        agent_result.get("failed")
+        and agent_result.get("failure_reason")
+        in _BACKEND_UNAVAILABLE_FAILURE_REASONS
+    )
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -5956,6 +5983,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.__dict__["_sessions"] = sessions
         return sessions
 
+    def _backend_notice_state_for_adapters(self) -> BackendNoticeState:
+        """Return runner-owned notice state, tolerating partial test runners."""
+        state = self.__dict__.get("_backend_notice_state")
+        if state is None:
+            state = BackendNoticeState()
+            self.__dict__["_backend_notice_state"] = state
+        return state
+
+    def _share_backend_notice_state(
+        self,
+        adapter: Any,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Wire runner routing and profile-scoped state across reconnects."""
+        # All adapters participate in replacement routing, including direct
+        # built-ins created outside plugin factories.
+        adapter.gateway_runner = self
+        if not profile_name:
+            try:
+                profile_name = self._active_profile_name()
+            except Exception:
+                profile_name = None
+        # ``source.profile`` is the runtime/session namespace and may be changed
+        # by a chat-based profile route. Keep the credential/transport owner
+        # separately so an in-flight turn can find this adapter's replacement.
+        adapter._transport_profile = str(profile_name or "").strip() or None
+        setter = getattr(adapter, "set_backend_notice_state", None)
+        if callable(setter):
+            setter(
+                self._backend_notice_state_for_adapters(),
+                profile_name=profile_name,
+            )
+
+    def _bind_voice_input_callback(self, adapter: Any) -> None:
+        """Bind Discord voice ingress to one live transport generation.
+
+        Voice source metadata is serialized while a channel is joined, so its
+        nonserialized transport provenance cannot survive restoration. Capture
+        that provenance at the trusted adapter boundary and reattach it before
+        authorization instead of inferring credential ownership from the
+        logical routed profile stored in the source.
+        """
+        if not hasattr(adapter, "_voice_input_callback"):
+            return
+        try:
+            adapter_ref = _weakref.ref(adapter)
+        except TypeError:
+            # Production adapters are weak-referenceable. Fail closed for an
+            # unusual hand-built adapter rather than retain a disconnected
+            # credential generation through a strong closure.
+            adapter._voice_input_callback = None
+            return
+        transport_profile = getattr(adapter, "_transport_profile", None)
+
+        async def _voice_input_callback(
+            guild_id: int,
+            user_id: int,
+            transcript: str,
+        ) -> None:
+            await self._handle_voice_channel_input(
+                guild_id,
+                user_id,
+                transcript,
+                transport_adapter_ref=adapter_ref,
+                transport_profile=transport_profile,
+            )
+
+        adapter._voice_input_callback = _voice_input_callback
+
     def _session_state(self, session_key: str) -> "SessionState":
         """Get-or-create the :class:`SessionState` for ``session_key``."""
         sessions = self._sessions_map()
@@ -6014,6 +6110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._backend_notice_state = BackendNoticeState()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -10748,14 +10845,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
-            _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
-            }
+            # Claim only rows whose exact transport credential is connected.
+            # Legacy rows have no owner stamp and retain the historical primary
+            # route. A same-platform adapter owned by another profile is never
+            # a deliverable route for a stamped row.
+            _deliverable_routes = set()
+            for _platform, _adapter in self.adapters.items():
+                _platform_value = getattr(_platform, "value", str(_platform))
+                _deliverable_routes.add((_platform_value, False, None))
+                if hasattr(_adapter, "_transport_profile"):
+                    _deliverable_routes.add(
+                        (
+                            _platform_value,
+                            True,
+                            getattr(_adapter, "_transport_profile", None),
+                        )
+                    )
+            for _profile, _profile_adapters in (
+                getattr(self, "_profile_adapters", None) or {}
+            ).items():
+                for _platform in _profile_adapters:
+                    _deliverable_routes.add(
+                        (
+                            getattr(_platform, "value", str(_platform)),
+                            True,
+                            _profile,
+                        )
+                    )
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable,
+                None,
+                deliverable_routes=_deliverable_routes,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -10773,9 +10893,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            if row.get("transport_profile_stamped"):
+                _recovery_source = SessionSource(
+                    platform=platform,
+                    chat_id=str(row["chat_id"]),
+                    thread_id=row.get("thread_id"),
+                )
+                setattr(
+                    _recovery_source,
+                    "_transport_profile",
+                    row.get("transport_profile"),
+                )
+                adapter = self._adapter_for_source(_recovery_source)
+            else:
+                adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
             content = row["content"]
@@ -11518,6 +11650,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            self._share_backend_notice_state(adapter)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -11547,8 +11680,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._sync_voice_mode_state_to_adapter(adapter)
                     # Wire voice input callback at connect time so voice
                     # transcription is forwarded without requiring /voice join.
-                    if hasattr(adapter, "_voice_input_callback"):
-                        adapter._voice_input_callback = self._handle_voice_channel_input
+                    self._bind_voice_input_callback(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -12911,6 +13043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._share_backend_notice_state(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -12931,8 +13064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
-                        if hasattr(adapter, "_voice_input_callback"):
-                            adapter._voice_input_callback = self._handle_voice_channel_input
+                        self._bind_voice_input_callback(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -13886,6 +14018,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        self._share_backend_notice_state(adapter, profile_name=profile_name)
+        self._bind_voice_input_callback(adapter)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -18891,6 +19025,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # The retry loop already classified provider failures.  Mark
+            # transient backend outages explicitly so the adapter can suppress
+            # only this safe notice and arm its cooldown after delivery.
+            if (
+                not _gateway_surface_passes_raw_text(source.platform)
+                and _is_backend_unavailable_agent_result(agent_result)
+            ):
+                return BackendUnavailableReply(_BACKEND_UNAVAILABLE_NOTICE)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -19774,8 +19917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+        self._bind_voice_input_callback(adapter)
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -19888,15 +20030,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        transport_adapter_ref: Optional[Callable[[], Any]] = None,
+        transport_profile: Optional[str] = None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
+        Production callbacks bind the exact Discord adapter generation and
+        credential profile that received the audio. Direct three-argument calls
+        retain the historical primary-adapter fallback for tests/in-process use.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
-        if not adapter:
+        callback_bound = transport_adapter_ref is not None
+        if not callback_bound:
+            adapter = self.adapters.get(Platform.DISCORD)
+            if not adapter:
+                return
+            stamped_profile = getattr(adapter, "_transport_profile", None)
+            transport_profile = (
+                stamped_profile.strip()
+                if isinstance(stamped_profile, str) and stamped_profile.strip()
+                else None
+            )
+            try:
+                transport_adapter_ref = _weakref.ref(adapter)
+            except TypeError:
+                transport_adapter_ref = None
+        else:
+            adapter = (
+                transport_adapter_ref()
+                if callable(transport_adapter_ref)
+                else None
+            )
+            if adapter is None:
+                return
+
+        # A callback retained by a disconnected Discord voice client must not
+        # authorize or dispatch through a replacement credential. Historical
+        # direct calls already select the current primary slot above and retain
+        # their unstamped compatibility path.
+        if callback_bound and self._authorization_adapter(
+            Platform.DISCORD,
+            profile=transport_profile,
+        ) is not adapter:
+            logger.debug(
+                "Ignoring voice input from an unregistered Discord adapter generation"
+            )
             return
 
         text_ch_id = adapter._voice_text_channels.get(guild_id)
@@ -19918,6 +20102,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+
+        # Runtime transport provenance is deliberately nonserialized. Reattach
+        # it from the live ingress callback before any policy or pairing lookup;
+        # ``source.profile`` remains the logical routed session namespace.
+        setattr(source, "_transport_profile", transport_profile)
+        if transport_adapter_ref is not None:
+            setattr(source, "_transport_adapter_ref", transport_adapter_ref)
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20046,6 +20237,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+    def _live_delivery_operation(
+        self,
+        source: SessionSource,
+        fallback_adapter: Any,
+        operation: str,
+    ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+        """Resolve one current transport operation, preserving legacy sources.
+
+        Explicit owner stamps are authoritative and fail closed. Hand-built or
+        restored legacy sources without a stamp retain the historical captured
+        adapter fallback. Operations are duck-typed for plugin compatibility.
+        """
+        source_attrs = getattr(source, "__dict__", {})
+        stamped = (
+            isinstance(source_attrs, dict)
+            and "_transport_profile" in source_attrs
+        )
+        if not stamped:
+            adapter = fallback_adapter
+        else:
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                adapter = None
+        if adapter is None:
+            return None, None
+        if stamped and getattr(adapter, "platform", None) != source.platform:
+            return None, None
+        method = getattr(adapter, operation, None)
+        if not callable(method):
+            return adapter, None
+        return adapter, cast(Callable[..., Awaitable[Any]], method)
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -20064,9 +20288,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Ogg/Opus bytes for every provider. Others keep MP3.
             audio_path = build_auto_tts_output_path(event.source.platform)
 
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+            _tts_task = asyncio.create_task(
+                asyncio.to_thread(
+                    text_to_speech_tool,
+                    text=tts_text,
+                    output_path=audio_path,
+                )
             )
+
+            def _cleanup_cancelled_voice_tts(task: asyncio.Task) -> None:
+                cleanup_paths = {audio_path}
+                try:
+                    cancelled_result = json.loads(task.result())
+                    cleanup_paths.update(
+                        str(path)
+                        for path in (
+                            cancelled_result.get("file_paths")
+                            or [cancelled_result.get("file_path")]
+                        )
+                        if path
+                    )
+                except BaseException:
+                    pass
+                for cleanup_path in cleanup_paths - {None}:
+                    try:
+                        os.unlink(cleanup_path)
+                    except OSError:
+                        pass
+
+            try:
+                result_json = await asyncio.shield(_tts_task)
+            except asyncio.CancelledError:
+                _tts_task.add_done_callback(_cleanup_cancelled_voice_tts)
+                raise
             try:
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
@@ -20087,47 +20341,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            adapter = self._adapter_for_source(event.source)
+            fallback_adapter = self._adapter_for_source(event.source)
 
-            # If connected to a voice channel, play there instead of sending a file
+            # If connected to a voice channel, play there instead of sending a file.
+            # Re-evaluate this policy and operation for each generated file because
+            # reconnect can replace the credential while an earlier send awaits.
             guild_id = self._get_guild_id(event)
-            play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
-            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
-            send_voice = getattr(adapter, "send_voice", None)
-            in_voice_channel = bool(
-                guild_id
-                and callable(play_in_voice_channel)
-                and callable(is_in_voice_channel)
-                and is_in_voice_channel(guild_id)
-            )
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if not in_voice_channel and callable(send_voice):
-                # Mark the auto voice reply as notify-worthy.  Mirrors the
-                # final-text path in gateway/platforms/base.py which sets
-                # ``notify=True`` so platform adapters that gate push
-                # notifications (Telegram "important" mode) deliver the
-                # final voice reply as a normal notification instead of a
-                # silent message.  Clone first so we don't mutate metadata
-                # shared with concurrent typing-indicator state.
-                if thread_meta is not None:
-                    thread_meta = dict(thread_meta)
-                    thread_meta["notify"] = True
-                else:
-                    thread_meta = {"notify": True}
+            if thread_meta is not None:
+                thread_meta = dict(thread_meta)
+                thread_meta["notify"] = True
+            else:
+                thread_meta = {"notify": True}
             for actual_path in actual_paths:
+                adapter, play_in_voice_channel = self._live_delivery_operation(
+                    event.source,
+                    fallback_adapter,
+                    "play_in_voice_channel",
+                )
+                is_in_voice_channel = getattr(
+                    adapter, "is_in_voice_channel", None
+                ) if adapter is not None else None
+                in_voice_channel = bool(
+                    guild_id
+                    and callable(play_in_voice_channel)
+                    and callable(is_in_voice_channel)
+                    and is_in_voice_channel(guild_id)
+                )
                 if in_voice_channel:
-                    play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
-                elif callable(send_voice):
-                    send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
-                        "audio_path": actual_path,
-                        "reply_to": reply_anchor,
-                        "metadata": thread_meta,
-                    }
-                    await send_voice_call(**send_kwargs)
+                    await cast(
+                        Callable[..., Awaitable[Any]], play_in_voice_channel
+                    )(guild_id, actual_path)
+                    continue
+                _, send_voice = self._live_delivery_operation(
+                    event.source,
+                    fallback_adapter,
+                    "send_voice",
+                )
+                if not callable(send_voice):
+                    logger.warning(
+                        "Withholding auto voice reply: no live transport owner"
+                    )
+                    continue
+                await send_voice(
+                    chat_id=event.source.chat_id,
+                    audio_path=actual_path,
+                    reply_to=reply_anchor,
+                    metadata=thread_meta,
+                )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -20172,6 +20434,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
+            # Extract with the captured adapter for parser compatibility; every
+            # physical delivery below resolves the current transport owner.
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -20217,39 +20481,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     non_image_media.append((media_path, is_voice))
 
             if image_paths:
+                live_adapter = None
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    live_adapter, image_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        "send_multiple_images",
+                    )
+                    if not callable(image_send):
+                        logger.warning(
+                            "Withholding post-stream images: no live transport owner"
+                        )
+                    else:
+                        _image_kwargs = {
+                            "chat_id": event.source.chat_id,
+                            "images": images,
+                            "metadata": _thread_meta,
+                        }
+                        if (
+                            getattr(image_send, "__func__", None)
+                            is BasePlatformAdapter.send_multiple_images
+                        ):
+                            _image_kwargs["source"] = event.source
+                        await image_send(**_image_kwargs)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Post-stream image batch delivery failed: %s",
+                        getattr(live_adapter, "name", getattr(adapter, "name", "gateway")),
+                        e,
+                    )
+
+            for media_path, is_voice in non_image_media:
+                live_adapter = None
+                try:
+                    ext = Path(media_path).suffix.lower()
+                    method_name = "send_document"
+                    path_arg = "file_path"
+                    if should_send_media_as_audio(
+                        event.source.platform, ext, is_voice=is_voice
+                    ):
+                        method_name = "send_voice"
+                        path_arg = "audio_path"
+                    elif ext in _VIDEO_EXTS:
+                        method_name = "send_video"
+                        path_arg = "video_path"
+                    live_adapter, media_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        method_name,
+                    )
+                    if not callable(media_send):
+                        logger.warning(
+                            "Withholding post-stream media: no live %s operation",
+                            method_name,
+                        )
+                        continue
+                    await media_send(
                         chat_id=event.source.chat_id,
-                        images=images,
+                        **{path_arg: media_path},
                         metadata=_thread_meta,
                     )
                 except Exception as e:
-                    logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
-
-            for media_path, is_voice in non_image_media:
-                try:
-                    ext = Path(media_path).suffix.lower()
-                    if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream media delivery failed: %s",
+                        getattr(live_adapter, "name", getattr(adapter, "name", "gateway")),
+                        e,
+                    )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -20268,11 +20568,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
-                await adapter.send(
-                    source.chat_id,
-                    text_content,
-                    metadata=metadata,
+                _, send = self._live_delivery_operation(
+                    source, adapter, "send"
                 )
+                if not callable(send):
+                    logger.warning(
+                        "Withholding queued turn response: no live transport owner"
+                    )
+                else:
+                    await send(
+                        source.chat_id,
+                        text_content,
+                        metadata=metadata,
+                    )
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
