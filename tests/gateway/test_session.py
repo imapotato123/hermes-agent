@@ -9,6 +9,7 @@ from hermes_state import SessionDB
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
+    backend_notice_session_key,
     copy_session_source,
     SessionEntry,
     SessionSource,
@@ -88,6 +89,42 @@ class TestSessionSourceRoundtrip:
         assert copied._transport_identity == "slack:bot-1"
         assert copied._transport_adapter_ref() is adapter
         assert not hasattr(copied, "_untrusted_dynamic_attribute")
+
+    def test_notice_key_uses_stamped_primary_not_routed_runtime_profile(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="routed-runtime",
+        )
+        source._transport_profile = None
+        source._transport_platform = Platform.SLACK
+
+        key = backend_notice_session_key(
+            "agent:routed-runtime:slack:dm:C1",
+            source,
+            fallback_profile="default",
+        )
+
+        assert key == (
+            "profile:7:default:agent:routed-runtime:slack:dm:C1"
+        )
+
+    def test_notice_key_includes_stamped_relay_identity(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.RELAY
+        source._transport_identity = "slack:bot-1"
+
+        key = backend_notice_session_key(
+            "agent:main:slack:dm:C1",
+            source,
+            fallback_profile="default",
+        )
+
+        assert key == (
+            "transport:11:slack:bot-1:"
+            "profile:7:default:agent:main:slack:dm:C1"
+        )
 
     def test_copy_preserves_explicit_trusted_legacy_state(self):
         source = SessionSource.from_dict(

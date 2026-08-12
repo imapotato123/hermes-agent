@@ -2435,6 +2435,7 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    backend_notice_session_key,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
@@ -21012,16 +21013,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             backend_notice_key = ""
             if is_backend_unavailable:
                 session_key = self._session_key_for_source(source)
-                notice_adapter = self._adapter_for_source(source)
-                notice_key_fn = getattr(
-                    notice_adapter, "_backend_notice_session_key", None
+                backend_notice_key = backend_notice_session_key(
+                    session_key,
+                    source,
+                    fallback_profile=getattr(
+                        adapter, "_backend_notice_profile", None
+                    ),
                 )
-                notice_key_value = (
-                    notice_key_fn(session_key, source)
-                    if callable(notice_key_fn)
-                    else session_key
-                )
-                backend_notice_key = str(notice_key_value)
                 backend_notice_claimed = await (
                     self._backend_notice_state_for_adapters().claim(
                         backend_notice_key, "backend_unavailable"
@@ -21056,12 +21054,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                     if text_content:
-                        send_result = await _deliver(
-                            "send",
-                            chat_id=source.chat_id,
-                            content=outbound_text,
-                            metadata=_thread_metadata,
-                        )
+                        if is_backend_unavailable:
+                            notice_state = self._backend_notice_state_for_adapters()
+
+                            async def _send_and_finish_background_notice_claim():
+                                delivered = False
+                                try:
+                                    send_result = await _deliver(
+                                        "send",
+                                        chat_id=source.chat_id,
+                                        content=outbound_text,
+                                        metadata=_thread_metadata,
+                                    )
+                                    delivered = bool(
+                                        getattr(send_result, "success", False)
+                                    )
+                                    return send_result
+                                finally:
+                                    notice_state.finish_claim(
+                                        backend_notice_key,
+                                        "backend_unavailable",
+                                        time.monotonic(),
+                                        delivered=delivered,
+                                    )
+
+                            send_task = asyncio.create_task(
+                                _send_and_finish_background_notice_claim()
+                            )
+                            try:
+                                send_result = await asyncio.shield(send_task)
+                            except asyncio.CancelledError:
+                                notice_state.track_delivery_task(send_task)
+                                raise
+                            finally:
+                                backend_notice_claimed = False
+                        else:
+                            send_result = await _deliver(
+                                "send",
+                                chat_id=source.chat_id,
+                                content=outbound_text,
+                                metadata=_thread_metadata,
+                            )
                         notice_delivered = bool(
                             getattr(send_result, "success", False)
                         )

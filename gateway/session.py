@@ -459,6 +459,46 @@ def copy_session_source(source: SessionSource, **changes: Any) -> SessionSource:
     return copied
 
 
+def backend_notice_session_key(
+    session_key: str,
+    source: Optional[SessionSource] = None,
+    *,
+    fallback_profile: Optional[str] = None,
+) -> str:
+    """Return one reconnect-stable namespace for backend notice claims.
+
+    Physical transport provenance wins over the logical runtime profile. The
+    fallback exists only for trusted legacy/adapter-local callers whose source
+    predates owner stamping; reconnecting modern sources carry the owner profile
+    themselves. Relay identities qualify the namespace because two connector
+    credentials can expose the same logical platform/chat identifiers.
+    """
+    source_attrs = getattr(source, "__dict__", {})
+    stamped = source_has_transport_owner(source)
+    transport_profile = (
+        source_attrs.get("_transport_profile")
+        if stamped and isinstance(source_attrs, dict)
+        else None
+    )
+    logical_profile = getattr(source, "profile", None) if source is not None else None
+    profile_candidate = (
+        transport_profile or fallback_profile or "default"
+        if stamped
+        else logical_profile or fallback_profile or "default"
+    )
+    profile = str(profile_candidate).strip() or "default"
+    qualified = f"profile:{len(profile)}:{profile}:{session_key}"
+    transport_identity = (
+        source_attrs.get("_transport_identity")
+        if stamped and isinstance(source_attrs, dict)
+        else None
+    )
+    if transport_identity is None:
+        return qualified
+    identity = str(transport_identity)
+    return f"transport:{len(identity)}:{identity}:{qualified}"
+
+
 def session_source_from_trusted_marker(data: Dict[str, Any]) -> Optional[SessionSource]:
     """Restore lifecycle-marker routing with explicit legacy migration.
 

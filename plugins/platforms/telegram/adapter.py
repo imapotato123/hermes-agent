@@ -8517,7 +8517,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        from gateway.session import copy_session_source
+
+        return copy_session_source(
+            source,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+        )
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
