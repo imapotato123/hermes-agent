@@ -112,6 +112,9 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         logical_platform = _platform_name(getattr(source, "platform", None))
         if logical_platform and logical_platform != Platform.RELAY.value:
             metadata["_relay_logical_platform"] = logical_platform
+        identity = source_attrs.get("_transport_identity")
+        if identity:
+            metadata["_relay_transport_identity"] = str(identity)
         scope_id = getattr(source, "scope_id", None)
         user_id = getattr(source, "user_id", None)
         if scope_id:

@@ -2450,6 +2450,7 @@ from gateway.session import (
 from gateway.delivery import (
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
+    relay_fronts_platform,
     resolve_delivery_transport,
 )
 from gateway.turn_lease import (
@@ -3503,7 +3504,11 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+        if (
+            len(parts) > 5
+            and parts[3] in {"dm", "thread"}
+            and not parts[5].startswith("transport=")
+        ):
             result["thread_id"] = parts[5]
         return result
     return None
@@ -10997,6 +11002,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for _platform, _adapter in self.adapters.items():
                 _platform_value = getattr(_platform, "value", str(_platform))
                 _deliverable_routes.add((_platform_value, False, None, None))
+                if _platform == Platform.RELAY:
+                    # Legacy unstamped rows contain only the logical route. A
+                    # relay may claim one only when it positively advertises that
+                    # exact platform; missing/non-callable/false/error remains
+                    # fail closed without blocking unrelated native recovery.
+                    for _logical_platform in Platform:
+                        if (
+                            _logical_platform != Platform.RELAY
+                            and relay_fronts_platform(
+                                _adapter, _logical_platform
+                            )
+                        ):
+                            _deliverable_routes.add(
+                                (
+                                    _logical_platform.value,
+                                    False,
+                                    None,
+                                    None,
+                                )
+                            )
                 if hasattr(_adapter, "_transport_profile"):
                     _identity_values = (None,)
                     if _platform == Platform.RELAY:
@@ -11043,6 +11068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         redelivered = 0
         for row in claimed:
             _recovery_source: Optional[SessionSource] = None
+            _legacy_transport = None
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -11095,6 +11121,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self._adapter_for_source(_recovery_source)
             else:
                 adapter = self.adapters.get(platform)
+                if adapter is None:
+                    _legacy_transport = resolve_delivery_transport(
+                        platform, self.config, self.adapters
+                    )
+                    adapter = (
+                        _legacy_transport.adapter
+                        if _legacy_transport is not None
+                        else None
+                    )
             if adapter is None:
                 # The route existed at claim time but vanished before delivery.
                 # Fail closed and restore the recovery budget for a later boot.
@@ -11113,8 +11148,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
             metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                self._thread_metadata_for_source(_recovery_source)
+                if _recovery_source is not None
+                else (
+                    {"thread_id": row["thread_id"]}
+                    if row.get("thread_id")
+                    else None
+                )
             )
+            if (
+                row.get("transport_profile_stamped")
+                and _recovery_source is not None
+                and getattr(_recovery_source, "_transport_platform", None)
+                == Platform.RELAY
+            ):
+                metadata = dict(metadata or {})
+                metadata["_relay_logical_platform"] = platform.value
+                transport_identity = getattr(
+                    _recovery_source, "_transport_identity", None
+                )
+                if transport_identity:
+                    metadata["_relay_transport_identity"] = str(
+                        transport_identity
+                    )
+                if row.get("route_scope_id"):
+                    metadata["scope_id"] = str(row["route_scope_id"])
+                if row.get("route_user_id"):
+                    metadata["user_id"] = str(row["route_user_id"])
+            elif (
+                not row.get("transport_profile_stamped")
+                and _legacy_transport is not None
+                and _legacy_transport.is_relay
+            ):
+                metadata = dict(metadata or {})
+                if row.get("route_scope_id"):
+                    metadata["scope_id"] = str(row["route_scope_id"])
+                if row.get("route_user_id"):
+                    metadata["user_id"] = str(row["route_user_id"])
             try:
                 if row.get("transport_profile_stamped"):
                     assert _recovery_source is not None
@@ -11134,6 +11204,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=row["chat_id"],
                         content=content,
                         metadata=metadata,
+                    )
+                elif _legacy_transport is not None and _legacy_transport.is_relay:
+                    result = await _legacy_transport.send(
+                        platform,
+                        row["chat_id"],
+                        content,
+                        metadata,
                     )
                 else:
                     result = await cast(Any, adapter).send(
@@ -22231,6 +22308,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if logical_platform and logical_platform != Platform.RELAY.value:
                 metadata = dict(metadata or {})
                 metadata["_relay_logical_platform"] = str(logical_platform)
+            identity = source_attrs.get("_transport_identity")
+            if identity:
+                metadata = dict(metadata or {})
+                metadata["_relay_transport_identity"] = str(identity)
             scope_id = getattr(source, "scope_id", None)
             user_id = getattr(source, "user_id", None)
             if scope_id:
