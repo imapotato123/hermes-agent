@@ -636,33 +636,77 @@ class WebSocketRelayTransport:
 
     # ── outbound ─────────────────────────────────────────────────────────
     async def send_outbound(
-        self, action: Dict[str, Any], *, platform: Optional[str] = None
+        self,
+        action: Dict[str, Any],
+        *,
+        platform: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return await self._request_response(action, platform=platform)
+        return await self._request_response(
+            action,
+            platform=platform,
+            identity=identity,
+        )
 
     async def send_follow_up(
-        self, action: Dict[str, Any], *, platform: Optional[str] = None
+        self,
+        action: Dict[str, Any],
+        *,
+        platform: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> Dict[str, Any]:
         # follow_up rides the same outbound frame; the connector dispatches by
         # action.op. Kept as a distinct method to satisfy the transport Protocol
         # and to make the A2 call site explicit.
-        return await self._request_response(action, platform=platform)
+        return await self._request_response(
+            action,
+            platform=platform,
+            identity=identity,
+        )
 
-    def _bot_id_for(self, platform: Optional[str]) -> Optional[str]:
-        """The bot_id this transport advertised at hello for ``platform`` (Phase 1.5).
+    def _identity_for_egress(
+        self,
+        platform: Optional[str],
+        identity: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        """Resolve exactly one advertised ``(platform, bot_id)`` pair.
 
-        The connector validates a per-frame egress target against the SET of
-        ``platform:botId`` pairs it accumulated from the N hellos, so a per-frame
-        ``platform`` must ride with its MATCHING ``botId`` (the session default
-        botId belongs to the first identity and would mis-key for a second
-        platform). Resolved from the identity set this transport was built with.
-        None when the platform isn't one we front (the connector then rejects it
-        with a structured failure — never a wrong-credential send)."""
+        An explicit identity must match the configured set exactly; a platform-
+        only selector is accepted only when it names one unambiguous account.
+        Ambiguity therefore fails before wire egress instead of silently selecting
+        the first same-platform credential.
+        """
         if not platform:
             return None
-        for p, b in self._identities:
-            if p == platform:
-                return b
+        normalized_platform = str(platform)
+        candidates = [
+            (str(candidate_platform), str(candidate_bot_id or ""))
+            for candidate_platform, candidate_bot_id in self._identities
+            if str(candidate_platform) == normalized_platform
+        ]
+        if identity is not None:
+            identity_platform, separator, bot_id = str(identity).partition(":")
+            candidate = (identity_platform, bot_id)
+            return candidate if separator and candidate in candidates else None
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _identity_for_inbound_frame(
+        self,
+        platform: Any,
+        bot_id: Any,
+    ) -> Optional[str]:
+        """Validate one connector-stamped inbound physical account."""
+        normalized_platform = str(platform or "")
+        candidates = [
+            (str(candidate_platform), str(candidate_bot_id or ""))
+            for candidate_platform, candidate_bot_id in self._identities
+            if str(candidate_platform) == normalized_platform
+        ]
+        if bot_id is not None:
+            candidate = (normalized_platform, str(bot_id))
+            return f"{candidate[0]}:{candidate[1]}" if candidate in candidates else None
+        if len(candidates) == 1:
+            return f"{candidates[0][0]}:{candidates[0][1]}"
         return None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -766,6 +810,7 @@ class WebSocketRelayTransport:
         frame_type: str = "outbound",
         *,
         platform: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> Dict[str, Any]:
         if self._closing:
             # Teardown in progress: the disconnect() fail-pending loop may
@@ -775,6 +820,14 @@ class WebSocketRelayTransport:
             return {"success": False, "error": "relay transport closed"}
         if self._ws is None:
             return {"success": False, "error": "relay transport not connected"}
+        selected_identity = None
+        if platform:
+            selected_identity = self._identity_for_egress(platform, identity)
+            if selected_identity is None:
+                return {
+                    "success": False,
+                    "error": "relay egress identity is ambiguous or unadvertised",
+                }
         request_id = uuid.uuid4().hex
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
@@ -787,10 +840,9 @@ class WebSocketRelayTransport:
         # single-platform gateway emits the exact frame shape as before (the
         # connector falls back to the session's default platform when absent).
         if platform:
-            frame["platform"] = platform
-            bot_id = self._bot_id_for(platform)
-            if bot_id:
-                frame["botId"] = bot_id
+            assert selected_identity is not None
+            frame["platform"] = selected_identity[0]
+            frame["botId"] = selected_identity[1]
         try:
             await self._send(frame)
             return await asyncio.wait_for(fut, timeout=self._outbound_timeout_s)
@@ -928,7 +980,23 @@ class WebSocketRelayTransport:
                 self._descriptor_ready.set_result(descriptor)
         elif ftype == "inbound":
             if self._inbound is not None:
-                event = _event_from_wire(frame.get("event", {}))
+                raw_event = frame.get("event", {})
+                raw_source = (
+                    raw_event.get("source", {})
+                    if isinstance(raw_event, dict)
+                    else {}
+                )
+                identity = self._identity_for_inbound_frame(
+                    raw_source.get("platform"),
+                    frame.get("botId"),
+                )
+                if identity is None:
+                    logger.warning(
+                        "relay: dropping inbound with ambiguous or unadvertised identity"
+                    )
+                    return
+                event = _event_from_wire(raw_event)
+                event.source._relay_transport_identity = identity
                 await self._inbound(event)
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the
@@ -959,7 +1027,21 @@ class WebSocketRelayTransport:
             # bufferId (when present, §5.3 buffered flip) is passed for ack.
             handler = getattr(self, "_passthrough_handler", None)
             if handler is not None:
-                fwd = _passthrough_from_wire(frame.get("forward", {}))
+                raw_forward = frame.get("forward", {})
+                identity = self._identity_for_inbound_frame(
+                    raw_forward.get("platform")
+                    if isinstance(raw_forward, dict)
+                    else None,
+                    raw_forward.get("botId")
+                    if isinstance(raw_forward, dict)
+                    else None,
+                )
+                if identity is None:
+                    logger.warning(
+                        "relay: dropping passthrough with ambiguous or unadvertised identity"
+                    )
+                    return
+                fwd = _passthrough_from_wire(raw_forward)
                 await handler(fwd, frame.get("bufferId"))
         else:
             # hello/outbound/interrupt are gateway->connector; ignore if echoed.

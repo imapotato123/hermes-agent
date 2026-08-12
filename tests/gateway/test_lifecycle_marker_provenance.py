@@ -211,6 +211,26 @@ def test_relay_marker_restores_exact_identity_and_local_relay_hint():
     assert restored.delivered_via_upstream_relay is True
 
 
+def test_relay_marker_rejects_identity_for_different_logical_platform():
+    restored = session_source_from_trusted_marker(
+        {
+            "source": SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="D1",
+            ).to_dict(),
+            "transport_owner_stamped": True,
+            "transport_platform": "relay",
+            "transport_profile": None,
+            "transport_identity": "slack:appB",
+            "delivered_via_upstream_relay": True,
+        }
+    )
+
+    assert restored is not None
+    assert source_has_transport_owner(restored) is False
+    assert restored.delivered_via_upstream_relay is False
+
+
 def test_encoder_refuses_ambiguous_relay_owner_without_identity():
     source = SessionSource(
         platform=Platform.DISCORD,

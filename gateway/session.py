@@ -418,6 +418,30 @@ def source_has_transport_owner(source: Any) -> bool:
     )
 
 
+def relay_transport_identity_matches_platform(
+    identity: Any,
+    platform: Any,
+) -> bool:
+    """Return whether an exact Relay identity belongs to ``platform``.
+
+    Relay identities are process-local ``<logical-platform>:<bot-id>`` owner
+    fingerprints. The logical platform is part of the authority: a Discord
+    source must never borrow a currently advertised Slack identity merely
+    because both ride the same physical Relay socket.
+    """
+    if not isinstance(identity, str):
+        return False
+    identity_platform, separator, _bot_id = identity.strip().partition(":")
+    platform_value = str(getattr(platform, "value", platform) or "").strip()
+    return bool(
+        separator
+        and identity_platform
+        and platform_value
+        and platform_value != Platform.RELAY.value
+        and identity_platform == platform_value
+    )
+
+
 _TRANSPORT_PROFILE_UNSET = object()
 
 
@@ -558,8 +582,12 @@ def session_source_to_trusted_marker(source: SessionSource) -> Dict[str, Any]:
     if identity is not None and not isinstance(identity, str):
         return _ownerless()
     normalized_identity = identity.strip() or None if isinstance(identity, str) else None
-    if physical_platform == Platform.RELAY and normalized_identity is None:
-        return _ownerless()
+    if physical_platform == Platform.RELAY:
+        if normalized_identity is None or not relay_transport_identity_matches_platform(
+            normalized_identity,
+            getattr(source, "platform", None),
+        ):
+            return _ownerless()
 
     marker.update(
         transport_owner_stamped=True,
@@ -617,8 +645,12 @@ def session_source_from_trusted_marker(
             if not isinstance(identity, str):
                 return source
             identity = identity.strip() or None
-        if physical_platform == Platform.RELAY and identity is None:
-            return source
+        if physical_platform == Platform.RELAY:
+            if identity is None or not relay_transport_identity_matches_platform(
+                identity,
+                getattr(source, "platform", None),
+            ):
+                return source
 
         stamp_source_transport_owner(
             source,

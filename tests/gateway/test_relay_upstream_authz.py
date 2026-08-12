@@ -249,6 +249,34 @@ def test_lifecycle_restored_relay_owner_authorizes_only_matching_identity(
     assert runner._is_user_authorized(restored) is False
 
 
+def test_contradictory_relay_lifecycle_identity_cannot_authorize(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    restored = session_source_from_trusted_marker(
+        {
+            "source": SessionSource(
+                platform=Platform.DISCORD,
+                user_id="267171776755269633",
+                chat_id="1400724139874058314",
+                delivered_via_upstream_relay=True,
+            ).to_dict(),
+            "transport_owner_stamped": True,
+            "transport_platform": "relay",
+            "transport_profile": None,
+            "transport_identity": "slack:appB",
+            "delivered_via_upstream_relay": True,
+        }
+    )
+
+    assert restored is not None
+    assert runner._adapter_for_source(restored) is None
+    assert runner._is_user_authorized(restored) is False
+    relay.prime_routing_source.assert_not_called()
+
+
 def test_ownerless_relay_marker_cannot_grant_upstream_authorization(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _ = _make_runner(

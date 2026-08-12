@@ -137,6 +137,90 @@ async def test_inbound_frame_reaches_handler(server):
         await t.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_inbound_same_platform_identity_requires_exact_bot_id():
+    """A multiplexed socket cannot collapse two Discord accounts to one owner."""
+    received = []
+    t = WebSocketRelayTransport(
+        "wss://connector.example/relay",
+        "discord",
+        "appA",
+        identities=[("discord", "appA"), ("discord", "appB")],
+    )
+    t.set_inbound_handler(lambda event: received.append(event) or asyncio.sleep(0))
+    event = {
+        "text": "hello",
+        "message_type": "text",
+        "source": {
+            "platform": "discord",
+            "chat_id": "chan1",
+            "chat_type": "group",
+        },
+    }
+
+    await t._handle_frame(json.dumps({"type": "inbound", "event": event}))
+    await t._handle_frame(
+        json.dumps(
+            {
+                "type": "inbound",
+                "botId": "unknown",
+                "event": event,
+            }
+        )
+    )
+    await t._handle_frame(
+        json.dumps(
+            {
+                "type": "inbound",
+                "botId": "appB",
+                "event": event,
+            }
+        )
+    )
+
+    assert len(received) == 1
+    assert received[0].source._relay_transport_identity == "discord:appB"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_same_platform_identity_requires_exact_bot_id():
+    received = []
+    t = WebSocketRelayTransport(
+        "wss://connector.example/relay",
+        "discord",
+        "appA",
+        identities=[("discord", "appA"), ("discord", "appB")],
+    )
+
+    async def handler(forward, buffer_id):
+        received.append((forward, buffer_id))
+
+    t.set_passthrough_handler(handler)
+    base = {
+        "type": "passthrough_forward",
+        "forward": {
+            "platform": "discord",
+            "method": "POST",
+            "path": "/interactions",
+            "headers": [],
+            "bodyB64": "",
+        },
+    }
+
+    await t._handle_frame(json.dumps(base))
+    await t._handle_frame(
+        json.dumps(
+            {
+                **base,
+                "forward": {**base["forward"], "botId": "appB"},
+            }
+        )
+    )
+
+    assert len(received) == 1
+    assert received[0][0].bot_id == "appB"
+
+
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────
 
 

@@ -5696,15 +5696,26 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        async def _send_once(send_adapter: Any, payload: str) -> "SendResult":
+            source_send = getattr(send_adapter, "send_for_source", None)
+            if source is not None and callable(source_send):
+                return await source_send(
+                    source,
+                    payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return await send_adapter.send(
+                chat_id=chat_id,
+                content=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
         send_adapter = self._retry_delivery_adapter(source)
         if send_adapter is None:
             return SendResult(success=False, error="transport owner unavailable")
-        result = await send_adapter.send(
-            chat_id=chat_id,
-            content=content,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        result = await _send_once(send_adapter, content)
 
         if result.success:
             return result
@@ -5738,12 +5749,7 @@ class BasePlatformAdapter(ABC):
                     return SendResult(
                         success=False, error="transport owner unavailable"
                     )
-                result = await send_adapter.send(
-                    chat_id=chat_id,
-                    content=content,
-                    reply_to=reply_to,
-                    metadata=metadata,
-                )
+                result = await _send_once(send_adapter, content)
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
@@ -5762,12 +5768,7 @@ class BasePlatformAdapter(ABC):
                 try:
                     send_adapter = self._retry_delivery_adapter(source)
                     if send_adapter is not None:
-                        await send_adapter.send(
-                            chat_id=chat_id,
-                            content=notice,
-                            reply_to=reply_to,
-                            metadata=metadata,
-                        )
+                        await _send_once(send_adapter, notice)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
@@ -5777,11 +5778,9 @@ class BasePlatformAdapter(ABC):
         send_adapter = self._retry_delivery_adapter(source)
         if send_adapter is None:
             return SendResult(success=False, error="transport owner unavailable")
-        fallback_result = await send_adapter.send(
-            chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
-            reply_to=reply_to,
-            metadata=metadata,
+        fallback_result = await _send_once(
+            send_adapter,
+            f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)

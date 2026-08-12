@@ -32,7 +32,11 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
-from gateway.session import SessionSource, stamp_source_transport_owner
+from gateway.session import (
+    SessionSource,
+    relay_transport_identity_matches_platform,
+    stamp_source_transport_owner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -381,10 +385,15 @@ class RelayAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     def _stamp_transport_owner(self, event: Any) -> None:
-        """Record relay as the physical owner without persisting auth trust."""
+        """Record Relay plus its exact authenticated account as physical owner."""
         source = getattr(event, "source", None)
         if source is None:
             return
+        exact_identity = getattr(source, "_relay_transport_identity", None)
+        try:
+            delattr(source, "_relay_transport_identity")
+        except AttributeError:
+            pass
         # The process-level relay socket is deliberately profile-independent.
         stamp_source_transport_owner(
             source,
@@ -392,6 +401,15 @@ class RelayAdapter(BasePlatformAdapter):
             profile=None,
             platform=Platform.RELAY,
         )
+        if (
+            exact_identity is not None
+            and relay_transport_identity_matches_platform(
+                exact_identity,
+                getattr(source, "platform", None),
+            )
+            and self.matches_transport_identity(str(exact_identity))
+        ):
+            source._transport_identity = str(exact_identity)
 
     def _relay_slack_extra(self) -> Dict[str, Any]:
         """The Slack-behavior subset of the RELAY platform config.
@@ -752,19 +770,42 @@ class RelayAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send from immutable source routing state, bypassing chat-id aliases."""
-        route_metadata = dict(metadata or {})
+        """Send through the exact Relay account stamped on ``source``.
+
+        Trusted live sources carry an exact account fingerprint. Synthetic and
+        legacy helper callers may omit it only when the current transport
+        advertises exactly one account for the logical platform; duplicate
+        same-platform accounts remain fail-closed.
+        """
+        exact_identity = getattr(source, "_transport_identity", None)
         logical_platform = getattr(source.platform, "value", source.platform)
+        if exact_identity is None:
+            exact_identity = self.transport_identity_for_platform(logical_platform)
+        if (
+            exact_identity is None
+            or not relay_transport_identity_matches_platform(
+                exact_identity,
+                logical_platform,
+            )
+            or not self.matches_transport_identity(str(exact_identity))
+        ):
+            return SendResult(
+                success=False,
+                error="relay source identity is unavailable or contradictory",
+            )
+        route_metadata = dict(metadata or {})
         route_metadata["_relay_logical_platform"] = str(logical_platform)
         if source.scope_id:
             route_metadata["scope_id"] = str(source.scope_id)
         if source.user_id:
             route_metadata["user_id"] = str(source.user_id)
-        return await self.send(
+        return await self.send_for_platform(
+            logical_platform,
             str(source.chat_id),
             content,
             reply_to=reply_to,
             metadata=route_metadata,
+            identity=str(exact_identity),
         )
 
     @staticmethod
@@ -793,7 +834,10 @@ class RelayAdapter(BasePlatformAdapter):
         platform_value = getattr(platform, "value", platform)
         if not platform_value:
             return False
-        return self.transport_identity_for_platform(platform_value) is not None
+        return any(
+            acknowledged_platform == str(platform_value)
+            for acknowledged_platform, _bot_id in self._acknowledged_transport_identities()
+        )
 
     def _acknowledged_transport_identities(self) -> list[tuple[str, str]]:
         """Return current-handshake identities acknowledged by the connector."""
@@ -961,7 +1005,7 @@ class RelayAdapter(BasePlatformAdapter):
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
         source = SessionSource(
-            platform=Platform.RELAY,
+            platform=Platform.DISCORD,
             chat_id=channel_id,
             chat_type="channel" if guild_id else "dm",
             user_id=str(user.get("id"))
@@ -974,6 +1018,9 @@ class RelayAdapter(BasePlatformAdapter):
             if guild_id
             else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+        )
+        source._relay_transport_identity = (
+            f"discord:{getattr(forward, 'bot_id', '')}"
         )
         event = MessageEvent(text=text, message_type=message_type, source=source)
         if itype == 3:
@@ -1157,6 +1204,8 @@ class RelayAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        identity: Optional[str] = None,
     ) -> SendResult:
         """Send to an explicitly advertised logical platform over Relay.
 
@@ -1173,6 +1222,9 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
+        send_kwargs: Dict[str, Any] = {"platform": str(platform_value)}
+        if identity is not None:
+            send_kwargs["identity"] = identity
         result = await self._transport.send_outbound(
             {
                 "op": "send",
@@ -1181,7 +1233,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "reply_to": reply_to,
                 "metadata": self._with_scope(chat_id, metadata),
             },
-            platform=str(platform_value),
+            **send_kwargs,
         )
         return SendResult(
             success=bool(result.get("success")),

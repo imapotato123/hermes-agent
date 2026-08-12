@@ -159,6 +159,44 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_same_platform_bot_identity_survives_source_to_egress():
+    descriptor = CapabilityDescriptor(
+        contract_version=1,
+        platform="discord",
+        label="Discord",
+        max_message_length=2000,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="discord",
+        len_unit="chars",
+    )
+    stub = StubConnector(descriptor)
+    stub._identities = [("discord", "appA"), ("discord", "appB")]
+    adapter = RelayAdapter(PlatformConfig(), descriptor, transport=stub)
+    await adapter.connect()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="dc-1",
+        chat_type="channel",
+    )
+    source._relay_transport_identity = "discord:appB"
+    event = MessageEvent(text="hello", source=source)
+
+    await stub.push_inbound(event)
+    result = await adapter._send_with_retry(
+        chat_id=event.source.chat_id,
+        content="reply",
+        source=event.source,
+        max_retries=0,
+    )
+
+    assert result.success is True
+    assert event.source._transport_identity == "discord:appB"
+    assert stub.sent_identities[-1] == "discord:appB"
+
+
+@pytest.mark.asyncio
 async def test_same_chat_id_across_platforms_never_combines_route_state():
     descriptor = CapabilityDescriptor(
         contract_version=1,

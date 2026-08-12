@@ -33,6 +33,7 @@ class StubConnector:
         self.sent: List[Dict[str, Any]] = []
         # Per-frame egress platform recorded alongside each sent action (Phase 1.5).
         self.sent_platforms: List[Optional[str]] = []
+        self.sent_identities: List[Optional[str]] = []
         self.interrupts: List[Dict[str, Any]] = []
         self.follow_ups: List[Dict[str, Any]] = []
         self.follow_up_platforms: List[Optional[str]] = []
@@ -83,12 +84,17 @@ class StubConnector:
         self._passthrough = handler
 
     async def send_outbound(
-        self, action: Dict[str, Any], *, platform: Optional[str] = None
+        self,
+        action: Dict[str, Any],
+        *,
+        platform: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> Dict[str, Any]:
         # Record the per-frame egress platform (Phase 1.5) alongside the action so
         # tests can assert which platform a reply was tagged for.
         self.sent.append(action)
         self.sent_platforms.append(platform)
+        self.sent_identities.append(identity)
         if action.get("op") == "send":
             return dict(self.next_send_result)
         if action.get("op") == "send_media":
