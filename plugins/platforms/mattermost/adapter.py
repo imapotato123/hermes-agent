@@ -74,6 +74,7 @@ _MATTERMOST_DISABLE_MENTIONS_PROPS = {"disable_mentions": True}
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+_POST_OWNER_REPLACED = object()
 
 
 def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -233,7 +234,9 @@ class MattermostAdapter(BasePlatformAdapter):
         chat_id: str,
         payload: Dict[str, Any],
         metadata: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        *,
+        source: Optional[Any] = None,
+    ) -> Any:
         """Post once, optionally falling back flat for final notify content."""
         data = await self._api_post("posts", payload)
         if data or "root_id" not in payload:
@@ -242,6 +245,11 @@ class MattermostAdapter(BasePlatformAdapter):
             return data
         if not self._last_post_failure_is_broken_thread_root():
             return data
+        if source is not None and self._final_delivery_adapter(source) is not self:
+            # The first post failed definitively, so prepared file IDs are safe
+            # to transfer. The retired generation must not start the helper's
+            # second physical post.
+            return _POST_OWNER_REPLACED
 
         flat_payload = dict(payload)
         flat_payload.pop("root_id", None)
@@ -846,9 +854,25 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
                 post_started = True
                 data = await self._post_preserving_thread(
-                    chat_id, payload, metadata
+                    chat_id,
+                    payload,
+                    metadata,
+                    source=source,
                 )
                 post_started = False
+                if data is _POST_OWNER_REPLACED:
+                    if await self._handoff_mattermost_chunk_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=chunk_remainder,
+                        next_image_index=handoff_next_index,
+                        file_ids=file_ids,
+                        caption_parts=handoff_captions,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
+                    return
                 if not data or "id" not in data:
                     if await self._handoff_mattermost_chunk_if_replaced(
                         source=source,

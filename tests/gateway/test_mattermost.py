@@ -421,6 +421,51 @@ class TestMattermostSend:
         assert payload["message"] == "caption"
 
     @pytest.mark.asyncio
+    async def test_image_batch_invalid_root_rechecks_owner_before_flat_fallback(
+        self, tmp_path
+    ):
+        """A retired adapter cannot start the helper's second physical post."""
+        stale = _make_adapter()
+        replacement = _make_adapter()
+        image = tmp_path / "image.png"
+        image.write_bytes(b"image")
+        owner = {"adapter": stale}
+        source = MagicMock()
+
+        stale._final_delivery_adapter = lambda source: owner["adapter"]
+        replacement._final_delivery_adapter = lambda source: owner["adapter"]
+        stale._thread_root_for_send = AsyncMock(return_value="bad-root")
+        replacement._thread_root_for_send = AsyncMock(return_value=None)
+        stale._upload_file = AsyncMock(return_value="prepared-file")
+        replacement._upload_file = AsyncMock()
+
+        async def invalid_root_then_replace(*_args, **_kwargs):
+            stale._last_post_status = 400
+            stale._last_post_error = "Invalid RootId parameter"
+            owner["adapter"] = replacement
+            return {}
+
+        stale._api_post = AsyncMock(side_effect=invalid_root_then_replace)
+        replacement._post_preserving_thread = AsyncMock(
+            return_value={"id": "replacement"}
+        )
+
+        await stale.send_multiple_images(
+            "channel-1",
+            [(image.as_uri(), "caption")],
+            metadata={"thread_id": "bad-root", "notify": True},
+            source=source,
+        )
+
+        stale._api_post.assert_awaited_once()
+        replacement._upload_file.assert_not_awaited()
+        replacement_post = replacement._post_preserving_thread.await_args
+        assert replacement_post is not None
+        payload = replacement_post.args[1]
+        assert payload["file_ids"] == ["prepared-file"]
+        assert payload["message"] == "caption"
+
+    @pytest.mark.asyncio
     async def test_image_batch_post_exception_is_not_retried_after_replacement(
         self, tmp_path
     ):

@@ -12,11 +12,12 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_event(text="/update", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890", thread_id=None):
+                user_id="12345", chat_id="67890", thread_id=None,
+                adapter=None, profile=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
@@ -24,6 +25,12 @@ def _make_event(text="/update", platform=Platform.TELEGRAM,
         chat_id=chat_id,
         user_name="testuser",
         thread_id=thread_id,
+    )
+    stamp_source_transport_owner(
+        source,
+        profile=profile,
+        platform=platform,
+        adapter=adapter,
     )
     return MessageEvent(text=text, source=source)
 
@@ -133,6 +140,10 @@ class TestHandleUpdateCommand:
         assert data["chat_id"] == "99999"
         assert data["chat_type"] == "dm"
         assert data["message_id"] == "m-update"
+        assert data["transport_owner_stamped"] is True
+        assert data["transport_platform"] == "telegram"
+        assert data["transport_profile"] is None
+        assert "transport_owner_stamped" not in data["source"]
         assert "timestamp" in data
         assert not (hermes_home / ".update_exit_code").exists()
 
@@ -287,6 +298,36 @@ class TestSendUpdateNotification:
 
         assert result is False
         mock_adapter.send.assert_not_called()
+        assert pending_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_defers_stamped_notification_when_exact_owner_is_missing(
+        self, tmp_path
+    ):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="secondary-update",
+            chat_type="dm",
+        )
+        stamp_source_transport_owner(source, profile="ops")
+        marker = source.to_dict()
+        marker["source"] = dict(marker)
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps(marker))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        primary = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: primary}
+        runner._profile_adapters = {}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is False
+        primary.send.assert_not_awaited()
         assert pending_path.exists()
 
     @pytest.mark.asyncio
@@ -504,11 +545,13 @@ class TestUpdateInHelp:
 
     def test_update_is_known_command(self):
         """The /update command is in the help text (proxy for _known_commands)."""
-        # _known_commands is local to _handle_message, so we verify by
-        # checking the help output includes it.
-        from gateway.run import GatewayRunner
-        import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
+        # Read the defining file instead of the imported class object: several
+        # gateway tests intentionally replace class methods while exercising
+        # compatibility shims, and source inspection must not observe one of
+        # those stand-ins through import-order leakage.
+        source = (Path(__file__).parents[2] / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
         assert '"update"' in source
 
 class TestWatchUpdateProgress:

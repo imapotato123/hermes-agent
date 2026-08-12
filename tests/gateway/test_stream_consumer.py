@@ -25,6 +25,64 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
+@pytest.mark.asyncio
+async def test_stream_replacement_sends_fresh_final_without_cross_generation_edit():
+    first = MagicMock()
+    first.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    first.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    first.delete_message = AsyncMock()
+    replacement = MagicMock()
+    replacement.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="final-2")
+    )
+    replacement.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="preview-1")
+    )
+    replacement.delete_message = AsyncMock()
+    owner = {"adapter": first}
+    consumer = GatewayStreamConsumer(
+        adapter=first,
+        chat_id="123",
+        config=StreamConsumerConfig(
+            edit_interval=0.0,
+            buffer_threshold=1,
+            cursor="",
+        ),
+        adapter_resolver=lambda: owner["adapter"],
+    )
+
+    assert await consumer._send_or_edit("preview") is True
+    owner["adapter"] = replacement
+    assert await consumer._send_or_edit("complete", finalize=True) is True
+
+    first.send.assert_awaited_once()
+    first.edit_message.assert_not_awaited()
+    first.delete_message.assert_not_awaited()
+    replacement.edit_message.assert_not_awaited()
+    replacement.delete_message.assert_not_awaited()
+    replacement.send.assert_awaited_once()
+    assert replacement.send.await_args.kwargs["content"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_stream_missing_replacement_fails_closed():
+    first = MagicMock()
+    first.send = AsyncMock()
+    owner = {"adapter": None}
+    consumer = GatewayStreamConsumer(
+        adapter=first,
+        chat_id="123",
+        adapter_resolver=lambda: owner["adapter"],
+    )
+
+    assert await consumer._send_or_edit("must not leak") is False
+    first.send.assert_not_awaited()
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 

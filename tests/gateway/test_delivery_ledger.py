@@ -237,6 +237,47 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
+    def test_claim_cas_includes_observed_process_start_time(self, monkeypatch):
+        """PID reuse between liveness check and UPDATE cannot steal a live claim."""
+        _record()
+        _orphan("ob-1")
+
+        class _RacingConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self._raced = False
+
+            def execute(self, sql, params=()):
+                if "SET owner_pid=?" in sql and not self._raced:
+                    self._raced = True
+                    self._conn.execute(
+                        "UPDATE delivery_obligations "
+                        "SET owner_pid=?, owner_started_at=? WHERE obligation_id=?",
+                        (999999999, 2, "ob-1"),
+                    )
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        real_transaction = dl._transaction
+
+        @dl.contextmanager
+        def racing_transaction():
+            with real_transaction() as conn:
+                yield _RacingConnection(conn)
+
+        monkeypatch.setattr(dl, "_transaction", racing_transaction)
+
+        assert dl.sweep_recoverable() == []
+        with dl._connect() as conn:
+            owner_pid, owner_started_at, attempts = conn.execute(
+                "SELECT owner_pid, owner_started_at, attempts "
+                "FROM delivery_obligations WHERE obligation_id=?",
+                ("ob-1",),
+            ).fetchone()
+        assert (owner_pid, owner_started_at, attempts) == (999999999, 2, 0)
+
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
@@ -299,6 +340,45 @@ class TestGatewayRedeliverySweep:
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_clear_still_fences_auto_resume(self):
+        from datetime import datetime
+
+        from gateway.config import Platform
+        from gateway.session import SessionEntry, SessionSource
+
+        _record()
+        _orphan("ob-1")
+        runner = self._runner()
+        setattr(
+            runner._async_session_store,
+            "clear_resume_pending",
+            AsyncMock(side_effect=OSError("disk")),
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="channel",
+        )
+        entry = SessionEntry(
+            session_key="agent:main:slack:channel:C1",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+        )
+        store = MagicMock()
+        store._lock = threading.Lock()
+        store._entries = {entry.session_key: entry}
+        store._ensure_loaded_locked = MagicMock()
+        runner.session_store = store
+        runner._AUTO_RESUME_REASONS = frozenset({"restart_interrupted"})
+
+        assert await runner._redeliver_pending_obligations() == 0
+        assert runner._schedule_resume_pending_sessions() == 0
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):

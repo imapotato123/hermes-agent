@@ -471,7 +471,154 @@ def stamp_source_transport_owner(
             if identity is not None:
                 source._transport_identity = str(identity)
     return source
-    
+
+
+def copy_session_source(source: SessionSource, **changes: Any) -> SessionSource:
+    """Clone *source* while preserving declared capability-backed state.
+
+    Runtime owner fields are keyword-only, non-comparing dataclass fields, so
+    :func:`dataclasses.replace` carries their exact process-local capability
+    objects through trusted in-process rewrites. Arbitrary dynamic attributes
+    are deliberately not copied.
+    """
+    return replace(source, **changes)
+
+
+def session_source_to_trusted_marker(source: SessionSource) -> Dict[str, Any]:
+    """Encode routing plus a separate owner envelope for a lifecycle marker.
+
+    Generic ``SessionSource.to_dict()`` output remains authority-free. Only
+    restart/update marker writers use this envelope, and only the paired trusted
+    decoder may restore it.
+    """
+    marker: Dict[str, Any] = {"source": source.to_dict()}
+
+    def _ownerless() -> Dict[str, Any]:
+        marker.update(
+            transport_owner_stamped=False,
+            transport_platform=None,
+            transport_profile=None,
+            transport_identity=None,
+        )
+        return marker
+
+    if not source_has_transport_owner(source):
+        return _ownerless()
+
+    platform_value = getattr(
+        getattr(source, "_transport_platform", None),
+        "value",
+        getattr(source, "_transport_platform", None),
+    )
+    try:
+        physical_platform = Platform(platform_value)
+    except (TypeError, ValueError):
+        return _ownerless()
+
+    profile = getattr(source, "_transport_profile", None)
+    if profile is not None and not isinstance(profile, str):
+        return _ownerless()
+    normalized_profile = profile.strip() or None if isinstance(profile, str) else None
+
+    identity = getattr(source, "_transport_identity", None)
+    if identity is not None and not isinstance(identity, str):
+        return _ownerless()
+    normalized_identity = identity.strip() or None if isinstance(identity, str) else None
+    if physical_platform == Platform.RELAY and normalized_identity is None:
+        return _ownerless()
+
+    marker.update(
+        transport_owner_stamped=True,
+        transport_platform=physical_platform.value,
+        transport_profile=normalized_profile,
+        transport_identity=normalized_identity,
+    )
+    if (
+        physical_platform == Platform.RELAY
+        and source.delivered_via_upstream_relay is True
+    ):
+        marker["delivered_via_upstream_relay"] = True
+    return marker
+
+
+def session_source_from_trusted_marker(
+    data: Dict[str, Any],
+) -> Optional[SessionSource]:
+    """Restore a local lifecycle marker without trusting generic source data.
+
+    A new nested marker mints physical-owner provenance only from a sibling
+    envelope whose stamp is literal ``True`` and whose fields validate. A
+    missing or malformed envelope stays modern and ownerless. Flat markers are
+    the narrowly scoped historical format and receive only legacy capability.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    source_data = data.get("source")
+    if isinstance(source_data, dict):
+        try:
+            source = SessionSource.from_dict(source_data)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if data.get("transport_owner_stamped") is not True:
+            return source
+
+        try:
+            physical_platform = Platform(data.get("transport_platform"))
+        except (TypeError, ValueError):
+            return source
+
+        profile = data.get("transport_profile")
+        if profile is not None:
+            if not isinstance(profile, str):
+                return source
+            profile = profile.strip() or None
+
+        identity = data.get("transport_identity")
+        if identity is not None:
+            if not isinstance(identity, str):
+                return source
+            identity = identity.strip() or None
+        if physical_platform == Platform.RELAY and identity is None:
+            return source
+
+        stamp_source_transport_owner(
+            source,
+            profile=profile,
+            platform=physical_platform,
+        )
+        source._transport_identity = identity
+        if (
+            physical_platform == Platform.RELAY
+            and data.get("delivered_via_upstream_relay") is True
+        ):
+            source.delivered_via_upstream_relay = True
+        return source
+
+    if not data.get("platform") or not data.get("chat_id"):
+        return None
+    try:
+        legacy_source = SessionSource.from_dict(
+            {
+                "platform": data.get("platform"),
+                "chat_id": data.get("chat_id"),
+                "chat_type": data.get("chat_type") or "dm",
+                "thread_id": data.get("thread_id"),
+                "message_id": data.get("message_id"),
+                "user_id": data.get("user_id"),
+                "scope_id": data.get("scope_id"),
+            },
+            allow_legacy_unstamped=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    # Historical flat markers may retain this outbound routing hint only inside
+    # this trusted compatibility boundary; generic deserialization never does.
+    legacy_source.delivered_via_upstream_relay = (
+        data.get("delivered_via_upstream_relay") is True
+    )
+    return legacy_source
 
 
 @dataclass

@@ -994,7 +994,9 @@ async def test_owner_appearing_after_initial_probe_receives_final_text(
     live_adapter = CaptureSlackAdapter()
     live_adapter.gateway_runner = runner
     runner.adapters[Platform.SLACK] = live_adapter
-    resolver = MagicMock(side_effect=[None, live_adapter, live_adapter])
+    resolver = MagicMock(
+        side_effect=[None, live_adapter, live_adapter, live_adapter]
+    )
     monkeypatch.setattr(stale_adapter, "_final_delivery_adapter", resolver)
 
     await stale_adapter._process_message_background(

@@ -9,8 +9,13 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
-from gateway.session import build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 from tests.gateway.restart_test_helpers import (
+    RestartTestAdapter,
     make_restart_runner,
     make_restart_source,
 )
@@ -61,6 +66,10 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     assert data["chat_id"] == "42"
     assert data["chat_type"] == "dm"
     assert data["message_id"] == "m1"
+    assert data["transport_owner_stamped"] is True
+    assert data["transport_platform"] == "telegram"
+    assert data["transport_profile"] is None
+    assert "transport_owner_stamped" not in data["source"]
     assert "thread_id" not in data  # no thread → omitted
 
 
@@ -373,6 +382,53 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 
 
 @pytest.mark.asyncio
+async def test_restart_notification_uses_exact_stamped_secondary_owner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, primary = make_restart_runner()
+    secondary = RestartTestAdapter()
+    runner._profile_adapters = {"ops": {Platform.TELEGRAM: secondary}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="secondary-restart",
+        chat_type="dm",
+        user_id="u1",
+    )
+    stamp_source_transport_owner(source, profile="ops", adapter=secondary)
+    marker = source.to_dict()
+    marker["source"] = dict(marker)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps(marker))
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "secondary-restart", None)
+    assert getattr(primary, "sent") == []
+    assert len(secondary.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_modern_ownerless_marker_defers(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, primary = make_restart_runner()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="ownerless-restart",
+        chat_type="dm",
+    )
+    marker = source.to_dict()
+    marker["source"] = dict(marker)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps(marker))
+
+    assert await runner._send_restart_notification() is None
+    assert notify_path.exists()
+    assert getattr(primary, "sent") == []
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_missing():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
@@ -390,6 +446,40 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_uses_exact_stamped_secondary_owner():
+    runner, primary = make_restart_runner()
+    secondary = RestartTestAdapter()
+    runner._profile_adapters = {"ops": {Platform.TELEGRAM: secondary}}
+    source = make_restart_source(chat_id="secondary-42")
+    stamp_source_transport_owner(source, profile="ops", adapter=secondary)
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert getattr(primary, "sent") == []
+    assert len(secondary.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_ownerless_modern_source_fails_closed():
+    runner, primary = make_restart_runner()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="ownerless-42",
+        chat_type="dm",
+    )
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert getattr(primary, "sent") == []
 
 
 @pytest.mark.asyncio

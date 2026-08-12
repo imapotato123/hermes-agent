@@ -424,8 +424,19 @@ def sweep_recoverable(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
                        updated_at=?
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid),
+                   WHERE obligation_id=?
+                     AND (owner_pid IS ? OR owner_pid=?)
+                     AND (owner_started_at IS ? OR owner_started_at=?)""",
+                (
+                    pid,
+                    started,
+                    now,
+                    oid,
+                    owner_pid,
+                    owner_pid,
+                    owner_started_at,
+                    owner_started_at,
+                ),
             )
             if cursor.rowcount:
                 claimed.append({

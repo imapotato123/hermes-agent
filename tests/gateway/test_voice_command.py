@@ -1249,15 +1249,19 @@ class TestSendVoiceReplyFilename:
         (gateway/platforms/base.py) when the path became platform-aware;
         the uniqueness contract lives there now.
         """
-        import inspect
-        from gateway.platforms.base import build_auto_tts_output_path
-        from gateway.run import GatewayRunner
-        source = inspect.getsource(build_auto_tts_output_path)
+        from pathlib import Path
+
+        repo_root = Path(__file__).parents[2]
+        source = (repo_root / "gateway" / "platforms" / "base.py").read_text(
+            encoding="utf-8"
+        )
         assert "uuid" in source, \
             "build_auto_tts_output_path should use uuid for unique filenames"
         assert "int(time.time())" not in source, \
             "build_auto_tts_output_path should not use int(time.time()) — collision risk"
-        runner_source = inspect.getsource(GatewayRunner._send_voice_reply)
+        runner_source = (repo_root / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
         assert "build_auto_tts_output_path" in runner_source, \
             "_send_voice_reply should build its path via build_auto_tts_output_path"
 
@@ -1404,11 +1408,19 @@ class TestSendVoiceReplyCleanup:
 
     def test_cleanup_in_finally(self):
         """The method has cleanup in a finally block, not inside try."""
-        import inspect, textwrap, ast
-        from gateway.run import GatewayRunner
-        source = textwrap.dedent(inspect.getsource(GatewayRunner._send_voice_reply))
+        import ast
+        from pathlib import Path
+
+        source = (Path(__file__).parents[2] / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
-        func = tree.body[0]
+        func = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_send_voice_reply"
+        )
 
         has_finally_unlink = False
         for node in ast.walk(func):
@@ -1431,9 +1443,11 @@ class TestAutoTtsTempFileCleanup:
 
     def test_source_has_finally_remove(self):
         """play_tts call is wrapped in try/finally with os.remove."""
-        import inspect
-        from gateway.platforms.base import BasePlatformAdapter
-        source = inspect.getsource(BasePlatformAdapter._process_message_background)
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parents[2] / "gateway" / "platforms" / "base.py"
+        ).read_text(encoding="utf-8")
         # Find the play_tts section and verify cleanup
         play_tts_idx = source.find("play_tts")
         assert play_tts_idx > 0
