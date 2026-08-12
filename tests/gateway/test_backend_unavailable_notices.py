@@ -12,6 +12,8 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import (
+    BackendNoticeState,
+    BackendUnavailableReply,
     _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS,
     _LLM_ERROR_TRACKER_MAX_SESSIONS,
     BasePlatformAdapter,
@@ -124,6 +126,8 @@ def _make_runner(adapter: CaptureSlackAdapter, results: list[dict]) -> gateway_r
         platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake-token")}
     )
     runner.adapters = {Platform.SLACK: adapter}
+    runner._backend_notice_state = BackendNoticeState()
+    runner._share_backend_notice_state(adapter, profile_name="default")
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
@@ -199,7 +203,9 @@ async def test_real_gateway_path_sanitizes_backend_transport_failure(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_mixed_transport_exceptions_share_one_cooldown(monkeypatch, tmp_path):
+async def test_mixed_transport_exceptions_share_one_cooldown(
+    monkeypatch, tmp_path, caplog
+):
     adapter = CaptureSlackAdapter()
     _wire_runner(
         monkeypatch,
@@ -216,6 +222,7 @@ async def test_mixed_transport_exceptions_share_one_cooldown(monkeypatch, tmp_pa
         await adapter._process_message_background(event, build_session_key(event.source))
 
     assert [message["content"] for message in adapter.sent] == [_NOTICE]
+    assert "response_delivery_dropped" not in caplog.text
     assert [hook for hook in adapter.processing_hooks if hook[0] == "complete"] == [
         ("complete", "m-1", ProcessingOutcome.FAILURE),
         ("complete", "m-2", ProcessingOutcome.FAILURE),
@@ -275,6 +282,30 @@ async def test_failed_notice_delivery_does_not_arm_cooldown(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_cancelled_notice_delivery_releases_inflight_claim(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    _wire_runner(
+        monkeypatch,
+        tmp_path,
+        adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    event = _make_event("m-1")
+    session_key = build_session_key(event.source)
+
+    async def cancel_delivery(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    adapter._send_with_retry = cancel_delivery
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._process_message_background(event, session_key)
+
+    assert adapter._backend_notice_state.inflight == set()
+    assert adapter._llm_error_last_posted == {}
+
+
+@pytest.mark.asyncio
 async def test_reconnect_rechecks_cooldown_on_adapter_that_will_send(
     monkeypatch, tmp_path
 ):
@@ -289,6 +320,7 @@ async def test_reconnect_rechecks_cooldown_on_adapter_that_will_send(
 
     replacement = CaptureSlackAdapter()
     cast(Any, replacement).gateway_runner = runner
+    replacement.set_backend_notice_state(runner._backend_notice_state)
     event = _make_event("m-1")
     session_key = build_session_key(event.source)
     replacement._record_llm_error_notice(
@@ -309,6 +341,144 @@ async def test_reconnect_rechecks_cooldown_on_adapter_that_will_send(
 
     assert replacement.sent == []
     assert stale_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_adapter_generations_share_one_inflight_claim(
+    monkeypatch, tmp_path
+):
+    first = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        first,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    cast(Any, first).gateway_runner = runner
+
+    second = CaptureSlackAdapter()
+    second.set_backend_notice_state(runner._backend_notice_state)
+    cast(Any, second).gateway_runner = runner
+    second.set_message_handler(AsyncMock(return_value=BackendUnavailableReply(_NOTICE)))
+
+    async def keep_typing(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    second._keep_typing = keep_typing
+
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def hold_first_send(*args, **kwargs):
+        send_started.set()
+        await release_send.wait()
+        first.sent.append({"content": kwargs["content"]})
+        return SendResult(success=True, message_id="first")
+
+    first._send_with_retry = hold_first_send
+    first_event = _make_event("m-1")
+    second_event = _make_event("m-2")
+    session_key = build_session_key(first_event.source)
+
+    first_task = asyncio.create_task(
+        first._process_message_background(first_event, session_key)
+    )
+    await send_started.wait()
+    runner.adapters[Platform.SLACK] = second
+    second_task = asyncio.create_task(
+        second._process_message_background(second_event, session_key)
+    )
+    await asyncio.sleep(0)
+    assert second_task.done() is False
+    release_send.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert len(first.sent) == 1
+    assert second.sent == []
+
+
+@pytest.mark.asyncio
+async def test_replacement_retries_notice_after_inflight_owner_delivery_fails(
+    monkeypatch, tmp_path
+):
+    first = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        first,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    cast(Any, first).gateway_runner = runner
+
+    second = CaptureSlackAdapter()
+    second.set_backend_notice_state(runner._backend_notice_state)
+    cast(Any, second).gateway_runner = runner
+    second.set_message_handler(AsyncMock(return_value=BackendUnavailableReply(_NOTICE)))
+
+    async def keep_typing(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    second._keep_typing = keep_typing
+
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def fail_first_send(*_args, **_kwargs):
+        send_started.set()
+        await release_send.wait()
+        return SendResult(success=False, error="stale transport disconnected")
+
+    first._send_with_retry = fail_first_send
+    first_event = _make_event("m-1")
+    second_event = _make_event("m-2")
+    session_key = build_session_key(first_event.source)
+
+    first_task = asyncio.create_task(
+        first._process_message_background(first_event, session_key)
+    )
+    await send_started.wait()
+    runner.adapters[Platform.SLACK] = second
+    second_task = asyncio.create_task(
+        second._process_message_background(second_event, session_key)
+    )
+    await asyncio.sleep(0)
+    assert second_task.done() is False
+
+    release_send.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert first.sent == []
+    assert [message["content"] for message in second.sent] == [_NOTICE]
+
+
+@pytest.mark.asyncio
+async def test_shared_runner_state_does_not_cross_suppress_profiles():
+    state = BackendNoticeState()
+    first = CaptureSlackAdapter()
+    second = CaptureSlackAdapter()
+    first.set_backend_notice_state(state, profile_name="alpha")
+    second.set_backend_notice_state(state, profile_name="beta")
+    first.set_message_handler(AsyncMock(return_value=BackendUnavailableReply(_NOTICE)))
+    second.set_message_handler(AsyncMock(return_value=BackendUnavailableReply(_NOTICE)))
+
+    async def keep_typing(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    first._keep_typing = keep_typing
+    second._keep_typing = keep_typing
+    first_event = _make_event("m-alpha")
+    second_event = _make_event("m-beta")
+    raw_session_key = build_session_key(first_event.source)
+
+    await first._process_message_background(first_event, raw_session_key)
+    await second._process_message_background(second_event, raw_session_key)
+
+    assert [message["content"] for message in first.sent] == [_NOTICE]
+    assert [message["content"] for message in second.sent] == [_NOTICE]
+    assert set(state.posted) == {
+        "agent:alpha:slack:channel:C123:171717",
+        "agent:beta:slack:channel:C123:171717",
+    }
 
 
 @pytest.mark.asyncio

@@ -191,6 +191,36 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _codex_failure_fields(
+    agent,
+    error: Exception | str | None,
+    *,
+    retired: bool = False,
+) -> dict[str, Any]:
+    """Classify Codex app-server failures with the shared agent taxonomy."""
+    if error is None:
+        return {}
+    from agent.error_classifier import classify_api_error
+
+    exception = error if isinstance(error, Exception) else RuntimeError(str(error))
+    classified = classify_api_error(
+        exception,
+        provider=getattr(agent, "provider", "") or "",
+        model=getattr(agent, "model", "") or "",
+    )
+    reason = classified.reason.value
+    if retired and reason == "unknown":
+        # A retired app-server session is known unhealthy (dead subprocess,
+        # wedged turn, or JSON-RPC internal failure).  Preserve any explicit
+        # auth/quota/timeout classification above; only promote the otherwise
+        # unknown transport/process failure to a transient server failure.
+        reason = "server_error"
+    return {
+        "failed": True,
+        "failure_reason": reason,
+    }
+
+
 def _record_codex_app_server_compaction(
     agent,
     turn,
@@ -731,6 +761,11 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+            **(
+                {}
+                if _user_interrupted
+                else _codex_failure_fields(agent, exc, retired=True)
+            ),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -859,6 +894,7 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    _failed = bool(turn.error and not _user_interrupted)
     return {
         "final_response": turn.final_text,
         "messages": messages,
@@ -872,6 +908,15 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        **(
+            _codex_failure_fields(
+                agent,
+                turn.error,
+                retired=bool(getattr(turn, "should_retire", False)),
+            )
+            if _failed
+            else {}
+        ),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

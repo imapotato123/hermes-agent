@@ -2673,6 +2673,85 @@ class BackendUnavailableReply(str):
         return str.__str__(self)
 
 
+class BackendNoticeState:
+    """Runner-scoped cooldown and in-flight claims for backend notices.
+
+    Adapter generations can overlap during reconnect. A contender waits for
+    the active owner's delivery result: successful delivery suppresses it,
+    while failed or cancelled delivery lets exactly one waiter take over.
+    """
+
+    def __init__(self) -> None:
+        self.posted: dict[str, tuple[str, float]] = {}
+        self.inflight: set[tuple[str, str]] = set()
+        self._claim_results: dict[
+            tuple[str, str], asyncio.Future[bool]
+        ] = {}
+
+    def _prune(self, now: float) -> None:
+        expired = [
+            key
+            for key, (_, timestamp) in self.posted.items()
+            if now - timestamp >= _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
+        ]
+        for key in expired:
+            del self.posted[key]
+
+    def is_suppressed(self, session_key: str, notice_kind: str, now: float) -> bool:
+        self._prune(now)
+        previous = self.posted.get(session_key)
+        return bool(
+            previous is not None
+            and previous[0] == notice_kind
+            and now - previous[1] < _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
+        )
+
+    async def claim(self, session_key: str, notice_kind: str) -> bool:
+        claim = (session_key, notice_kind)
+        while True:
+            if self.is_suppressed(session_key, notice_kind, time.monotonic()):
+                return False
+
+            owner_result = self._claim_results.get(claim)
+            if owner_result is None:
+                self.inflight.add(claim)
+                self._claim_results[claim] = (
+                    asyncio.get_running_loop().create_future()
+                )
+                return True
+
+            # Cancelling a reconnect generation must not cancel the shared
+            # completion signal and strand the owner or other waiters.
+            delivered = await asyncio.shield(owner_result)
+            if delivered:
+                return False
+            # The owner failed or was cancelled. Race other waiters for a new
+            # claim; one wins and the rest await that new owner.
+
+    def finish_claim(
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        delivered: bool,
+    ) -> None:
+        claim = (session_key, notice_kind)
+        owner_result = self._claim_results.pop(claim, None)
+        self.inflight.discard(claim)
+        if delivered:
+            self.record(session_key, notice_kind, now)
+        if owner_result is not None and not owner_result.done():
+            owner_result.set_result(delivered)
+
+    def record(self, session_key: str, notice_kind: str, now: float) -> None:
+        self._prune(now)
+        while len(self.posted) >= _LLM_ERROR_TRACKER_MAX_SESSIONS:
+            oldest = min(self.posted, key=lambda key: self.posted[key][1])
+            del self.posted[oldest]
+        self.posted[session_key] = (notice_kind, now)
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -3126,7 +3205,12 @@ class BasePlatformAdapter(ABC):
         # session_key -> (notice_kind, monotonic_timestamp).  Pruned on write
         # by _record_llm_error_notice; never grows past
         # _LLM_ERROR_TRACKER_MAX_SESSIONS.
-        self._llm_error_last_posted: dict[str, tuple[str, float]] = {}
+        self._backend_notice_state = BackendNoticeState()
+        # Logical profile namespace used only for runner-shared backend notice
+        # state. The adapter's local session key deliberately keeps the legacy
+        # ``agent:main`` namespace, even for multiplexed secondary adapters.
+        self._backend_notice_profile: Optional[str] = None
+        self._llm_error_last_posted = self._backend_notice_state.posted
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -6195,20 +6279,63 @@ class BasePlatformAdapter(ABC):
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
     def _llm_error_notice_suppressed(
-        self, session_key: str, notice_kind: str, now: float
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        source: Optional[SessionSource] = None,
     ) -> bool:
         """True when this session already saw this notice inside the cooldown."""
-        previous = self._llm_error_last_posted.get(session_key)
-        if previous is None:
-            return False
-        previous_kind, previous_ts = previous
-        return (
-            previous_kind == notice_kind
-            and now - previous_ts < _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
+        session_key = self._backend_notice_session_key(session_key, source)
+        return self._backend_notice_state.is_suppressed(
+            session_key, notice_kind, now
         )
 
+    def _backend_notice_session_key(
+        self,
+        session_key: str,
+        source: Optional[SessionSource] = None,
+    ) -> str:
+        """Restore the logical profile namespace for shared notice state.
+
+        ``handle_message`` builds its adapter-local key before a secondary
+        profile handler stamps ``source.profile`` and intentionally omits the
+        multiplex profile. Reusing that raw key in runner-wide state would let
+        independent profile credentials suppress each other's notices.
+        """
+        profile = str(
+            (getattr(source, "profile", None) if source is not None else None)
+            or self._backend_notice_profile
+            or ""
+        ).strip()
+        if not profile or profile == "default":
+            return session_key
+        prefix, separator, remainder = session_key.partition(":")
+        _namespace, namespace_separator, tail = remainder.partition(":")
+        if prefix == "agent" and separator and namespace_separator:
+            return f"agent:{profile}:{tail}"
+        # Defensive fallback for synthetic/plugin session-key formats.
+        return f"profile:{profile}:{session_key}"
+
+    def set_backend_notice_state(
+        self,
+        state: BackendNoticeState,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Share claims across reconnects within one logical profile."""
+        self._backend_notice_state = state
+        self._backend_notice_profile = str(profile_name or "").strip() or None
+        # Compatibility for diagnostics/tests that inspect the old map.
+        self._llm_error_last_posted = state.posted
+
     def _record_llm_error_notice(
-        self, session_key: str, notice_kind: str, now: float
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        source: Optional[SessionSource] = None,
     ) -> None:
         """Record a posted notice, dropping expired and surplus entries.
 
@@ -6216,19 +6343,11 @@ class BasePlatformAdapter(ABC):
         keeps the map from retaining every session key for the lifetime of
         the adapter.
         """
-        tracker = self._llm_error_last_posted
-        expired = [
-            key for key, (_, ts) in tracker.items()
-            if now - ts >= _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
-        ]
-        for key in expired:
-            del tracker[key]
-        # Only reachable when >1024 distinct sessions fail inside one
-        # cooldown window; evict oldest-first so live sessions survive.
-        while len(tracker) >= _LLM_ERROR_TRACKER_MAX_SESSIONS:
-            oldest = min(tracker, key=lambda k: tracker[k][1])
-            del tracker[oldest]
-        tracker[session_key] = (notice_kind, now)
+        self._backend_notice_state.record(
+            self._backend_notice_session_key(session_key, source),
+            notice_kind,
+            now,
+        )
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
@@ -6507,6 +6626,9 @@ class BasePlatformAdapter(ABC):
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
                 delivery_adapter = None
+                backend_notice_claimed = False
+                backend_notice_suppressed = False
+                backend_notice_session_key = session_key
                 if (
                     text_content
                     and not _tts_caption_delivered
@@ -6518,10 +6640,19 @@ class BasePlatformAdapter(ABC):
                     # adapter's tracker and then sending through a new one
                     # would bypass the replacement's live cooldown.
                     delivery_adapter = self._final_delivery_adapter(event.source)
-                    now = time.monotonic()
-                    if delivery_adapter._llm_error_notice_suppressed(
-                        session_key, "backend_unavailable", now
-                    ):
+                    backend_notice_session_key = (
+                        delivery_adapter._backend_notice_session_key(
+                            session_key, event.source
+                        )
+                    )
+                    backend_notice_claimed = (
+                        await delivery_adapter._backend_notice_state.claim(
+                            backend_notice_session_key,
+                            "backend_unavailable",
+                        )
+                    )
+                    if not backend_notice_claimed:
+                        backend_notice_suppressed = True
                         logger.info(
                             "[%s] Suppressing duplicate backend-unavailable "
                             "notice for session %s",
@@ -6550,9 +6681,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not is_ephemeral_response
+                        and not is_backend_unavailable_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6583,21 +6718,29 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    try:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                    except BaseException:
+                        if backend_notice_claimed:
+                            delivery_adapter._backend_notice_state.finish_claim(
+                                backend_notice_session_key,
+                                "backend_unavailable",
+                                time.monotonic(),
+                                delivered=False,
+                            )
+                        raise
                     _record_delivery(result)
-                    if (
-                        is_backend_unavailable_response
-                        and getattr(result, "success", False)
-                    ):
-                        delivery_adapter._record_llm_error_notice(
-                            session_key,
+                    if backend_notice_claimed:
+                        delivery_adapter._backend_notice_state.finish_claim(
+                            backend_notice_session_key,
                             "backend_unavailable",
                             time.monotonic(),
+                            delivered=bool(getattr(result, "success", False)),
                         )
                     if _obligation_id is not None:
                         try:
@@ -6777,7 +6920,11 @@ class BasePlatformAdapter(ABC):
                     delivery_attempted or _tts_caption_delivered
                     or images or local_files or media_files
                 )
-                if not _anything_delivered and _response_pre_extract.strip():
+                if (
+                    not _anything_delivered
+                    and not backend_notice_suppressed
+                    and _response_pre_extract.strip()
+                ):
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
                         "(%d chars) produced no delivered message or attachment "
