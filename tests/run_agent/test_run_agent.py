@@ -4600,6 +4600,52 @@ class TestRetryExhaustion:
         assert "Invalid API response" in result["error"]
         assert result.get("final_response") == result["error"]
 
+    def test_transient_failure_result_carries_structured_reason(self, agent):
+        self._setup_agent(agent)
+        agent._api_max_retries = 1
+
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=TimeoutError("provider request timed out"),
+            ),
+            patch.object(agent, "_try_recover_primary_transport", return_value=False),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "timeout"
+
+    def test_nonretryable_auth_result_carries_structured_excluded_reason(self, agent):
+        self._setup_agent(agent)
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+
+        class UnauthorizedError(RuntimeError):
+            status_code = 401
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=UnauthorizedError("invalid API key"),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["failure_reason"] == "auth"
+
     def test_invalid_response_retry_completes_one_logical_call(self, agent):
         self._setup_agent(agent)
         agent.client.chat.completions.create.side_effect = [

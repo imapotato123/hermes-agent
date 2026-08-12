@@ -191,11 +191,51 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _is_transient_codex_runtime_failure(error: Exception | str) -> bool:
+    """Recognize a dead or wedged app-server transport, not local config bugs."""
+    if isinstance(error, (TimeoutError, ConnectionError, BrokenPipeError)):
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "app-server subprocess exited unexpectedly",
+            "app-server process exited unexpectedly",
+            "codex went silent for",
+            "turn timed out after",
+            "turn/start timed out",
+        )
+    )
+
+
+def _is_transient_codex_error_info(value: Any) -> bool:
+    """Map only protocol-defined transient app-server failure variants."""
+    if isinstance(value, str):
+        return value in {"serverOverloaded", "internalServerError"}
+    if isinstance(value, dict):
+        transient_variants = {
+            "httpConnectionFailed",
+            "responseStreamConnectionFailed",
+            "responseStreamDisconnected",
+            "responseTooManyFailedAttempts",
+        }
+        variant = next((key for key in transient_variants if key in value), None)
+        if variant is None:
+            return False
+        details = value.get(variant)
+        status = details.get("httpStatusCode") if isinstance(details, dict) else None
+        return status is None or status == 408 or (
+            isinstance(status, int) and status >= 500
+        )
+    return False
+
+
 def _codex_failure_fields(
     agent,
     error: Exception | str | None,
     *,
     retired: bool = False,
+    codex_error_info: Any = None,
 ) -> dict[str, Any]:
     """Classify Codex app-server failures with the shared agent taxonomy."""
     if error is None:
@@ -209,11 +249,15 @@ def _codex_failure_fields(
         model=getattr(agent, "model", "") or "",
     )
     reason = classified.reason.value
-    if retired and reason == "unknown":
-        # A retired app-server session is known unhealthy (dead subprocess,
-        # wedged turn, or JSON-RPC internal failure).  Preserve any explicit
-        # auth/quota/timeout classification above; only promote the otherwise
-        # unknown transport/process failure to a transient server failure.
+    if reason == "unknown" and _is_transient_codex_error_info(codex_error_info):
+        reason = "server_error"
+    if (
+        retired
+        and reason == "unknown"
+        and _is_transient_codex_runtime_failure(error)
+    ):
+        # Retirement alone can also mean deterministic local configuration or
+        # protocol failure. Promote only stable dead/wedged transport signals.
         reason = "server_error"
     return {
         "failed": True,
@@ -913,6 +957,7 @@ def run_codex_app_server_turn(
                 agent,
                 turn.error,
                 retired=bool(getattr(turn, "should_retire", False)),
+                codex_error_info=getattr(turn, "codex_error_info", None),
             )
             if _failed
             else {}

@@ -43,6 +43,7 @@ def _make_turn():
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
+        codex_error_info=None,
     )
 
 
@@ -160,6 +161,90 @@ def test_codex_runtime_generic_exception_stays_unknown():
 
     assert result["failed"] is True
     assert result["failure_reason"] == "unknown"
+
+
+def test_codex_protocol_internal_server_error_is_structured_transient():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "turn ended status=failed: opaque provider prose"
+    turn.final_text = ""
+    turn.codex_error_info = "internalServerError"
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "server_error"
+
+
+def test_codex_protocol_other_error_remains_unsuppressed():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "turn ended status=failed: opaque provider prose"
+    turn.final_text = ""
+    turn.codex_error_info = "other"
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "unknown"
+
+
+def test_codex_protocol_connection_error_preserves_excluded_http_status():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "turn ended status=failed: opaque provider prose"
+    turn.final_text = ""
+    turn.codex_error_info = {
+        "httpConnectionFailed": {"httpStatusCode": 401},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "unknown"
+
+
+def test_codex_protocol_connection_error_maps_http_503_to_transient():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "turn ended status=failed: opaque provider prose"
+    turn.final_text = ""
+    turn.codex_error_info = {
+        "responseStreamConnectionFailed": {"httpStatusCode": 503},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "server_error"
 
 
 def test_codex_timeout_turn_result_emits_structured_failure():
