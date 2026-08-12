@@ -6016,6 +6016,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile_name=profile_name,
             )
 
+    def _bind_voice_input_callback(self, adapter: Any) -> None:
+        """Bind Discord voice ingress to one live transport generation.
+
+        Voice source metadata is serialized while a channel is joined, so its
+        nonserialized transport provenance cannot survive restoration. Capture
+        that provenance at the trusted adapter boundary and reattach it before
+        authorization instead of inferring credential ownership from the
+        logical routed profile stored in the source.
+        """
+        if not hasattr(adapter, "_voice_input_callback"):
+            return
+        try:
+            adapter_ref = _weakref.ref(adapter)
+        except TypeError:
+            # Production adapters are weak-referenceable. Fail closed for an
+            # unusual hand-built adapter rather than retain a disconnected
+            # credential generation through a strong closure.
+            adapter._voice_input_callback = None
+            return
+        transport_profile = getattr(adapter, "_transport_profile", None)
+
+        async def _voice_input_callback(
+            guild_id: int,
+            user_id: int,
+            transcript: str,
+        ) -> None:
+            await self._handle_voice_channel_input(
+                guild_id,
+                user_id,
+                transcript,
+                transport_adapter_ref=adapter_ref,
+                transport_profile=transport_profile,
+            )
+
+        adapter._voice_input_callback = _voice_input_callback
+
     def _session_state(self, session_key: str) -> "SessionState":
         """Get-or-create the :class:`SessionState` for ``session_key``."""
         sessions = self._sessions_map()
@@ -11628,8 +11664,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._sync_voice_mode_state_to_adapter(adapter)
                     # Wire voice input callback at connect time so voice
                     # transcription is forwarded without requiring /voice join.
-                    if hasattr(adapter, "_voice_input_callback"):
-                        adapter._voice_input_callback = self._handle_voice_channel_input
+                    self._bind_voice_input_callback(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -13005,8 +13040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
-                        if hasattr(adapter, "_voice_input_callback"):
-                            adapter._voice_input_callback = self._handle_voice_channel_input
+                        self._bind_voice_input_callback(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -13961,6 +13995,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         self._share_backend_notice_state(adapter, profile_name=profile_name)
+        self._bind_voice_input_callback(adapter)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -19858,8 +19893,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
-        if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+        self._bind_voice_input_callback(adapter)
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -19972,15 +20006,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        transport_adapter_ref: Optional[Callable[[], Any]] = None,
+        transport_profile: Optional[str] = None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
+        Production callbacks bind the exact Discord adapter generation and
+        credential profile that received the audio. Direct three-argument calls
+        retain the historical primary-adapter fallback for tests/in-process use.
         """
-        adapter = self.adapters.get(Platform.DISCORD)
-        if not adapter:
+        callback_bound = transport_adapter_ref is not None
+        if not callback_bound:
+            adapter = self.adapters.get(Platform.DISCORD)
+            if not adapter:
+                return
+            stamped_profile = getattr(adapter, "_transport_profile", None)
+            transport_profile = (
+                stamped_profile.strip()
+                if isinstance(stamped_profile, str) and stamped_profile.strip()
+                else None
+            )
+            try:
+                transport_adapter_ref = _weakref.ref(adapter)
+            except TypeError:
+                transport_adapter_ref = None
+        else:
+            adapter = (
+                transport_adapter_ref()
+                if callable(transport_adapter_ref)
+                else None
+            )
+            if adapter is None:
+                return
+
+        # A callback retained by a disconnected Discord voice client must not
+        # authorize or dispatch through a replacement credential. Historical
+        # direct calls already select the current primary slot above and retain
+        # their unstamped compatibility path.
+        if callback_bound and self._authorization_adapter(
+            Platform.DISCORD,
+            profile=transport_profile,
+        ) is not adapter:
+            logger.debug(
+                "Ignoring voice input from an unregistered Discord adapter generation"
+            )
             return
 
         text_ch_id = adapter._voice_text_channels.get(guild_id)
@@ -20002,6 +20078,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+
+        # Runtime transport provenance is deliberately nonserialized. Reattach
+        # it from the live ingress callback before any policy or pairing lookup;
+        # ``source.profile`` remains the logical routed session namespace.
+        setattr(source, "_transport_profile", transport_profile)
+        if transport_adapter_ref is not None:
+            setattr(source, "_transport_adapter_ref", transport_adapter_ref)
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
