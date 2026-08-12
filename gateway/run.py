@@ -2441,6 +2441,8 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -10903,10 +10905,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(row["chat_id"]),
                     thread_id=row.get("thread_id"),
                 )
-                setattr(
+                stamp_source_transport_owner(
                     _recovery_source,
-                    "_transport_profile",
-                    row.get("transport_profile"),
+                    profile=row.get("transport_profile"),
                 )
                 adapter = self._adapter_for_source(_recovery_source)
             else:
@@ -14513,6 +14514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            stamp_source_transport_owner(source, profile=profile_name)
             return self._is_user_authorized(source)
         return check
 
@@ -20105,9 +20107,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Runtime transport provenance is deliberately nonserialized. Reattach
         # it from the live ingress callback before any policy or pairing lookup;
         # ``source.profile`` remains the logical routed session namespace.
-        setattr(source, "_transport_profile", transport_profile)
-        if transport_adapter_ref is not None:
-            setattr(source, "_transport_adapter_ref", transport_adapter_ref)
+        stamp_source_transport_owner(
+            source,
+            profile=transport_profile,
+            adapter_ref=transport_adapter_ref,
+        )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20248,11 +20252,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restored legacy sources without a stamp retain the historical captured
         adapter fallback. Operations are duck-typed for plugin compatibility.
         """
-        source_attrs = getattr(source, "__dict__", {})
-        stamped = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
+        stamped = source_has_transport_owner(source)
         if not stamped:
             adapter = fallback_adapter
         else:
@@ -20500,13 +20500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "metadata": _thread_meta,
                         }
                         try:
-                            source_attrs = getattr(
-                                event.source, "__dict__", {}
-                            )
-                            if (
-                                isinstance(source_attrs, dict)
-                                and "_transport_profile" in source_attrs
-                            ):
+                            if source_has_transport_owner(event.source):
                                 signature = inspect.signature(image_send)
                                 if "source" in signature.parameters or any(
                                     parameter.kind

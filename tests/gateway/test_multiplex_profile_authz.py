@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
+)
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -145,7 +149,7 @@ def test_routed_runtime_pairing_uses_stamped_transport_owner(monkeypatch):
         chat_type="dm",
         profile="routed",
     )
-    setattr(source, "_transport_profile", "coder")
+    stamp_source_transport_owner(source, profile="coder")
 
     assert runner._is_user_authorized(source) is False
     transport_store.is_approved.assert_called_once_with(
@@ -173,7 +177,7 @@ def test_primary_active_transport_pairing_uses_active_named_store(monkeypatch):
         chat_type="dm",
         profile="routed",
     )
-    setattr(source, "_transport_profile", "main")
+    stamp_source_transport_owner(source, profile="main")
 
     assert runner._is_user_authorized(source) is True
     active_store.is_approved.assert_called_once_with(
@@ -201,7 +205,7 @@ def test_missing_stamped_transport_pairing_store_fails_closed(monkeypatch):
         chat_type="dm",
         profile="routed",
     )
-    setattr(source, "_transport_profile", "coder")
+    stamp_source_transport_owner(source, profile="coder")
 
     assert runner._is_user_authorized(source) is False
     runner.pairing_store.is_approved.assert_not_called()
@@ -227,6 +231,42 @@ def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
     routed_store.is_approved.assert_called_once_with(
         Platform.WECOM.value, "legacy-routed-user"
     )
+
+
+def test_restored_named_source_resolves_named_profile_not_default(monkeypatch):
+    """Wire-restored named sources must not collapse onto primary credentials."""
+    runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
+    source = SessionSource.from_dict(
+        SessionSource(
+            platform=Platform.WECOM,
+            user_id="restored-user",
+            chat_id="dm-chat",
+            chat_type="dm",
+            profile="coder",
+        ).to_dict()
+    )
+
+    assert source_has_transport_owner(source) is False
+    assert runner._adapter_for_source(source) is secondary_adapter
+    assert runner._adapter_for_source(source) is not default_adapter
+    assert runner._adapter_profile_for_source(source) == "coder"
+
+
+def test_restored_missing_named_source_fails_closed(monkeypatch):
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._profile_adapters = {}
+    source = SessionSource.from_dict(
+        SessionSource(
+            platform=Platform.WECOM,
+            user_id="restored-user",
+            chat_id="dm-chat",
+            profile="coder",
+        ).to_dict()
+    )
+
+    assert source_has_transport_owner(source) is False
+    assert runner._adapter_for_source(source) is None
+    assert runner._adapter_for_source(source) is not default_adapter
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
@@ -260,6 +300,8 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
 
     def fake_is_user_authorized(source):
         captured["profile"] = source.profile
+        captured["transport_profile"] = source._transport_profile
+        captured["stamped"] = source_has_transport_owner(source)
         return True
 
     runner._is_user_authorized = fake_is_user_authorized
@@ -267,6 +309,8 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
     check = runner._make_adapter_auth_check(Platform.WECOM, profile_name="coder")
     assert check("some-user", "dm", "dm-chat") is True
     assert captured["profile"] == "coder"
+    assert captured["transport_profile"] == "coder"
+    assert captured["stamped"] is True
 
 
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):

@@ -4514,6 +4514,20 @@ class TestHookPayloadSanitizesSimpleNamespace:
         result = AIAgent._sanitize_hook_payload(ns)
         assert result == {"id": "call_1", "value": 42, "nested": {"name": "x"}}
 
+    def test_hook_jsonable_omits_nonserializable_dataclass_fields(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource, stamp_source_transport_owner
+
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        stamp_source_transport_owner(source, profile="coder")
+
+        result = AIAgent._sanitize_hook_payload(source)
+        assert result["platform"] == "slack"
+        assert result["chat_id"] == "C1"
+        assert "_transport_profile" not in result
+        assert "_transport_profile_stamped" not in result
+        assert "_transport_adapter_ref" not in result
+
     def test_api_response_payload_for_hook_normalizes_simplenamespace_tool_calls(self, agent):
         # Shape mirrors agent/bedrock_adapter.py::normalize_converse_response and
         # agent/codex_responses_adapter.py — raw SDK objects are SimpleNamespace.

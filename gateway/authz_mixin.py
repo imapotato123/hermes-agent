@@ -21,7 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import SessionSource, source_has_transport_owner
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -154,14 +154,10 @@ class GatewayAuthorizationMixin:
         # stamps the transport owner's profile separately and does not serialize
         # it. If the original weakref is stale after reconnect, resolve the new
         # generation from that owner instead of an unrelated routed profile.
-        source_attrs = getattr(source, "__dict__", {})
-        if (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        ):
+        if source_has_transport_owner(source):
             return self._authorization_adapter(
                 getattr(source, "platform", None),
-                source_attrs.get("_transport_profile"),
+                getattr(source, "_transport_profile", None),
             )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
@@ -180,6 +176,8 @@ class GatewayAuthorizationMixin:
         intake-policy checks stay on that transport without weakening the
         fail-closed fallback for restored or hand-built sources.
         """
+        if not source_has_transport_owner(source):
+            return None
         adapter_ref = getattr(source, "_transport_adapter_ref", None)
         adapter = adapter_ref() if callable(adapter_ref) else None
         platform = getattr(source, "platform", None)
@@ -205,12 +203,8 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
-        source_attrs = getattr(source, "__dict__", {})
-        if (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        ):
-            transport_profile = source_attrs.get("_transport_profile")
+        if source_has_transport_owner(source):
+            transport_profile = getattr(source, "_transport_profile", None)
             transport_adapter = self._authorization_adapter(
                 platform, transport_profile
             )
@@ -409,13 +403,9 @@ class GatewayAuthorizationMixin:
         sources retain the historical runtime-profile/global fallback.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        source_attrs = getattr(source, "__dict__", {})
-        has_transport_owner = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
+        has_transport_owner = source_has_transport_owner(source)
         profile = (
-            source_attrs.get("_transport_profile")
+            getattr(source, "_transport_profile", None)
             if has_transport_owner
             else getattr(source, "profile", None)
         )

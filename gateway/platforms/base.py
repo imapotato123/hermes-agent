@@ -577,7 +577,12 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
+)
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
 if TYPE_CHECKING:
@@ -5625,11 +5630,7 @@ class BasePlatformAdapter(ABC):
         resolve = getattr(runner, "_adapter_for_source", None)
         if not callable(resolve):
             return self
-        source_attrs = getattr(source, "__dict__", {})
-        has_transport_owner = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
+        has_transport_owner = source_has_transport_owner(source)
         try:
             live_adapter = resolve(source)
         except Exception:
@@ -6908,15 +6909,11 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if await asyncio.to_thread(ledger_enabled):
-                                _source_attrs = getattr(
-                                    event.source, "__dict__", {}
-                                )
                                 _transport_profile_stamped = (
-                                    isinstance(_source_attrs, dict)
-                                    and "_transport_profile" in _source_attrs
+                                    source_has_transport_owner(event.source)
                                 )
                                 _transport_profile = (
-                                    _source_attrs.get("_transport_profile")
+                                    getattr(event.source, "_transport_profile", None)
                                     if _transport_profile_stamped
                                     else None
                                 )
@@ -7077,13 +7074,7 @@ class BasePlatformAdapter(ABC):
                                 "human_delay": human_delay,
                             }
                             try:
-                                source_attrs = getattr(
-                                    event.source, "__dict__", {}
-                                )
-                                if (
-                                    isinstance(source_attrs, dict)
-                                    and "_transport_profile" in source_attrs
-                                ):
+                                if source_has_transport_owner(event.source):
                                     signature = inspect.signature(image_send)
                                     if "source" in signature.parameters or any(
                                         parameter.kind
@@ -7152,13 +7143,7 @@ class BasePlatformAdapter(ABC):
                                 "human_delay": human_delay,
                             }
                             try:
-                                source_attrs = getattr(
-                                    event.source, "__dict__", {}
-                                )
-                                if (
-                                    isinstance(source_attrs, dict)
-                                    and "_transport_profile" in source_attrs
-                                ):
+                                if source_has_transport_owner(event.source):
                                     signature = inspect.signature(image_send)
                                     if "source" in signature.parameters or any(
                                         parameter.kind
@@ -7723,15 +7708,14 @@ class BasePlatformAdapter(ABC):
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
-        source._transport_adapter_ref = weakref.ref(self)
-        # The weakref identifies this exact generation while it remains in the
-        # runner registry. Preserve its owning profile independently so a turn
-        # that outlives a reconnect can resolve the replacement generation.
-        setattr(
+        stamp_source_transport_owner(
             source,
-            "_transport_profile",
-            getattr(self, "_transport_profile", None),
+            profile=getattr(self, "_transport_profile", None),
+            adapter_ref=weakref.ref(self),
         )
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. The profile separately resolves its replacement when
+        # an in-flight turn outlives a reconnect.
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

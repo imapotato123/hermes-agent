@@ -23,7 +23,12 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 _NOTICE = (
@@ -816,7 +821,7 @@ def test_missing_secondary_transport_owner_keeps_secondary_policy_scope():
     runner.adapters = {}
     runner._profile_adapters = {}
     source = SessionSource(platform=Platform.SLACK, chat_id="C123")
-    setattr(source, "_transport_profile", "coder")
+    stamp_source_transport_owner(source, profile="coder")
 
     assert runner._adapter_for_source(source) is None
     assert runner._adapter_profile_for_source(source) == "coder"

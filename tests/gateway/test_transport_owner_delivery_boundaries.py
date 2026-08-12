@@ -23,7 +23,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _source(*, stamped: bool = True, profile: str | None = "coder") -> SessionSource:
@@ -34,7 +34,7 @@ def _source(*, stamped: bool = True, profile: str | None = "coder") -> SessionSo
         message_id="m1",
     )
     if stamped:
-        source._transport_profile = profile
+        stamp_source_transport_owner(source, profile=profile)
     return source
 
 
