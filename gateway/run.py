@@ -2450,6 +2450,7 @@ from gateway.session import (
 from gateway.delivery import (
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
+    relay_fronts_platform,
     resolve_delivery_transport,
 )
 from gateway.turn_lease import (
@@ -2474,6 +2475,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -3503,7 +3505,11 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+        if (
+            len(parts) > 5
+            and parts[3] in {"dm", "thread"}
+            and not parts[5].startswith("transport=")
+        ):
             result["thread_id"] = parts[5]
         return result
     return None
@@ -10960,6 +10966,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                mark_partial_failed,
                 release_claim,
                 sweep_recoverable,
                 undelivered_session_keys,
@@ -10994,40 +11001,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # route. A same-platform adapter owned by another profile is never
             # a deliverable route for a stamped row.
             _deliverable_routes = set()
-            for _platform, _adapter in self.adapters.items():
+
+            def _add_delivery_route(
+                _platform: Platform,
+                _adapter: Any,
+                _profile: Optional[str],
+                *,
+                _include_legacy: bool,
+            ) -> None:
                 _platform_value = getattr(_platform, "value", str(_platform))
-                _deliverable_routes.add((_platform_value, False, None, None))
-                if hasattr(_adapter, "_transport_profile"):
+                if _include_legacy:
+                    _deliverable_routes.add(
+                        (_platform_value, False, None, None)
+                    )
+                if _platform == Platform.RELAY:
+                    # Legacy unstamped rows contain only the logical route. A
+                    # relay may claim one only when it positively advertises that
+                    # exact platform; missing/non-callable/false/error remains
+                    # fail closed without blocking unrelated native recovery.
+                    if _include_legacy:
+                        for _logical_platform in Platform:
+                            if (
+                                _logical_platform != Platform.RELAY
+                                and relay_fronts_platform(
+                                    _adapter, _logical_platform
+                                )
+                            ):
+                                _deliverable_routes.add(
+                                    (
+                                        _logical_platform.value,
+                                        False,
+                                        None,
+                                        None,
+                                    )
+                                )
+                    _identity_fn = getattr(
+                        _adapter, "acknowledged_transport_identities", None
+                    )
+                    _identity_values = (
+                        tuple(cast(Iterable[Any], _identity_fn()))
+                        if callable(_identity_fn)
+                        else ()
+                    )
+                else:
                     _identity_values = (None,)
-                    if _platform == Platform.RELAY:
-                        _identity_fn = getattr(
-                            _adapter, "acknowledged_transport_identities", None
+                for _identity in _identity_values:
+                    _deliverable_routes.add(
+                        (
+                            _platform_value,
+                            True,
+                            _profile,
+                            _identity,
                         )
-                        _identity_values = (
-                            tuple(cast(Iterable[Any], _identity_fn()))
-                            if callable(_identity_fn)
-                            else ()
-                        )
-                    for _identity in _identity_values:
-                        _deliverable_routes.add(
-                            (
-                                _platform_value,
-                                True,
-                                getattr(_adapter, "_transport_profile", None),
-                                _identity,
-                            )
-                        )
+                    )
+
+            for _platform, _adapter in self.adapters.items():
+                _add_delivery_route(
+                    _platform,
+                    _adapter,
+                    getattr(_adapter, "_transport_profile", None),
+                    _include_legacy=True,
+                )
             for _profile, _profile_adapters in (
                 getattr(self, "_profile_adapters", None) or {}
             ).items():
-                for _platform in _profile_adapters:
-                    _deliverable_routes.add(
-                        (
-                            getattr(_platform, "value", str(_platform)),
-                            True,
-                            _profile,
-                            None,
-                        )
+                for _platform, _adapter in _profile_adapters.items():
+                    _add_delivery_route(
+                        _platform,
+                        _adapter,
+                        _profile,
+                        _include_legacy=False,
                     )
             claimed = await asyncio.to_thread(
                 sweep_recoverable,
@@ -11041,8 +11084,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         redelivered = 0
+        blocked_sessions: set[str] = set()
         for row in claimed:
+            if row["session_key"] in blocked_sessions:
+                await asyncio.to_thread(
+                    release_claim, row["obligation_id"]
+                )
+                continue
             _recovery_source: Optional[SessionSource] = None
+            _legacy_transport = None
+            operation = row.get("operation") or "text"
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -11095,6 +11146,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self._adapter_for_source(_recovery_source)
             else:
                 adapter = self.adapters.get(platform)
+                if adapter is None:
+                    _legacy_transport = resolve_delivery_transport(
+                        platform, self.config, self.adapters
+                    )
+                    adapter = (
+                        _legacy_transport.adapter
+                        if _legacy_transport is not None
+                        else None
+                    )
             if adapter is None:
                 # The route existed at claim time but vanished before delivery.
                 # Fail closed and restore the recovery budget for a later boot.
@@ -11113,10 +11173,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
             metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                self._thread_metadata_for_source(_recovery_source)
+                if _recovery_source is not None
+                else (
+                    {"thread_id": row["thread_id"]}
+                    if row.get("thread_id")
+                    else None
+                )
             )
+            if (
+                row.get("transport_profile_stamped")
+                and _recovery_source is not None
+                and getattr(_recovery_source, "_transport_platform", None)
+                == Platform.RELAY
+            ):
+                metadata = dict(metadata or {})
+                metadata["_relay_logical_platform"] = platform.value
+                transport_identity = getattr(
+                    _recovery_source, "_transport_identity", None
+                )
+                if transport_identity:
+                    metadata["_relay_transport_identity"] = str(
+                        transport_identity
+                    )
+                if row.get("route_scope_id"):
+                    metadata["scope_id"] = str(row["route_scope_id"])
+                if row.get("route_user_id"):
+                    metadata["user_id"] = str(row["route_user_id"])
+            elif (
+                not row.get("transport_profile_stamped")
+                and _legacy_transport is not None
+                and _legacy_transport.is_relay
+            ):
+                metadata = dict(metadata or {})
+                if row.get("route_scope_id"):
+                    metadata["scope_id"] = str(row["route_scope_id"])
+                if row.get("route_user_id"):
+                    metadata["user_id"] = str(row["route_user_id"])
             try:
-                if row.get("transport_profile_stamped"):
+                if operation == "response_bundle":
+                    try:
+                        payload = json.loads(row.get("payload_json") or "{}")
+                    except Exception as payload_err:
+                        raise ValueError("malformed response bundle payload") from payload_err
+                    if not isinstance(payload, dict) or payload.get("version") != 1:
+                        raise ValueError("unsupported response bundle payload")
+                    result = await self._redeliver_response_bundle(
+                        row,
+                        payload,
+                        adapter,
+                        _recovery_source,
+                        metadata,
+                        platform,
+                        _legacy_transport,
+                    )
+                elif row.get("transport_profile_stamped"):
                     assert _recovery_source is not None
                     adapter, send = self._live_delivery_operation(
                         _recovery_source, adapter, "send"
@@ -11135,6 +11246,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         content=content,
                         metadata=metadata,
                     )
+                elif _legacy_transport is not None and _legacy_transport.is_relay:
+                    result = await _legacy_transport.send(
+                        platform,
+                        row["chat_id"],
+                        content,
+                        metadata,
+                    )
                 else:
                     result = await cast(Any, adapter).send(
                         chat_id=row["chat_id"],
@@ -11147,8 +11265,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], send_err,
                 )
                 result = None
+            bundle_complete = bool(
+                getattr(result, "success", False)
+                or getattr(result, "auto_retry_safe", True)
+            )
             try:
-                if result is not None and getattr(result, "success", False):
+                if (
+                    result is not None
+                    and getattr(result, "success", False)
+                    and bundle_complete
+                ):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
@@ -11158,18 +11284,445 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed,
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                    error = str(
+                        getattr(result, "error", "") or "send failed"
                     )
+                    if not bundle_complete:
+                        # The platform ACKed an operation but its durable
+                        # checkpoint failed. Retrying that operation would be
+                        # acknowledgement-ambiguous, so require intervention.
+                        await asyncio.to_thread(
+                            mark_partial_failed,
+                            row["obligation_id"],
+                            "partial response bundle: " + error,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            mark_failed,
+                            row["obligation_id"],
+                            error,
+                        )
+                    blocked_sessions.add(row["session_key"])
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
+                blocked_sessions.add(row["session_key"])
 
             # The answer reached (or was owed to) this session. Its resume
             # marker was cleared before sweeping, including for unavailable
             # owners, so there is nothing further to do here.
         return redelivered
+
+    async def _redeliver_response_bundle(
+        self,
+        row: Dict[str, Any],
+        payload: Dict[str, Any],
+        adapter: Any,
+        source: Optional[SessionSource],
+        metadata: Optional[Dict[str, Any]],
+        platform: Platform,
+        legacy_transport: Any,
+    ) -> SendResult:
+        """Replay one durable physical-output bundle in original order."""
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        completed_keys = {
+            str(key) for key in (payload.get("completed_operations") or [])
+        }
+        from gateway.delivery_ledger import response_bundle_operation_keys
+
+        planned_keys = set(response_bundle_operation_keys(payload))
+        completed_operations = len(completed_keys)
+        ambiguous_operation = (
+            str(payload.get("attempting_operation"))
+            if payload.get("attempting_operation")
+            else None
+        )
+
+        def _failure(error: str, *, retry_safe: bool = True) -> SendResult:
+            result = SendResult(success=False, error=error)
+            setattr(result, "auto_retry_safe", retry_safe)
+            return result
+
+        async def _completed(
+            operation_key: str, *fulfilled_operation_keys: str
+        ) -> Optional[SendResult]:
+            nonlocal completed_operations
+            from gateway.delivery_ledger import mark_bundle_operations_completed
+
+            keys = [operation_key, *fulfilled_operation_keys]
+            completed_operations += len(
+                [key for key in keys if key not in completed_keys]
+            )
+            if not await asyncio.to_thread(
+                mark_bundle_operations_completed,
+                row["obligation_id"],
+                keys,
+            ):
+                return _failure(
+                    f"failed to checkpoint completed {operation_key} operation",
+                    retry_safe=False,
+                )
+            completed_keys.update(keys)
+            return None
+
+        async def _attempting(operation_key: str) -> Optional[SendResult]:
+            from gateway.delivery_ledger import mark_bundle_operation_attempting
+
+            if not await asyncio.to_thread(
+                mark_bundle_operation_attempting,
+                row["obligation_id"],
+                operation_key,
+            ):
+                return _failure(
+                    f"failed to checkpoint attempting {operation_key} operation"
+                )
+            return None
+
+        async def _operation(name: str, **kwargs: Any) -> Any:
+            nonlocal adapter
+            if source is not None:
+                adapter, method = self._live_delivery_operation(
+                    source, adapter, name
+                )
+                if method is None:
+                    raise RuntimeError(
+                        f"transport owner unavailable for {name}"
+                    )
+                return await cast(
+                    Callable[..., Awaitable[Any]], method
+                )(**kwargs)
+            if legacy_transport is not None and legacy_transport.is_relay:
+                if name != "send":
+                    raise RuntimeError(
+                        f"legacy relay cannot replay typed operation {name}"
+                    )
+                return await legacy_transport.send(
+                    platform,
+                    kwargs["chat_id"],
+                    kwargs["content"],
+                    kwargs.get("metadata"),
+                )
+            method = getattr(adapter, name, None)
+            if not callable(method):
+                raise RuntimeError(f"adapter has no {name} operation")
+            return await method(**kwargs)
+
+        text = str(payload.get("text") or "")
+        if payload.get("auto_tts") and text and any(
+            f"auto_tts:{index}" not in completed_keys
+            for index in range(
+                int(payload.get("auto_tts_segment_count") or 1)
+            )
+        ):
+            from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+
+            if not check_tts_requirements():
+                return _failure("TTS requirements unavailable")
+            tts_path = build_auto_tts_output_path(platform)
+            generated_audio_paths = {str(tts_path)}
+            try:
+                tts_data = json.loads(
+                    await asyncio.to_thread(
+                        text_to_speech_tool,
+                        text=text,
+                        output_path=tts_path,
+                    )
+                )
+                if not tts_data.get("success", True):
+                    return _failure(
+                        str(tts_data.get("error") or "TTS synthesis failed")
+                    )
+                audio_paths = [
+                    str(audio_path)
+                    for audio_path in (
+                        tts_data.get("file_paths")
+                        or [tts_data.get("file_path")]
+                    )
+                    if audio_path
+                ]
+                generated_audio_paths.update(audio_paths)
+                expected_segment_count = int(
+                    payload.get("auto_tts_segment_count") or 1
+                )
+                if len(audio_paths) != expected_segment_count:
+                    from gateway.delivery_ledger import update_bundle_payload
+
+                    if completed_keys:
+                        return _failure(
+                            "TTS segment count changed after partial delivery",
+                            retry_safe=False,
+                        )
+                    if not await asyncio.to_thread(
+                        update_bundle_payload,
+                        row["obligation_id"],
+                        {"auto_tts_segment_count": len(audio_paths)},
+                    ):
+                        return _failure(
+                            "failed to persist TTS segment count"
+                        )
+                    payload["auto_tts_segment_count"] = len(audio_paths)
+                    planned_keys = set(response_bundle_operation_keys(payload))
+                for audio_index, audio_path in enumerate(audio_paths):
+                    operation_key = f"auto_tts:{audio_index}"
+                    if operation_key in completed_keys:
+                        continue
+                    attempting_failure = await _attempting(operation_key)
+                    if attempting_failure is not None:
+                        return attempting_failure
+                    try:
+                        caption_text = (
+                            text
+                            if audio_index == 0
+                            and payload.get("auto_tts_caption_text")
+                            else None
+                        )
+                        if (
+                            caption_text
+                            and ambiguous_operation == operation_key
+                        ):
+                            caption_text = RECOVERED_MARKER + caption_text
+                        elif (
+                            not caption_text
+                            and ambiguous_operation == operation_key
+                        ):
+                            caption_text = RECOVERED_MARKER.strip()
+                        tts_result = await _operation(
+                            "play_tts",
+                            chat_id=row["chat_id"],
+                            audio_path=str(audio_path),
+                            caption=caption_text,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        return _failure(str(exc))
+                    if getattr(tts_result, "success", True) is False:
+                        return _failure(
+                            str(getattr(tts_result, "error", "") or "TTS failed")
+                        )
+                    checkpoint_failure = await _completed(
+                        operation_key,
+                        *(
+                            ("text",)
+                            if audio_index == 0
+                            and payload.get("auto_tts_caption_text")
+                            else ()
+                        ),
+                    )
+                    if checkpoint_failure is not None:
+                        return checkpoint_failure
+            finally:
+                for generated_audio_path in generated_audio_paths:
+                    try:
+                        os.unlink(generated_audio_path)
+                    except OSError:
+                        pass
+
+        if text and "text" not in completed_keys:
+            attempting_failure = await _attempting("text")
+            if attempting_failure is not None:
+                return attempting_failure
+            text_to_send = (
+                RECOVERED_MARKER + text
+                if ambiguous_operation == "text"
+                else text
+            )
+            try:
+                text_result = await _operation(
+                    "send",
+                    chat_id=row["chat_id"],
+                    content=text_to_send,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                return _failure(str(exc))
+            if getattr(text_result, "success", False) is False:
+                return _failure(
+                    str(getattr(text_result, "error", "") or "text send failed")
+                )
+            checkpoint_failure = await _completed("text")
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+
+        images = [tuple(item) for item in payload.get("images") or []]
+        media_files = [tuple(item) for item in payload.get("media_files") or []]
+        local_files = [str(item) for item in payload.get("local_files") or []]
+        force_document = bool(payload.get("force_document_attachments"))
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        image_paths: List[str] = []
+        remaining_media: List[Tuple[str, bool]] = []
+        remaining_local: List[str] = []
+        for path, is_voice in media_files:
+            if Path(str(path)).suffix.lower() in image_exts and not is_voice and not force_document:
+                image_paths.append(str(path))
+            else:
+                remaining_media.append((str(path), bool(is_voice)))
+        for path in local_files:
+            if Path(path).suffix.lower() in image_exts and not force_document:
+                image_paths.append(path)
+            else:
+                remaining_local.append(path)
+        if image_paths:
+            from urllib.parse import quote
+
+            file_images = [
+                (f"file://{quote(path)}", "") for path in image_paths
+            ]
+        else:
+            file_images = []
+        if images and "images" not in completed_keys:
+            attempting_failure = await _attempting("images")
+            if attempting_failure is not None:
+                return attempting_failure
+            images_to_send = list(images)
+            if ambiguous_operation == "images" and images_to_send:
+                first_url, first_alt = images_to_send[0]
+                images_to_send[0] = (
+                    first_url,
+                    f"{RECOVERED_MARKER.strip()}\n\n{first_alt}".strip(),
+                )
+            try:
+                image_result = await _operation(
+                    "send_multiple_images",
+                    chat_id=row["chat_id"],
+                    images=images_to_send,
+                    metadata=metadata,
+                    human_delay=0.0,
+                    **({"source": source} if source is not None else {}),
+                )
+            except Exception as exc:
+                return _failure(str(exc))
+            if getattr(image_result, "success", True) is False:
+                return _failure(
+                    str(
+                        getattr(image_result, "error", "")
+                        or "image batch failed"
+                    )
+                )
+            checkpoint_failure = await _completed("images")
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+        if file_images and "image_files" not in completed_keys:
+            attempting_failure = await _attempting("image_files")
+            if attempting_failure is not None:
+                return attempting_failure
+            file_images_to_send = list(file_images)
+            if ambiguous_operation == "image_files" and file_images_to_send:
+                first_url, first_alt = file_images_to_send[0]
+                file_images_to_send[0] = (
+                    first_url,
+                    f"{RECOVERED_MARKER.strip()}\n\n{first_alt}".strip(),
+                )
+            try:
+                image_result = await _operation(
+                    "send_multiple_images",
+                    chat_id=row["chat_id"],
+                    images=file_images_to_send,
+                    metadata=metadata,
+                    human_delay=0.0,
+                    **({"source": source} if source is not None else {}),
+                )
+            except Exception as exc:
+                return _failure(str(exc))
+            if getattr(image_result, "success", True) is False:
+                return _failure(
+                    str(
+                        getattr(image_result, "error", "")
+                        or "image batch failed"
+                    )
+                )
+            checkpoint_failure = await _completed("image_files")
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+        from gateway.platforms.base import should_send_media_as_audio
+
+        for media_index, (path, is_voice) in enumerate(remaining_media):
+            operation_key = f"media:{media_index}"
+            if operation_key in completed_keys:
+                continue
+            attempting_failure = await _attempting(operation_key)
+            if attempting_failure is not None:
+                return attempting_failure
+            ext = Path(path).suffix.lower()
+            caption = (
+                RECOVERED_MARKER.strip()
+                if ambiguous_operation == operation_key
+                else None
+            )
+            try:
+                if should_send_media_as_audio(platform, ext, is_voice=is_voice):
+                    result = await _operation(
+                        "send_voice",
+                        chat_id=row["chat_id"],
+                        audio_path=path,
+                        caption=caption,
+                        metadata=metadata,
+                    )
+                elif ext in video_exts:
+                    result = await _operation(
+                        "send_video",
+                        chat_id=row["chat_id"],
+                        video_path=path,
+                        caption=caption,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await _operation(
+                        "send_document",
+                        chat_id=row["chat_id"],
+                        file_path=path,
+                        caption=caption,
+                        metadata=metadata,
+                    )
+            except Exception as exc:
+                return _failure(str(exc))
+            if getattr(result, "success", False) is False:
+                return _failure(
+                    str(getattr(result, "error", "") or "attachment send failed")
+                )
+            checkpoint_failure = await _completed(operation_key)
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+        for local_index, path in enumerate(remaining_local):
+            operation_key = f"local:{local_index}"
+            if operation_key in completed_keys:
+                continue
+            attempting_failure = await _attempting(operation_key)
+            if attempting_failure is not None:
+                return attempting_failure
+            ext = Path(path).suffix.lower()
+            method_name = "send_video" if ext in video_exts else "send_document"
+            path_arg = "video_path" if ext in video_exts else "file_path"
+            try:
+                result = await _operation(
+                    method_name,
+                    chat_id=row["chat_id"],
+                    **{path_arg: path},
+                    caption=(
+                        RECOVERED_MARKER.strip()
+                        if ambiguous_operation == operation_key
+                        else None
+                    ),
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                return _failure(str(exc))
+            if getattr(result, "success", False) is False:
+                return _failure(
+                    str(getattr(result, "error", "") or "attachment send failed")
+                )
+            checkpoint_failure = await _completed(operation_key)
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+        missing_keys = planned_keys - completed_keys
+        if missing_keys:
+            return _failure(
+                "response bundle incomplete: "
+                + ", ".join(sorted(missing_keys))
+            )
+        result = SendResult(success=True)
+        setattr(result, "bundle_complete", True)
+        return result
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -13319,6 +13872,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform.value,
                                 exc_info=True,
                             )
+                        try:
+                            await self._redeliver_pending_obligations()
+                        except Exception:
+                            logger.debug(
+                                "ledger redelivery after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
                         self._update_platform_runtime_status(
@@ -14306,6 +14867,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 platform.value,
                                 profile_name,
                             )
+                            try:
+                                await self._redeliver_pending_obligations()
+                            except Exception:
+                                logger.debug(
+                                    "ledger redelivery after secondary %s/%s "
+                                    "reconnect failed",
+                                    profile_name,
+                                    platform.value,
+                                    exc_info=True,
+                                )
                             return
                         # A newer reconnect already won the slot while this
                         # attempt was awaiting connect; do not replace it.
@@ -17330,6 +17901,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # token out of public metadata, transcripts, and platform payloads.
         setattr(event, "_gateway_active_turn_session_key", session_key)
         setattr(event, "_gateway_active_turn_token", token)
+        relay_handoff = getattr(event, "_relay_durable_handoff", None)
+        if relay_handoff is not None:
+            relay_handoff.set()
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
@@ -17722,7 +18296,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # explicitly degraded past) the per-session lease.  Marking before the
         # await above would falsely recover an alias-routed message that never
         # began processing if the gateway died while it was still waiting.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        await self._mark_durable_active_turn(
+            event, session_entry.session_key
+        )
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -22231,6 +22807,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if logical_platform and logical_platform != Platform.RELAY.value:
                 metadata = dict(metadata or {})
                 metadata["_relay_logical_platform"] = str(logical_platform)
+            identity = source_attrs.get("_transport_identity")
+            if identity:
+                metadata = dict(metadata or {})
+                metadata["_relay_transport_identity"] = str(identity)
             scope_id = getattr(source, "scope_id", None)
             user_id = getattr(source, "user_id", None)
             if scope_id:

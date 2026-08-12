@@ -33,8 +33,9 @@ ambiguous sends):
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
-Everything here is best-effort by design: ledger failures must never block
-or delay an actual send. Callers wrap every call in try/except.
+Final response bundles fail closed when their durable row or a pre-send
+operation marker cannot be established. Post-send checkpoint failures remain
+visible as acknowledgement-ambiguous partial state rather than being erased.
 """
 
 from __future__ import annotations
@@ -114,6 +115,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             route_scope_id TEXT,
             route_user_id TEXT,
             route_chat_type TEXT,
+            operation TEXT NOT NULL DEFAULT 'text',
+            payload_json TEXT,
+            sequence_no INTEGER NOT NULL DEFAULT 0,
             last_error TEXT
         )"""
     )
@@ -146,6 +150,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 f"ALTER TABLE delivery_obligations ADD COLUMN {column} TEXT"
             )
+    if "operation" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN "
+            "operation TEXT NOT NULL DEFAULT 'text'"
+        )
+    if "payload_json" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN payload_json TEXT"
+        )
+    if "sequence_no" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN "
+            "sequence_no INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -223,16 +241,29 @@ def compute_obligation_id(
     transport_identity: Optional[str] = None,
     route_scope_id: Optional[str] = None,
     route_user_id: Optional[str] = None,
+    operation: str = "text",
+    payload_json: Optional[str] = None,
 ) -> str:
     """Stable id for one turn, payload, and transport credential owner."""
-    payload = f"{session_key}|{message_ref}|{content}"
+    payload_body = payload_json if payload_json is not None else content
+    is_legacy_text = operation == "text" and payload_json is None
+    payload = (
+        f"{session_key}|{message_ref}|{content}"
+        if is_legacy_text
+        else f"{session_key}|{message_ref}|{operation}|{payload_body}"
+    )
     if transport_profile_stamped:
         payload = (
             f"{session_key}|{message_ref}|"
             f"stamped:{transport_platform or ''}:"
             f"{transport_profile or ''}:"
             f"{transport_identity or ''}:"
-            f"{route_scope_id or ''}:{route_user_id or ''}|{content}"
+            f"{route_scope_id or ''}:{route_user_id or ''}|"
+            + (
+                content
+                if is_legacy_text
+                else f"{operation}|{payload_body}"
+            )
         )
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
@@ -252,6 +283,9 @@ def record_obligation(
     route_scope_id: Optional[str] = None,
     route_user_id: Optional[str] = None,
     route_chat_type: Optional[str] = None,
+    operation: str = "text",
+    payload_json: Optional[str] = None,
+    sequence_no: int = 0,
 ) -> None:
     """Record a final response as owed to one transport owner."""
     now = time.time()
@@ -263,8 +297,8 @@ def record_obligation(
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, transport_platform, transport_profile,
                 transport_profile_stamped, transport_identity, route_scope_id,
-                route_user_id, route_chat_type)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                route_user_id, route_chat_type, operation, payload_json, sequence_no)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 obligation_id,
                 session_key,
@@ -283,13 +317,25 @@ def record_obligation(
                 route_scope_id,
                 route_user_id,
                 route_chat_type,
+                str(operation or "text"),
+                payload_json,
+                int(sequence_no),
             ),
         )
     _prune()
 
 
-def mark_attempting(obligation_id: str) -> None:
-    _update_state(obligation_id, "attempting")
+def mark_attempting(obligation_id: str) -> bool:
+    """Transition an existing owed row to attempting; return whether it existed."""
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', updated_at=?, last_error=NULL
+               WHERE obligation_id=?
+                 AND state IN ('pending', 'failed', 'attempting')""",
+            (time.time(), obligation_id),
+        )
+    return bool(cursor.rowcount)
 
 
 def mark_delivered(obligation_id: str) -> None:
@@ -300,12 +346,181 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def mark_partial_failed(obligation_id: str, error: str = "") -> None:
+    """Preserve a partially delivered bundle without automatic whole replay."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='partial', attempts=?, updated_at=?, last_error=?
+               WHERE obligation_id=?""",
+            (
+                MAX_ATTEMPTS,
+                time.time(),
+                (error or "partial response bundle")[:500],
+                obligation_id,
+            ),
+        )
+
+
+def response_bundle_operation_keys(payload: Dict[str, Any]) -> List[str]:
+    """Return stable physical-operation keys for a v1 response bundle."""
+    keys: List[str] = []
+    text = str(payload.get("text") or "")
+    if payload.get("auto_tts") and text:
+        segment_count = int(payload.get("auto_tts_segment_count") or 1)
+        keys.extend(f"auto_tts:{index}" for index in range(segment_count))
+    if text:
+        keys.append("text")
+    if payload.get("images"):
+        keys.append("images")
+    force_document = bool(payload.get("force_document_attachments"))
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    has_image_files = False
+    media_count = 0
+    local_count = 0
+    for item in payload.get("media_files") or []:
+        path = str(item[0]) if isinstance(item, (list, tuple)) and item else ""
+        is_voice = bool(item[1]) if isinstance(item, (list, tuple)) and len(item) > 1 else False
+        if os.path.splitext(path)[1].lower() in image_exts and not is_voice and not force_document:
+            has_image_files = True
+        else:
+            media_count += 1
+    for item in payload.get("local_files") or []:
+        path = str(item)
+        if os.path.splitext(path)[1].lower() in image_exts and not force_document:
+            has_image_files = True
+        else:
+            local_count += 1
+    if has_image_files:
+        keys.append("image_files")
+    keys.extend(f"media:{index}" for index in range(media_count))
+    keys.extend(f"local:{index}" for index in range(local_count))
+    return keys
+
+
+def mark_bundle_operation_completed(obligation_id: str, operation_key: str) -> bool:
+    """Durably checkpoint one ACKed physical operation within a bundle."""
+    return mark_bundle_operations_completed(obligation_id, [operation_key])
+
+
+def mark_bundle_operations_completed(
+    obligation_id: str, operation_keys: List[str]
+) -> bool:
+    """Atomically checkpoint obligations fulfilled by one physical operation."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT operation, payload_json FROM delivery_obligations "
+            "WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()
+        if not row or row[0] != "response_bundle" or not row[1]:
+            return False
+        try:
+            payload = json.loads(str(row[1]))
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        # ``operation_keys`` is a cache, never an authority boundary. Always
+        # derive it from the physical plan so stale/malformed rows cannot
+        # authorize a nonexistent checkpoint or omit an obligation.
+        expected = response_bundle_operation_keys(payload)
+        payload["operation_keys"] = expected
+        keys = [str(key) for key in operation_keys]
+        if not keys or any(key not in expected for key in keys):
+            return False
+        completed = payload.get("completed_operations")
+        if not isinstance(completed, list):
+            completed = []
+        for key in keys:
+            if key not in completed:
+                completed.append(key)
+        payload["completed_operations"] = completed
+        if payload.get("attempting_operation") in keys:
+            payload.pop("attempting_operation", None)
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET payload_json=?, state='pending', updated_at=?, last_error=NULL
+               WHERE obligation_id=?""",
+            (json.dumps(payload, sort_keys=True), time.time(), obligation_id),
+        )
+    return bool(cursor.rowcount)
+
+
+def mark_bundle_operation_attempting(
+    obligation_id: str, operation_key: str
+) -> bool:
+    """Durably identify the exact physical operation about to start."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT operation, payload_json FROM delivery_obligations "
+            "WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()
+        if not row or row[0] != "response_bundle" or not row[1]:
+            return False
+        try:
+            payload = json.loads(str(row[1]))
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        # ``operation_keys`` is a cache, never an authority boundary. Always
+        # derive it from the physical plan so stale/malformed rows cannot
+        # authorize a nonexistent checkpoint or omit an obligation.
+        expected = response_bundle_operation_keys(payload)
+        payload["operation_keys"] = expected
+        key = str(operation_key)
+        completed = payload.get("completed_operations")
+        if not isinstance(completed, list):
+            completed = []
+        if key not in expected or key in completed:
+            return False
+        payload["attempting_operation"] = key
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET payload_json=?, state='attempting', updated_at=?, last_error=NULL
+               WHERE obligation_id=?
+                 AND state IN ('pending', 'failed', 'attempting')""",
+            (json.dumps(payload, sort_keys=True), time.time(), obligation_id),
+        )
+    return bool(cursor.rowcount)
+
+
+def update_bundle_payload(
+    obligation_id: str, updates: Dict[str, Any]
+) -> bool:
+    """Merge durable routing-independent bundle metadata before delivery."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT operation, payload_json FROM delivery_obligations "
+            "WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()
+        if not row or row[0] != "response_bundle" or not row[1]:
+            return False
+        try:
+            payload = json.loads(str(row[1]))
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        payload.update(dict(updates))
+        payload["operation_keys"] = response_bundle_operation_keys(payload)
+        cursor = conn.execute(
+            "UPDATE delivery_obligations SET payload_json=?, updated_at=? "
+            "WHERE obligation_id=?",
+            (json.dumps(payload, sort_keys=True), time.time(), obligation_id),
+        )
+    return bool(cursor.rowcount)
+
+
 def undelivered_session_keys() -> set[str]:
     """Return sessions whose completed answer is still durably owed."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT DISTINCT session_key FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed', 'partial')"""
         ).fetchall()
     return {str(row[0]) for row in rows if row and row[0]}
 
@@ -368,9 +583,11 @@ def sweep_recoverable(
                       transport_platform, transport_profile,
                       transport_profile_stamped, transport_identity,
                       route_scope_id, route_user_id, route_chat_type,
+                      operation, payload_json, sequence_no,
                       owner_pid, owner_started_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+               ORDER BY created_at ASC, sequence_no ASC, rowid ASC"""
         ).fetchall()
         for (
             oid,
@@ -389,6 +606,9 @@ def sweep_recoverable(
             route_scope_id,
             route_user_id,
             route_chat_type,
+            operation,
+            payload_json,
+            sequence_no,
             owner_pid,
             owner_started_at,
         ) in rows:
@@ -455,6 +675,9 @@ def sweep_recoverable(
                     "route_scope_id": route_scope_id,
                     "route_user_id": route_user_id,
                     "route_chat_type": route_chat_type,
+                    "operation": operation or "text",
+                    "payload_json": payload_json,
+                    "sequence_no": int(sequence_no or 0),
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
@@ -481,10 +704,10 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
+                         WHERE state IN ('delivered', 'abandoned')
                          ORDER BY CASE state
                                     WHEN 'delivered' THEN 0
                                     WHEN 'abandoned' THEN 1
-                                    ELSE 2
                                   END, updated_at ASC
                          LIMIT ?)""",
                     (excess,),

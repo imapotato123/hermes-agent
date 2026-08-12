@@ -35,6 +35,17 @@ def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch
     fake_home = tmp_path / "alt_hermes_home"
     fake_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    import hermes_state
+
+    # The suite's autouse isolation fixture deliberately repoints
+    # DEFAULT_DB_PATH, which has higher precedence than runtime HERMES_HOME.
+    # This test exercises the no-explicit-override path, so restore the import
+    # snapshot before constructing SessionStore.
+    monkeypatch.setattr(
+        hermes_state,
+        "DEFAULT_DB_PATH",
+        hermes_state._IMPORT_DEFAULT_DB_PATH,
+    )
 
     with patch("gateway.session.SessionStore._ensure_loaded"):
         store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)

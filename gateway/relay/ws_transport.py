@@ -462,6 +462,7 @@ class WebSocketRelayTransport:
         self._descriptor_ready: asyncio.Future[CapabilityDescriptor] | None = None
         # requestId -> future awaiting the matching outbound_result.
         self._pending: Dict[str, asyncio.Future[Dict[str, Any]]] = {}
+        self._inbound_tasks: set[asyncio.Task[None]] = set()
         # Phase 5 §5.3: future awaiting the connector's going_idle_ack.
         self._going_idle_ack: asyncio.Future[None] | None = None
         self._closing = False
@@ -582,6 +583,21 @@ class WebSocketRelayTransport:
                 except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                     pass
                 self._reader = None
+            inbound_tasks = getattr(self, "_inbound_tasks", None)
+            if inbound_tasks:
+                for task in tuple(inbound_tasks):
+                    task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *tuple(inbound_tasks),
+                            return_exceptions=True,
+                        ),
+                        timeout=_TEARDOWN_AWAIT_TIMEOUT_S,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
+                inbound_tasks.clear()
             if self._ws is not None:
                 try:
                     await asyncio.wait_for(self._ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S)
@@ -648,22 +664,15 @@ class WebSocketRelayTransport:
         # and to make the A2 call site explicit.
         return await self._request_response(action, platform=platform)
 
-    def _bot_id_for(self, platform: Optional[str]) -> Optional[str]:
-        """The bot_id this transport advertised at hello for ``platform`` (Phase 1.5).
-
-        The connector validates a per-frame egress target against the SET of
-        ``platform:botId`` pairs it accumulated from the N hellos, so a per-frame
-        ``platform`` must ride with its MATCHING ``botId`` (the session default
-        botId belongs to the first identity and would mis-key for a second
-        platform). Resolved from the identity set this transport was built with.
-        None when the platform isn't one we front (the connector then rejects it
-        with a structured failure — never a wrong-credential send)."""
+    def _bot_ids_for(self, platform: Optional[str]) -> list[str]:
         if not platform:
-            return None
-        for p, b in self._identities:
-            if p == platform:
-                return b
-        return None
+            return []
+        return [str(b or "") for p, b in self._identities if p == platform]
+
+    def _bot_id_for(self, platform: Optional[str]) -> Optional[str]:
+        """The unique bot_id advertised at hello for ``platform`` (Phase 1.5)."""
+        matches = self._bot_ids_for(platform)
+        return matches[0] if len(matches) == 1 else None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         result = await self._request_response(
@@ -760,6 +769,9 @@ class WebSocketRelayTransport:
         except Exception:  # noqa: BLE001 - a failed ack just redelivers the entry next time
             logger.debug("relay: inbound_ack send failed for %s", buffer_id)
 
+    async def ack_buffered_inbound(self, buffer_id: str) -> None:
+        await self._send_inbound_ack(buffer_id)
+
     async def _request_response(
         self,
         action: Dict[str, Any],
@@ -767,6 +779,38 @@ class WebSocketRelayTransport:
         *,
         platform: Optional[str] = None,
     ) -> Dict[str, Any]:
+        wire_action = dict(action)
+        action_metadata = wire_action.get("metadata")
+        private_identity = None
+        if isinstance(action_metadata, dict):
+            wire_metadata = dict(action_metadata)
+            private_identity = wire_metadata.pop(
+                "_relay_transport_identity", None
+            )
+            wire_action["metadata"] = wire_metadata
+
+        explicit_bot_id: Optional[str] = None
+        platform_bot_ids = self._bot_ids_for(platform)
+        if private_identity is not None:
+            identity = str(private_identity)
+            prefix = f"{platform}:" if platform else ""
+            if not prefix or not identity.startswith(prefix):
+                return {
+                    "success": False,
+                    "error": "relay transport identity/platform mismatch",
+                }
+            explicit_bot_id = identity[len(prefix):]
+            if explicit_bot_id not in platform_bot_ids:
+                return {
+                    "success": False,
+                    "error": "relay transport identity unavailable",
+                }
+        elif platform and len(platform_bot_ids) != 1:
+            return {
+                "success": False,
+                "error": "relay transport identity ambiguous",
+            }
+
         if self._closing:
             # Teardown in progress: the disconnect() fail-pending loop may
             # already have run, so a future registered now would never be
@@ -779,7 +823,11 @@ class WebSocketRelayTransport:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
         self._pending[request_id] = fut
-        frame: Dict[str, Any] = {"type": frame_type, "requestId": request_id, "action": action}
+        frame: Dict[str, Any] = {
+            "type": frame_type,
+            "requestId": request_id,
+            "action": wire_action,
+        }
         # Phase 1.5: tag the per-frame egress platform on the OutboundFrame
         # envelope (gateway-gateway D-Q1.5b.1), with its MATCHING advertised botId
         # so the connector's `${platform}:${botId}` advertised-set check passes.
@@ -788,8 +836,12 @@ class WebSocketRelayTransport:
         # connector falls back to the session's default platform when absent).
         if platform:
             frame["platform"] = platform
-            bot_id = self._bot_id_for(platform)
-            if bot_id:
+            bot_id = (
+                explicit_bot_id
+                if explicit_bot_id is not None
+                else self._bot_id_for(platform)
+            )
+            if bot_id is not None:
                 frame["botId"] = bot_id
         try:
             await self._send(frame)
@@ -929,14 +981,42 @@ class WebSocketRelayTransport:
         elif ftype == "inbound":
             if self._inbound is not None:
                 event = _event_from_wire(frame.get("event", {}))
-                await self._inbound(event)
-                # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
-                # a bufferId; ack it after the handler has durably taken it so the
-                # connector advances its delivery-leg buffer cursor (no dup). A live
-                # delivery has no bufferId — nothing to ack.
                 buffer_id = frame.get("bufferId")
+                handoff = None
                 if buffer_id:
-                    await self._send_inbound_ack(str(buffer_id))
+                    handoff = asyncio.Event()
+                    setattr(event, "_relay_durable_handoff", handoff)
+                inbound_platform = str(
+                    getattr(event.source.platform, "value", event.source.platform)
+                )
+                inbound_bot_id = frame.get("botId")
+                if inbound_bot_id is not None:
+                    identity = f"{inbound_platform}:{inbound_bot_id}"
+                    if identity not in {
+                        f"{p}:{b}" for p, b in self._identities
+                    }:
+                        logger.warning(
+                            "relay inbound dropped: unacknowledged transport "
+                            "identity %s",
+                            identity,
+                        )
+                        return
+                    setattr(
+                        event.source,
+                        "_relay_ingress_transport_identity",
+                        identity,
+                    )
+                if buffer_id:
+                    task = asyncio.create_task(
+                        self._consume_buffered_inbound(
+                            event, str(buffer_id), handoff
+                        ),
+                        name=f"relay-buffered-inbound-{buffer_id}",
+                    )
+                    self._inbound_tasks.add(task)
+                    task.add_done_callback(self._inbound_tasks.discard)
+                else:
+                    await self._inbound(event)
         elif ftype == "going_idle_ack":
             # Phase 5 §5.3: the connector confirmed our destination is now
             # buffered-only; resolve the waiter go_idle() is blocked on.
@@ -960,7 +1040,16 @@ class WebSocketRelayTransport:
             handler = getattr(self, "_passthrough_handler", None)
             if handler is not None:
                 fwd = _passthrough_from_wire(frame.get("forward", {}))
-                await handler(fwd, frame.get("bufferId"))
+                buffer_id = frame.get("bufferId")
+                if buffer_id:
+                    task = asyncio.create_task(
+                        handler(fwd, str(buffer_id)),
+                        name=f"relay-buffered-passthrough-{buffer_id}",
+                    )
+                    self._inbound_tasks.add(task)
+                    task.add_done_callback(self._inbound_tasks.discard)
+                else:
+                    await handler(fwd, None)
         else:
             # hello/outbound/interrupt are gateway->connector; ignore if echoed.
             pass
@@ -968,6 +1057,19 @@ class WebSocketRelayTransport:
     def set_interrupt_inbound_handler(self, handler: Any) -> None:
         """Register the callback for connector->gateway interrupt_inbound frames."""
         self._interrupt_inbound_handler = handler
+
+    async def _consume_buffered_inbound(
+        self,
+        event: MessageEvent,
+        buffer_id: str,
+        handoff: Optional[asyncio.Event],
+    ) -> None:
+        if self._inbound is None:
+            return
+        await self._inbound(event)
+        if handoff is not None:
+            await handoff.wait()
+        await self._send_inbound_ack(buffer_id)
 
     def set_passthrough_handler(self, handler: Any) -> None:
         """Register the callback for connector->gateway passthrough_forward frames.
