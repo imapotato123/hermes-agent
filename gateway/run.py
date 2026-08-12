@@ -20393,11 +20393,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "images": images,
                             "metadata": _thread_meta,
                         }
-                        if (
-                            getattr(image_send, "__func__", None)
-                            is BasePlatformAdapter.send_multiple_images
-                        ):
-                            _image_kwargs["source"] = event.source
+                        try:
+                            source_attrs = getattr(
+                                event.source, "__dict__", {}
+                            )
+                            if (
+                                isinstance(source_attrs, dict)
+                                and "_transport_profile" in source_attrs
+                            ):
+                                signature = inspect.signature(image_send)
+                                if "source" in signature.parameters or any(
+                                    parameter.kind
+                                    is inspect.Parameter.VAR_KEYWORD
+                                    for parameter in signature.parameters.values()
+                                ):
+                                    _image_kwargs["source"] = event.source
+                        except (TypeError, ValueError):
+                            pass
                         await image_send(**_image_kwargs)
                 except Exception as e:
                     logger.warning(

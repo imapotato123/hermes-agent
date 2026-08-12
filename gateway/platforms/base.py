@@ -4429,6 +4429,65 @@ class BasePlatformAdapter(ABC):
                 return
         await self.stop_typing(chat_id)
 
+    async def _handoff_image_batch_if_replaced(
+        self,
+        *,
+        source: Optional[SessionSource],
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]],
+        human_delay: float,
+    ) -> bool:
+        """Delegate an unsent batch remainder to the current transport owner."""
+        if source is None:
+            return False
+        if not images:
+            return True
+        delivery_adapter = self._final_delivery_adapter(source)
+        if delivery_adapter is self:
+            return False
+        if delivery_adapter is None:
+            logger.warning(
+                "[%s] Withholding image batch remainder: no live transport owner",
+                self.name,
+            )
+            return True
+        send_images = getattr(delivery_adapter, "send_multiple_images", None)
+        if not callable(send_images):
+            logger.warning(
+                "[%s] Withholding image batch remainder: live owner has no "
+                "batch operation",
+                self.name,
+            )
+            return True
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "images": images,
+            "metadata": metadata,
+            "human_delay": human_delay,
+        }
+        try:
+            signature = inspect.signature(send_images)
+            if "source" in signature.parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ):
+                kwargs["source"] = source
+        except (TypeError, ValueError):
+            pass
+        try:
+            await cast(Callable[..., Awaitable[Any]], send_images)(**kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[%s] Replacement image-batch delivery failed; retired owner "
+                "will not retry",
+                self.name,
+                exc_info=True,
+            )
+        return True
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -7017,11 +7076,23 @@ class BasePlatformAdapter(ABC):
                                 "metadata": _final_thread_metadata,
                                 "human_delay": human_delay,
                             }
-                            if (
-                                getattr(image_send, "__func__", None)
-                                is BasePlatformAdapter.send_multiple_images
-                            ):
-                                _image_kwargs["source"] = event.source
+                            try:
+                                source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                if (
+                                    isinstance(source_attrs, dict)
+                                    and "_transport_profile" in source_attrs
+                                ):
+                                    signature = inspect.signature(image_send)
+                                    if "source" in signature.parameters or any(
+                                        parameter.kind
+                                        is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in signature.parameters.values()
+                                    ):
+                                        _image_kwargs["source"] = event.source
+                            except (TypeError, ValueError):
+                                pass
                             await cast(
                                 Callable[..., Awaitable[Any]], image_send
                             )(**_image_kwargs)
@@ -7080,11 +7151,23 @@ class BasePlatformAdapter(ABC):
                                 "metadata": _final_thread_metadata,
                                 "human_delay": human_delay,
                             }
-                            if (
-                                getattr(image_send, "__func__", None)
-                                is BasePlatformAdapter.send_multiple_images
-                            ):
-                                _image_kwargs["source"] = event.source
+                            try:
+                                source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                if (
+                                    isinstance(source_attrs, dict)
+                                    and "_transport_profile" in source_attrs
+                                ):
+                                    signature = inspect.signature(image_send)
+                                    if "source" in signature.parameters or any(
+                                        parameter.kind
+                                        is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in signature.parameters.values()
+                                    ):
+                                        _image_kwargs["source"] = event.source
+                            except (TypeError, ValueError):
+                                pass
                             await cast(
                                 Callable[..., Awaitable[Any]], image_send
                             )(**_image_kwargs)
