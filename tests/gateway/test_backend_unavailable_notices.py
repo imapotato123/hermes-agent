@@ -591,8 +591,8 @@ async def test_shared_runner_state_does_not_cross_suppress_profiles():
     assert [message["content"] for message in first.sent] == [_NOTICE]
     assert [message["content"] for message in second.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:alpha:agent:main:slack:channel:C123:171717",
-        "profile:beta:agent:main:slack:channel:C123:171717",
+        "profile:5:alpha:agent:main:slack:channel:C123:171717",
+        "profile:4:beta:agent:main:slack:channel:C123:171717",
     }
 
 
@@ -627,9 +627,149 @@ async def test_default_profile_does_not_collide_with_named_main_profile():
     assert [message["content"] for message in default_adapter.sent] == [_NOTICE]
     assert [message["content"] for message in named_main_adapter.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "profile:default:agent:main:slack:channel:C123:171717",
-        "profile:main:agent:main:slack:channel:C123:171717",
+        "profile:7:default:agent:main:slack:channel:C123:171717",
+        "profile:4:main:agent:main:slack:channel:C123:171717",
     }
+
+
+def test_shared_notice_state_wiring_attaches_runner_for_direct_builtins():
+    adapter = CaptureSlackAdapter()
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner._backend_notice_state = BackendNoticeState()
+
+    runner._share_backend_notice_state(adapter, profile_name="default")
+
+    assert cast(Any, adapter).gateway_runner is runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routed_profile_has_slack", [False, True])
+async def test_routed_runtime_reconnect_uses_primary_transport_replacement(
+    monkeypatch,
+    tmp_path,
+    routed_profile_has_slack,
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    runner._profile_name_for_source = lambda source: "routed"
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="default")
+
+    routed_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(routed_adapter, profile_name="routed")
+    runner._profile_adapters = (
+        {"routed": {Platform.SLACK: routed_adapter}}
+        if routed_profile_has_slack
+        else {}
+    )
+
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-routed",
+    )
+    assert source.profile == "routed"
+    assert "_transport_profile" not in source.to_dict()
+    event = MessageEvent(text="hello", source=source, message_id="m-routed")
+    session_key = build_session_key(source)
+
+    # The runtime route is independent from the bot credential that received
+    # this turn. A primary reconnect must retain the primary transport even if
+    # the routed profile happens to own another adapter for the same platform.
+    runner.adapters[Platform.SLACK] = replacement
+    assert runner._adapter_for_source(source) is replacement
+    assert runner._adapter_profile_for_source(source) is None
+    await stale_adapter._process_message_background(event, session_key)
+
+    assert stale_adapter.sent == []
+    assert routed_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [_NOTICE]
+    assert replacement._llm_error_notice_suppressed(
+        session_key,
+        "backend_unavailable",
+        time.monotonic(),
+        source=source,
+    )
+
+
+@pytest.mark.asyncio
+async def test_routed_runtime_reconnect_uses_secondary_transport_replacement(
+    monkeypatch,
+    tmp_path,
+):
+    stale_adapter = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_adapter,
+        [_backend_failure("ConnectError: connection refused")],
+    )
+    runner._profile_name_for_source = lambda source: "routed"
+
+    primary_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(primary_adapter, profile_name="default")
+    runner.adapters[Platform.SLACK] = primary_adapter
+
+    runner._share_backend_notice_state(stale_adapter, profile_name="coder")
+    routed_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(routed_adapter, profile_name="routed")
+    runner._profile_adapters = {
+        "coder": {Platform.SLACK: stale_adapter},
+        "routed": {Platform.SLACK: routed_adapter},
+    }
+
+    source = stale_adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-secondary-routed",
+    )
+    assert source.profile == "routed"
+    assert "_transport_profile" not in source.to_dict()
+    event = MessageEvent(
+        text="hello",
+        source=source,
+        message_id="m-secondary-routed",
+    )
+
+    replacement = CaptureSlackAdapter()
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    runner._profile_adapters["coder"][Platform.SLACK] = replacement
+
+    assert runner._adapter_for_source(source) is replacement
+    assert runner._adapter_profile_for_source(source) == "coder"
+    await stale_adapter._process_message_background(event, build_session_key(source))
+
+    assert stale_adapter.sent == []
+    assert primary_adapter.sent == []
+    assert routed_adapter.sent == []
+    assert [message["content"] for message in replacement.sent] == [_NOTICE]
+    assert replacement._llm_error_notice_suppressed(
+        build_session_key(source),
+        "backend_unavailable",
+        time.monotonic(),
+        source=source,
+    )
+
+
+def test_missing_secondary_transport_owner_keeps_secondary_policy_scope():
+    runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    source = SessionSource(platform=Platform.SLACK, chat_id="C123")
+    setattr(source, "_transport_profile", "coder")
+
+    assert runner._adapter_for_source(source) is None
+    assert runner._adapter_profile_for_source(source) == "coder"
 
 
 @pytest.mark.asyncio
@@ -720,7 +860,7 @@ def test_notice_tracker_prunes_expired_sessions():
 
     adapter._record_llm_error_notice("live", "backend_unavailable", now)
 
-    assert set(adapter._llm_error_last_posted) == {"profile:default:live"}
+    assert set(adapter._llm_error_last_posted) == {"profile:7:default:live"}
 
 
 def test_notice_tracker_is_bounded():
@@ -737,7 +877,7 @@ def test_notice_tracker_is_bounded():
 
     assert len(adapter._llm_error_last_posted) <= _LLM_ERROR_TRACKER_MAX_SESSIONS
     assert (
-        f"profile:default:session-{overflow - 1}"
+        f"profile:7:default:session-{overflow - 1}"
         in adapter._llm_error_last_posted
     )
     assert "session-0" not in adapter._llm_error_last_posted
