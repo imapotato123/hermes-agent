@@ -76,6 +76,9 @@ async def deliver_wake(
                 "deliver_wake: push-capable adapter requires a SessionSource"
             )
         from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import stamp_source_transport_owner
+
+        stamp_source_transport_owner(source, adapter=adapter)
 
         synth_event = MessageEvent(
             text=text,

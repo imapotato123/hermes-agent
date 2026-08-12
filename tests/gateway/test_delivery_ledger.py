@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import sqlite3
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -93,6 +94,55 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_existing_schema_migrates_transport_owner_columns(self):
+        path = dl._db_path()
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                content TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                last_error TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        _record()
+        with dl._connect() as migrated:
+            columns = {
+                row[1]
+                for row in migrated.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                ).fetchall()
+            }
+            owner = migrated.execute(
+                "SELECT transport_platform, transport_profile, "
+                "transport_profile_stamped, transport_identity, route_scope_id, "
+                "route_user_id, route_chat_type, recovery_claim "
+                "FROM delivery_obligations WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert {
+            "transport_platform",
+            "transport_profile",
+            "transport_profile_stamped",
+            "transport_identity",
+            "route_scope_id",
+            "route_user_id",
+            "route_chat_type",
+            "recovery_claim",
+        } <= columns
+        assert owner == (None, None, 0, None, None, None, None, None)
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -104,6 +154,72 @@ class TestObligationId:
         assert a != dl.compute_obligation_id("sk1", "msg2", "hello")
         assert a != dl.compute_obligation_id("sk1", "msg1", "other")
         assert len(a) == 24
+
+    def test_stamped_physical_platform_is_part_of_identity(self):
+        native = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="discord",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+        relay = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+
+        assert native != relay
+
+    def test_transport_identity_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-2",
+        )
+
+        assert first != second
+
+    def test_relay_tenant_discriminator_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-1",
+            route_user_id="user-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-2",
+            route_user_id="user-2",
+        )
+
+        assert first != second
 
 
 class TestSweep:
@@ -121,6 +237,78 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_claim_cas_includes_observed_process_start_time(self, monkeypatch):
+        """PID reuse between liveness check and UPDATE cannot steal a live claim."""
+        _record()
+        _orphan("ob-1")
+
+        class _RacingConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self._raced = False
+
+            def execute(self, sql, params=()):
+                if "SET owner_pid=?" in sql and not self._raced:
+                    self._raced = True
+                    self._conn.execute(
+                        "UPDATE delivery_obligations "
+                        "SET owner_pid=?, owner_started_at=? WHERE obligation_id=?",
+                        (999999999, 2, "ob-1"),
+                    )
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        real_transaction = dl._transaction
+
+        @dl.contextmanager
+        def racing_transaction():
+            with real_transaction() as conn:
+                yield _RacingConnection(conn)
+
+        monkeypatch.setattr(dl, "_transaction", racing_transaction)
+
+        assert dl.sweep_recoverable() == []
+        with dl._connect() as conn:
+            owner_pid, owner_started_at, attempts = conn.execute(
+                "SELECT owner_pid, owner_started_at, attempts "
+                "FROM delivery_obligations WHERE obligation_id=?",
+                ("ob-1",),
+            ).fetchone()
+        assert (owner_pid, owner_started_at, attempts) == (999999999, 2, 0)
+
+    def test_stale_same_process_generation_cannot_release_or_settle_new_claim(self):
+        _record()
+        _orphan("ob-1")
+
+        first = dl.sweep_recoverable()[0]
+        assert first["attempts"] == 1
+        first_claim = first["recovery_claim"]
+        assert dl.mark_attempting("ob-1", recovery_claim=first_claim) is True
+        assert dl.release_claim(
+            "ob-1", consume_attempt=True, recovery_claim=first_claim
+        ) is True
+
+        second = dl.sweep_recoverable()[0]
+        assert second["attempts"] == 2
+        second_claim = second["recovery_claim"]
+        assert second_claim != first_claim
+
+        assert dl.release_claim(
+            "ob-1", consume_attempt=True, recovery_claim=first_claim
+        ) is False
+        assert dl.mark_delivered("ob-1", recovery_claim=first_claim) is False
+
+        with dl._connect() as conn:
+            state, attempts, owner_pid = conn.execute(
+                "SELECT state, attempts, owner_pid FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert state == "attempting"
+        assert attempts == 2
+        assert owner_pid == dl._owner_stamp()[0]
 
 
 class TestPrune:
@@ -184,6 +372,45 @@ class TestGatewayRedeliverySweep:
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_clear_still_fences_auto_resume(self):
+        from datetime import datetime
+
+        from gateway.config import Platform
+        from gateway.session import SessionEntry, SessionSource
+
+        _record()
+        _orphan("ob-1")
+        runner = self._runner()
+        setattr(
+            runner._async_session_store,
+            "clear_resume_pending",
+            AsyncMock(side_effect=OSError("disk")),
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="channel",
+        )
+        entry = SessionEntry(
+            session_key="agent:main:slack:channel:C1",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+        )
+        store = MagicMock()
+        store._lock = threading.Lock()
+        store._entries = {entry.session_key: entry}
+        store._ensure_loaded_locked = MagicMock()
+        runner.session_store = store
+        runner._AUTO_RESUME_REASONS = frozenset({"restart_interrupted"})
+
+        assert await runner._redeliver_pending_obligations() == 0
+        assert runner._schedule_resume_pending_sessions() == 0
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):
