@@ -285,11 +285,33 @@ class SessionSource:
             d["auto_thread_initial_name"] = self.auto_thread_initial_name
         if self.prospective_thread_id:
             d["prospective_thread_id"] = self.prospective_thread_id
+        # Durable routing provenance is distinct from ``profile`` (the runtime
+        # selected for the agent turn) and from ``platform`` (the logical chat
+        # namespace). Persist it only for explicitly stamped live sources so
+        # old rows remain recognizably legacy/unstamped. The explicit stamp bit
+        # preserves a primary owner whose profile is legitimately ``None``.
+        source_attrs = getattr(self, "__dict__", {})
+        if isinstance(source_attrs, dict) and (
+            "_transport_profile" in source_attrs
+            or "_transport_platform" in source_attrs
+        ):
+            transport_platform = source_attrs.get(
+                "_transport_platform", self.platform
+            )
+            transport_platform_value = getattr(
+                transport_platform, "value", transport_platform
+            )
+            d["transport_owner_stamped"] = True
+            d["transport_platform"] = str(transport_platform_value)
+            d["transport_profile"] = source_attrs.get("_transport_profile")
+            transport_identity = source_attrs.get("_transport_identity")
+            if transport_identity is not None:
+                d["transport_identity"] = str(transport_identity)
         return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
-        return cls(
+        source = cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
             chat_name=data.get("chat_name"),
@@ -310,6 +332,25 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+        if data.get("transport_owner_stamped") is True:
+            transport_platform_value = data.get("transport_platform") or data.get(
+                "platform"
+            )
+            try:
+                transport_platform = Platform(transport_platform_value)
+            except (TypeError, ValueError):
+                # A malformed durable owner must remain stamped but impossible
+                # to resolve, never silently degrade into legacy routing.
+                transport_platform = None
+            setattr(source, "_transport_platform", transport_platform)
+            setattr(source, "_transport_profile", data.get("transport_profile"))
+            if data.get("transport_identity") is not None:
+                setattr(
+                    source,
+                    "_transport_identity",
+                    str(data.get("transport_identity")),
+                )
+        return source
     
 
 

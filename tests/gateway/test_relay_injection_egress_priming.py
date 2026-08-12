@@ -35,6 +35,7 @@ def _bare_relay_adapter():
     a._scope_by_chat = {}
     a._dm_user_by_chat = {}
     a._platform_by_chat = {}
+    a._route_by_destination = {}
     a._chat_type_by_chat = {}
     a._last_inbound_ts_by_chat = {}
     return a
