@@ -554,7 +554,12 @@ async def test_platform_send_connection_error_is_not_backend_outage(monkeypatch,
 
     contents = [message["content"] for message in adapter.sent]
     assert _NOTICE not in contents
-    assert any("ConnectionError" in content for content in contents)
+    assert contents == [
+        "Sorry, I couldn't deliver that response.\n"
+        "Try again or use /reset to start a fresh session."
+    ]
+    assert "ConnectionError" not in contents[0]
+    assert "Slack socket disconnected" not in contents[0]
 
 
 @pytest.mark.parametrize(

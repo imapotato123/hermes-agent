@@ -6713,6 +6713,7 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
+                    result = None
                     try:
                         result = await delivery_adapter._send_with_retry(
                             chat_id=event.source.chat_id,
@@ -6720,23 +6721,19 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor,
                             metadata=_final_thread_metadata,
                         )
-                    except BaseException:
+                        _record_delivery(result)
+                    finally:
                         if backend_notice_claimed:
                             delivery_adapter._backend_notice_state.finish_claim(
                                 backend_notice_session_key,
                                 "backend_unavailable",
                                 time.monotonic(),
-                                delivered=False,
+                                delivered=bool(
+                                    result is not None
+                                    and getattr(result, "success", False)
+                                ),
                             )
-                        raise
-                    _record_delivery(result)
-                    if backend_notice_claimed:
-                        delivery_adapter._backend_notice_state.finish_claim(
-                            backend_notice_session_key,
-                            "backend_unavailable",
-                            time.monotonic(),
-                            delivered=bool(getattr(result, "success", False)),
-                        )
+                    assert result is not None
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -7009,14 +7006,11 @@ class BasePlatformAdapter(ABC):
             # platform, media, storage, or hook failures and must not be
             # mislabeled as an AI-backend outage.
             try:
-                error_type = type(e).__name__
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                error_detail = str(e)[:300] if str(e) else "no details available"
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
+                        "Sorry, I couldn't deliver that response.\n"
                         "Try again or use /reset to start a fresh session."
                     ),
                     metadata=_thread_metadata,
