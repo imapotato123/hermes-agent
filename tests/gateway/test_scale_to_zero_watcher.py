@@ -248,3 +248,125 @@ async def test_self_suspend_noop_off_fly(monkeypatch):
     )
     await r._scale_to_zero_self_suspend()
     assert called == []
+
+
+# ── non-messaging platforms must not disarm (the api_server-key regression) ──
+#
+# The Docker stage2 hook now generates API_SERVER_KEY for every container, and
+# key presence force-enables the api_server platform (gateway/config.py). The
+# arm gate counted every enabled platform, so `api_server` (a loopback
+# listener, not a messaging socket) made messaging_is_relay_only_or_absent
+# False on EVERY hosted instance — silently disarming scale-to-zero. The gate
+# must only count messaging platforms (excluding LOCAL/API_SERVER/WEBHOOK,
+# mirroring _connect_platforms' messaging_platforms exclusion set).
+
+
+def test_arm_true_with_api_server_enabled(monkeypatch):
+    from gateway.platforms.base import Platform
+
+    r = _arm_runner(
+        monkeypatch,
+        {
+            Platform.RELAY: True,
+            Platform.API_SERVER: True,
+            Platform.TELEGRAM: False,
+        },
+    )
+    assert r._scale_to_zero_should_arm() is True
+
+
+def test_arm_true_with_all_non_messaging_surfaces_enabled(monkeypatch):
+    from gateway.platforms.base import Platform
+
+    r = _arm_runner(
+        monkeypatch,
+        {
+            Platform.RELAY: True,
+            Platform.API_SERVER: True,
+            Platform.WEBHOOK: True,
+            Platform.LOCAL: True,
+        },
+    )
+    assert r._scale_to_zero_should_arm() is True
+
+
+def test_direct_platform_still_disarms_alongside_api_server(monkeypatch):
+    """The messaging-only filter must not over-broaden: a genuinely enabled
+    direct-socket platform still disarms even with api_server also enabled."""
+    from gateway.platforms.base import Platform
+
+    r = _arm_runner(
+        monkeypatch,
+        {
+            Platform.RELAY: True,
+            Platform.API_SERVER: True,
+            Platform.DISCORD: True,
+        },
+    )
+    assert r._scale_to_zero_should_arm() is False
+
+
+# ── supervised watchers must NOT count as live background work (staging bug) ──
+#
+# _spawn_supervised parks every permanent watcher task (session-expiry, kanban,
+# reconnect, the scale-to-zero watcher ITSELF, ...) in _background_tasks. The
+# bg-work check counted them, so an armed gateway considered itself busy
+# forever and never went dormant — verified live on staging 2026-08-12 (armed
+# at 05:25, fully idle 25+ min, zero "going dormant" lines). Fly's coarse
+# autostop masked this until the gateway took ownership of the suspend.
+# These tests exercise the REAL _spawn_supervised path — the earlier tests
+# stubbed _background_tasks and missed the call site (same trap as F25).
+
+
+@pytest.mark.asyncio
+async def test_supervised_watchers_do_not_block_idle():
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+    r._background_tasks = set()
+
+    async def _forever():
+        await asyncio.sleep(3600)
+
+    # Spawn like production does — through _spawn_supervised.
+    for name in ("session_expiry", "kanban", "scale_to_zero_watcher"):
+        r._spawn_supervised(lambda: _forever(), name)
+    await asyncio.sleep(0)  # let tasks start
+    try:
+        assert r._scale_to_zero_has_live_background_work() is False
+    finally:
+        for t in r._background_tasks:
+            t.cancel()
+        await asyncio.gather(*r._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transient_background_task_still_blocks_idle():
+    """A plain (untagged) task in _background_tasks — startup-resume events,
+    ad-hoc work — must still count as live background work."""
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+
+    async def _work():
+        await asyncio.sleep(3600)
+
+    t = asyncio.create_task(_work())
+    r._background_tasks = {t}
+    try:
+        assert r._scale_to_zero_has_live_background_work() is True
+    finally:
+        t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_done_supervised_watcher_is_ignored_either_way():
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+
+    async def _quick():
+        return None
+
+    t = asyncio.create_task(_quick())
+    await t
+    r._background_tasks = {t}
+    assert r._scale_to_zero_has_live_background_work() is False

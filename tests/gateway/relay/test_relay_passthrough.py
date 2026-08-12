@@ -141,8 +141,6 @@ async def test_discord_interaction_routes_through_handle_message(adapter, monkey
     # The logical platform is now recorded for egress sender selection too
     # (_capture_scope skips only the generic "relay").
     assert adapter._platform_by_chat.get("chan-9") == "discord"
-
-
 @pytest.mark.asyncio
 async def test_buffered_passthrough_acks_after_consumption(adapter, monkeypatch):
     await adapter.connect()
