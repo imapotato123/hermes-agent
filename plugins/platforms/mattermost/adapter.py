@@ -640,6 +640,8 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
@@ -660,13 +662,21 @@ class MattermostAdapter(BasePlatformAdapter):
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
         for chunk_idx, chunk in enumerate(chunks):
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images[chunk_idx * CHUNK :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
             file_ids: List[str] = []
             caption_parts: List[str] = []
             try:
-                for image_url, alt_text in chunk:
+                for item_idx, (image_url, alt_text) in enumerate(chunk):
                     if alt_text:
                         caption_parts.append(alt_text)
 
@@ -701,6 +711,14 @@ class MattermostAdapter(BasePlatformAdapter):
                             continue
                         fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
 
+                    if await self._handoff_image_batch_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=images[chunk_idx * CHUNK + item_idx :],
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
                     fid = await self._upload_file(chat_id, file_data, fname, ct)
                     if fid:
                         file_ids.append(fid)
@@ -708,12 +726,29 @@ class MattermostAdapter(BasePlatformAdapter):
                 if not file_ids:
                     continue
 
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[chunk_idx * CHUNK :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
+
                 payload: Dict[str, Any] = _with_mentions_disabled({
                     "channel_id": chat_id,
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 })
                 resolved_root = await self._thread_root_for_send(None, metadata)
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[chunk_idx * CHUNK :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
                 if resolved_root:
                     payload["root_id"] = resolved_root
                 logger.info(
@@ -723,13 +758,19 @@ class MattermostAdapter(BasePlatformAdapter):
                 data = await self._post_preserving_thread(chat_id, payload, metadata)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay,
+                        source=source,
+                    )
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay,
+                    source=source,
+                )
 
     # ------------------------------------------------------------------
     # WebSocket

@@ -1,6 +1,7 @@
 """Regression tests for multiplex profile-aware own-policy authorization."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -72,6 +73,160 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     runner._active_profile_name = lambda: "dev"
 
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
+
+
+def test_explicit_default_stamp_resolves_primary_when_default_is_active(monkeypatch):
+    """Literal ``default`` remains the primary owner on a default gateway."""
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "default"
+
+    assert (
+        runner._authorization_adapter(Platform.WECOM, profile="default")
+        is default_adapter
+    )
+
+
+def test_literal_default_transport_owner_does_not_alias_active_named_profile(
+    monkeypatch,
+):
+    """An explicit ``default`` owner must resolve its secondary registry entry.
+
+    The primary adapter map belongs to the active profile. When that profile is
+    named ``main`` and a literal ``default`` profile is served secondarily,
+    treating the string ``default`` as an alias for ``self.adapters`` crosses
+    credentials and authorization policy.
+    """
+    runner, active_adapter, default_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {
+        "default": {Platform.WECOM: default_adapter},
+    }
+
+    assert (
+        runner._authorization_adapter(Platform.WECOM, profile="default")
+        is default_adapter
+    )
+    assert runner._authorization_adapter(Platform.WECOM, profile="main") is active_adapter
+
+
+def test_missing_literal_default_secondary_owner_fails_closed(monkeypatch):
+    """A missing literal-default secondary cannot borrow the named primary."""
+    runner, _active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {}
+
+    assert runner._authorization_adapter(Platform.WECOM, profile="default") is None
+
+
+def test_routed_runtime_pairing_uses_stamped_transport_owner(monkeypatch):
+    """Pairing grants belong to the credential that received the message."""
+    runner, _active_adapter, transport_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    transport_adapter.enforces_own_access_policy = False
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {
+        "coder": {Platform.WECOM: transport_adapter},
+    }
+
+    routed_store = MagicMock()
+    routed_store.is_approved.return_value = True
+    transport_store = MagicMock()
+    transport_store.is_approved.return_value = False
+    runner.pairing_stores = {
+        "routed": routed_store,
+        "coder": transport_store,
+    }
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="paired-only-in-routed",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="routed",
+    )
+    setattr(source, "_transport_profile", "coder")
+
+    assert runner._is_user_authorized(source) is False
+    transport_store.is_approved.assert_called_once_with(
+        Platform.WECOM.value, "paired-only-in-routed"
+    )
+    routed_store.is_approved.assert_not_called()
+
+
+def test_primary_active_transport_pairing_uses_active_named_store(monkeypatch):
+    """A primary named owner must not fall through to the global default store."""
+    runner, active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    active_adapter.enforces_own_access_policy = False
+    runner._active_profile_name = lambda: "main"
+
+    active_store = MagicMock()
+    active_store.is_approved.return_value = True
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_stores = {"main": active_store}
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="paired-in-main",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="routed",
+    )
+    setattr(source, "_transport_profile", "main")
+
+    assert runner._is_user_authorized(source) is True
+    active_store.is_approved.assert_called_once_with(
+        Platform.WECOM.value, "paired-in-main"
+    )
+    runner.pairing_store.is_approved.assert_not_called()
+
+
+def test_missing_stamped_transport_pairing_store_fails_closed(monkeypatch):
+    """A missing secondary store must not borrow the active/global approval."""
+    runner, _active_adapter, transport_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    transport_adapter.enforces_own_access_policy = False
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {
+        "coder": {Platform.WECOM: transport_adapter},
+    }
+    runner.pairing_store.is_approved.return_value = True
+    runner.pairing_stores = {}
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="globally-paired",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="routed",
+    )
+    setattr(source, "_transport_profile", "coder")
+
+    assert runner._is_user_authorized(source) is False
+    runner.pairing_store.is_approved.assert_not_called()
+
+
+def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
+    """Hand-built/restored sources retain the historical profile lookup."""
+    runner, _active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    routed_store = MagicMock()
+    routed_store.is_approved.return_value = True
+    runner.pairing_stores = {"routed": routed_store}
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="legacy-routed-user",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="routed",
+    )
+
+    assert runner._is_user_authorized(source) is True
+    routed_store.is_approved.assert_called_once_with(
+        Platform.WECOM.value, "legacy-routed-user"
+    )
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
