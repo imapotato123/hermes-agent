@@ -6297,26 +6297,21 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         source: Optional[SessionSource] = None,
     ) -> str:
-        """Restore the logical profile namespace for shared notice state.
+        """Return an injective profile/session key for runner-wide notice state.
 
-        ``handle_message`` builds its adapter-local key before a secondary
-        profile handler stamps ``source.profile`` and intentionally omits the
-        multiplex profile. Reusing that raw key in runner-wide state would let
-        independent profile credentials suppress each other's notices.
+        Adapter-local session keys are built before multiplex routing stamps the
+        source profile. Always prefix the logical profile, including ``default``:
+        a valid secondary profile named ``main`` would otherwise collide with
+        the default session namespace ``agent:main:...``. Length-prefixing keeps
+        the encoding unambiguous even if plugin profiles/session keys contain
+        separators.
         """
         profile = str(
             (getattr(source, "profile", None) if source is not None else None)
             or self._backend_notice_profile
-            or ""
-        ).strip()
-        if not profile or profile == "default":
-            return session_key
-        prefix, separator, remainder = session_key.partition(":")
-        _namespace, namespace_separator, tail = remainder.partition(":")
-        if prefix == "agent" and separator and namespace_separator:
-            return f"agent:{profile}:{tail}"
-        # Defensive fallback for synthetic/plugin session-key formats.
-        return f"profile:{profile}:{session_key}"
+            or "default"
+        ).strip() or "default"
+        return f"profile:{len(profile)}:{profile}:{session_key}"
 
     def set_backend_notice_state(
         self,
