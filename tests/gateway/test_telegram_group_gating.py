@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, Mock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
-from gateway.session import SessionSource, stamp_source_transport_owner
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
+)
 
 
 def _make_adapter(
@@ -220,6 +224,37 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
         assert "current new message" in event.channel_prompt
 
     asyncio.run(_run())
+
+
+def test_observed_group_context_preserves_exact_transport_owner_stamp():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    transport = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        _transport_profile="secondary",
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        user_id="111",
+        user_name="Alice",
+    )
+    stamp_source_transport_owner(source, adapter=transport)
+    source._transport_identity = "telegram:bot-1"
+
+    shared = adapter._telegram_group_observe_shared_source(source)
+
+    assert shared.user_id is None
+    assert source_has_transport_owner(shared)
+    assert shared._transport_profile == "secondary"
+    assert shared._transport_platform == Platform.TELEGRAM
+    assert shared._transport_identity == "telegram:bot-1"
+    assert shared._transport_adapter_ref() is transport
 
 
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():

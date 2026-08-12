@@ -953,7 +953,7 @@ async def test_owner_vanishes_after_notice_claim_releases_claim(monkeypatch, tmp
         message_id="m-owner-vanishes-after-claim",
     )
     live_adapter = CaptureSlackAdapter()
-    resolver = MagicMock(side_effect=[live_adapter, live_adapter, None])
+    resolver = MagicMock(side_effect=[live_adapter, live_adapter, None, None])
     monkeypatch.setattr(stale_adapter, "_final_delivery_adapter", resolver)
 
     await stale_adapter._process_message_background(
@@ -965,7 +965,7 @@ async def test_owner_vanishes_after_notice_claim_releases_claim(monkeypatch, tmp
         build_session_key(source),
     )
 
-    assert resolver.call_count == 3
+    assert resolver.call_count == 4
     assert stale_adapter.sent == []
     assert live_adapter.sent == []
     assert runner._backend_notice_state.inflight == set()
@@ -1008,7 +1008,7 @@ async def test_owner_appearing_after_initial_probe_receives_final_text(
         build_session_key(source),
     )
 
-    assert resolver.call_count == 3
+    assert resolver.call_count == 4
     assert stale_adapter.sent == []
     assert [message["content"] for message in live_adapter.sent] == [
         "late owner reply"

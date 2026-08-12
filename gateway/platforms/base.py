@@ -593,6 +593,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import (
     SessionSource,
+    backend_notice_session_key,
     build_session_key,
     copy_session_source,
     source_has_transport_owner,
@@ -6490,12 +6491,11 @@ class BasePlatformAdapter(ABC):
         Length-prefixing keeps the encoding unambiguous even if plugin profiles
         or session keys contain separators.
         """
-        profile = str(
-            (getattr(source, "profile", None) if source is not None else None)
-            or self._backend_notice_profile
-            or "default"
-        ).strip() or "default"
-        return f"profile:{len(profile)}:{profile}:{session_key}"
+        return backend_notice_session_key(
+            session_key,
+            source,
+            fallback_profile=self._backend_notice_profile,
+        )
 
     def set_backend_notice_state(
         self,

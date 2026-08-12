@@ -3,6 +3,7 @@
 from gateway.config import Platform
 from gateway.session import (
     SessionSource,
+    backend_notice_session_key,
     copy_session_source,
     session_source_from_trusted_marker,
     session_source_to_trusted_marker,
@@ -37,6 +38,62 @@ def test_copy_preserves_capability_backed_owner_but_not_dynamic_data():
     assert copied._transport_profile == "credential-owner"
     assert copied._transport_platform == Platform.SLACK
     assert not hasattr(copied, "untrusted_dynamic_attribute")
+
+
+def test_notice_key_uses_physical_owner_not_routed_runtime_profile():
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        profile="routed-runtime",
+    )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.SLACK,
+    )
+
+    key = backend_notice_session_key(
+        "agent:routed-runtime:slack:dm:C1",
+        source,
+        fallback_profile="default",
+    )
+
+    assert key == "profile:7:default:agent:routed-runtime:slack:dm:C1"
+
+
+def test_notice_key_includes_only_capability_backed_relay_identity():
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
+    source._transport_identity = "slack:bot-1"
+
+    key = backend_notice_session_key(
+        "agent:main:slack:dm:C1",
+        source,
+        fallback_profile="default",
+    )
+    forged = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        _transport_profile=None,
+        _transport_platform=Platform.RELAY,
+        _transport_identity="slack:forged",
+        _transport_profile_stamped=True,
+        _transport_owner_capability=object(),
+    )
+
+    assert key == (
+        "transport:11:slack:bot-1:"
+        "profile:7:default:agent:main:slack:dm:C1"
+    )
+    assert backend_notice_session_key(
+        "agent:main:slack:dm:C1",
+        forged,
+        fallback_profile="default",
+    ) == "profile:7:default:agent:main:slack:dm:C1"
 
 
 def test_marker_envelope_is_separate_from_generic_source_serialization():

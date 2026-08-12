@@ -484,6 +484,40 @@ def copy_session_source(source: SessionSource, **changes: Any) -> SessionSource:
     return replace(source, **changes)
 
 
+def backend_notice_session_key(
+    session_key: str,
+    source: Optional[SessionSource] = None,
+    *,
+    fallback_profile: Optional[str] = None,
+) -> str:
+    """Return one reconnect-stable namespace for backend notice claims.
+
+    Capability-backed physical owner provenance wins over the logical runtime
+    route. The adapter profile is only a fallback for legacy/adapter-local
+    callers. Relay account identity further qualifies the key so separate
+    connector credentials cannot suppress one another's notices.
+    """
+    stamped = source_has_transport_owner(source)
+    transport_profile = (
+        getattr(source, "_transport_profile", None) if stamped else None
+    )
+    logical_profile = getattr(source, "profile", None) if source is not None else None
+    profile_candidate = (
+        transport_profile or fallback_profile or "default"
+        if stamped
+        else logical_profile or fallback_profile or "default"
+    )
+    profile = str(profile_candidate).strip() or "default"
+    qualified = f"profile:{len(profile)}:{profile}:{session_key}"
+    transport_identity = (
+        getattr(source, "_transport_identity", None) if stamped else None
+    )
+    if transport_identity is None:
+        return qualified
+    identity = str(transport_identity)
+    return f"transport:{len(identity)}:{identity}:{qualified}"
+
+
 def session_source_to_trusted_marker(source: SessionSource) -> Dict[str, Any]:
     """Encode routing plus a separate owner envelope for a lifecycle marker.
 
