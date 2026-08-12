@@ -2726,6 +2726,15 @@ class AIAgent:
             return f"<{type(value).__name__} depth limit>"
         if value is None or isinstance(value, (bool, int, float)):
             return value
+        from enum import Enum
+        if isinstance(value, Enum):
+            return cls._hook_jsonable(
+                value.value,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_string=max_string,
+                max_sequence=max_sequence,
+            )
         if isinstance(value, str):
             if len(value) > max_string:
                 return value[:max_string] + f"...[truncated {len(value) - max_string} chars]"
@@ -2787,10 +2796,14 @@ class AIAgent:
         except Exception:
             pass
         try:
-            from dataclasses import asdict, is_dataclass
+            from dataclasses import fields, is_dataclass
             if is_dataclass(value):
                 return cls._hook_jsonable(
-                    asdict(value),
+                    {
+                        item.name: getattr(value, item.name)
+                        for item in fields(value)
+                        if item.metadata.get("serialize", True)
+                    },
                     depth=depth + 1,
                     max_depth=max_depth,
                     max_string=max_string,

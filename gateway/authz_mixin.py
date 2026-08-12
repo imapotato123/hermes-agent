@@ -21,7 +21,11 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+)
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -179,13 +183,16 @@ class GatewayAuthorizationMixin:
         # durable physical platform/profile pair instead; relay sources retain
         # their underlying logical platform for session identity.
         source_attrs = getattr(source, "__dict__", {})
-        if (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        ):
+        if source_has_transport_owner(source):
             transport_platform = source_attrs.get(
                 "_transport_platform", getattr(source, "platform", None)
             )
+            logical_platform = getattr(source, "platform", None)
+            if (
+                transport_platform != Platform.RELAY
+                and transport_platform != logical_platform
+            ):
+                return None
             adapter = self._authorization_adapter(
                 transport_platform,
                 source_attrs.get("_transport_profile"),
@@ -216,12 +223,15 @@ class GatewayAuthorizationMixin:
                 if callable(prime):
                     prime(source)
             return adapter
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
-        )
+        # Only an explicit deserialization marker proves this is a genuinely
+        # historical unstamped record. Fresh hand-built sources have no
+        # physical-owner authority and fail closed.
+        if source_is_legacy_unstamped(source):
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "profile", None),
+            )
+        return None
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -238,8 +248,7 @@ class GatewayAuthorizationMixin:
         source_attrs = getattr(source, "__dict__", {})
         platform = (
             source_attrs.get("_transport_platform")
-            if isinstance(source_attrs, dict)
-            and "_transport_platform" in source_attrs
+            if source_has_transport_owner(source)
             else getattr(source, "platform", None)
         )
         if adapter is None or platform is None:
@@ -268,8 +277,7 @@ class GatewayAuthorizationMixin:
         source_attrs = getattr(source, "__dict__", {})
         platform = (
             source_attrs.get("_transport_platform")
-            if isinstance(source_attrs, dict)
-            and "_transport_platform" in source_attrs
+            if source_has_transport_owner(source)
             else getattr(source, "platform", None)
         )
         adapter = self._registered_transport_adapter(source)
@@ -282,10 +290,7 @@ class GatewayAuthorizationMixin:
                 if adapter is profile_adapters.get(platform):
                     return profile
         source_attrs = getattr(source, "__dict__", {})
-        if (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        ):
+        if source_has_transport_owner(source):
             transport_profile = source_attrs.get("_transport_profile")
             transport_adapter = self._authorization_adapter(
                 platform, transport_profile
@@ -295,7 +300,9 @@ class GatewayAuthorizationMixin:
             ).get(platform):
                 return None
             return transport_profile
-        return getattr(source, "profile", None)
+        if source_is_legacy_unstamped(source):
+            return getattr(source, "profile", None)
+        return None
 
     def _adapter_authorization_is_upstream(
         self,
@@ -486,14 +493,12 @@ class GatewayAuthorizationMixin:
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         source_attrs = getattr(source, "__dict__", {})
-        has_transport_owner = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
         profile = (
             source_attrs.get("_transport_profile")
             if has_transport_owner
-            else getattr(source, "profile", None)
+            else getattr(source, "profile", None) if is_legacy else None
         )
         if profile and profile in per_profile:
             return per_profile[profile]
@@ -507,6 +512,8 @@ class GatewayAuthorizationMixin:
                     active_profile = None
             if profile != active_profile:
                 return None
+        if not has_transport_owner and not is_legacy:
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -521,11 +528,18 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
-        # Home Assistant events are system-generated (state changes), not
-        # user-initiated messages.  The HASS_TOKEN already authenticates the
-        # connection, so HA events are always authorized.
-        # Webhook events are authenticated via HMAC signature validation in
-        # the adapter itself — no user allowlist applies.
+        # Every network/platform authorization path depends on the physical
+        # credential that received the message. Historical unstamped records may
+        # use the narrowly-scoped compatibility path; fresh ownerless sources
+        # fail closed before adapter-level trust or allowlist policy is consulted.
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
+        if not has_transport_owner and not is_legacy:
+            return False
+
+        # Home Assistant and webhook adapters authenticate the transport itself
+        # (bearer token / HMAC), so no per-user allowlist applies after provenance
+        # proves this source actually crossed that adapter boundary.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 

@@ -21,7 +21,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
 )
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, stamp_source_transport_owner
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -52,11 +52,13 @@ def _make_adapter(typing_indicator: bool) -> _StubAdapter:
 
 
 def _make_event(chat_id="C123"):
-    return MessageEvent(
-        text="hi",
-        message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.SLACK, chat_id=chat_id, chat_type="dm"),
+    source = SessionSource(platform=Platform.SLACK, chat_id=chat_id, chat_type="dm")
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.SLACK,
     )
+    return MessageEvent(text="hi", message_type=MessageType.TEXT, source=source)
 
 
 def _sk(chat_id="C123"):

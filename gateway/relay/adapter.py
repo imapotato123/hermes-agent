@@ -32,7 +32,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 logger = logging.getLogger(__name__)
 
@@ -385,15 +385,13 @@ class RelayAdapter(BasePlatformAdapter):
         source = getattr(event, "source", None)
         if source is None:
             return
-        source._transport_adapter_ref = weakref.ref(self)
-        source._transport_platform = Platform.RELAY
         # The process-level relay socket is deliberately profile-independent.
-        source._transport_profile = None
-        identity = self.transport_identity_for_platform(
-            getattr(source, "platform", None)
+        stamp_source_transport_owner(
+            source,
+            adapter=self,
+            profile=None,
+            platform=Platform.RELAY,
         )
-        if identity is not None:
-            source._transport_identity = identity
 
     def _relay_slack_extra(self) -> Dict[str, Any]:
         """The Slack-behavior subset of the RELAY platform config.

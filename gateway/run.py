@@ -2441,6 +2441,9 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -10900,21 +10903,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_id=row.get("route_user_id"),
                     chat_type=row.get("route_chat_type") or "dm",
                 )
-                setattr(
-                    _recovery_source,
-                    "_transport_profile",
-                    row.get("transport_profile"),
-                )
                 try:
                     _transport_platform = Platform(
                         row.get("transport_platform") or row["platform"]
                     )
                 except (TypeError, ValueError):
                     _transport_platform = None
-                setattr(
+                stamp_source_transport_owner(
                     _recovery_source,
-                    "_transport_platform",
-                    _transport_platform,
+                    profile=row.get("transport_profile"),
+                    platform=_transport_platform,
                 )
                 if row.get("transport_identity") is not None:
                     setattr(
@@ -11074,7 +11072,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # Rebuild public origin metadata without importing authority from
+            # its generic dictionary. Physical ownership comes only from the
+            # private SessionEntry envelope written by mark_turn_active().
+            origin = entry.origin
+            if origin is None:
+                continue
+            runtime_owner_retained = source_has_transport_owner(origin)
+            if runtime_owner_retained:
+                # Same-process startup/reconnect scheduling can still hold an
+                # exact live source. dataclasses.replace preserves its declared
+                # runtime-only provenance while avoiding mutation of the
+                # canonical routing entry. A source loaded from persistence can
+                # never enter this branch because generic deserialization drops
+                # the stamp sentinel.
+                source = dataclasses.replace(origin)
+            else:
+                source = SessionSource.from_dict(
+                    origin.to_dict(),
+                    allow_legacy_unstamped=source_is_legacy_unstamped(origin),
+                )
+            transport_platform: Optional[Platform] = None
+            if entry.transport_owner_stamped:
+                try:
+                    transport_platform = Platform(entry.transport_platform)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Skipping auto-resume for %s: invalid durable transport owner",
+                        entry.session_key,
+                    )
+                    continue
+                stamp_source_transport_owner(
+                    source,
+                    profile=entry.transport_profile,
+                    platform=transport_platform,
+                )
+                if entry.transport_identity is not None:
+                    source._transport_identity = entry.transport_identity
+            elif runtime_owner_retained:
+                transport_platform = getattr(
+                    source,
+                    "_transport_platform",
+                    None,
+                )
+            elif not source_is_legacy_unstamped(source):
+                logger.debug(
+                    "Skipping auto-resume for %s: modern source has no transport owner",
+                    entry.session_key,
+                )
+                continue
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -11083,6 +11129,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
+            if entry.transport_owner_stamped:
+                # The durable owner (including relay account identity) resolved
+                # to this current adapter generation. Reattach only now; generic
+                # source deserialization never mints either provenance or trust.
+                stamp_source_transport_owner(
+                    source,
+                    adapter=adapter,
+                    profile=entry.transport_profile,
+                    platform=transport_platform,
+                )
+                if entry.transport_identity is not None:
+                    source._transport_identity = entry.transport_identity
+                if transport_platform == Platform.RELAY:
+                    source.delivered_via_upstream_relay = True
 
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
@@ -12436,6 +12496,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
+        )
+        stamp_source_transport_owner(
+            dest_source,
+            adapter=adapter,
+            platform=getattr(adapter, "platform", platform),
         )
 
         # Compute the gateway's session_key for that destination using the
@@ -14547,6 +14612,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type=chat_type or "group",
                 user_id=user_id,
                 profile=profile_name,
+            )
+            adapter = self._authorization_adapter(platform, profile_name)
+            if adapter is None:
+                return False
+            stamp_source_transport_owner(
+                source,
+                adapter=adapter,
+                platform=getattr(adapter, "platform", platform),
             )
             return self._is_user_authorized(source)
         return check
@@ -17117,7 +17190,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                source=getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -20095,6 +20171,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+        stamp_source_transport_owner(
+            source,
+            adapter=adapter,
+            platform=Platform.DISCORD,
+        )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20236,12 +20317,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter fallback. Operations are duck-typed for plugin compatibility.
         """
         source_attrs = getattr(source, "__dict__", {})
-        stamped = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
-        if not stamped:
+        stamped = source_has_transport_owner(source)
+        if not stamped and source_is_legacy_unstamped(source):
             adapter = fallback_adapter
+        elif not stamped:
+            adapter = None
         else:
             try:
                 adapter = self._adapter_for_source(source)
@@ -20493,10 +20573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source_attrs = getattr(
                                 event.source, "__dict__", {}
                             )
-                            if (
-                                isinstance(source_attrs, dict)
-                                and "_transport_profile" in source_attrs
-                            ):
+                            if source_has_transport_owner(event.source):
                                 signature = inspect.signature(image_send)
                                 if "source" in signature.parameters or any(
                                     parameter.kind

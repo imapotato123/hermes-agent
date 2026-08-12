@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -144,7 +144,29 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
         chat_type="dm",
         delivered_via_upstream_relay=True,
     )
+    stamp_source_transport_owner(
+        src,
+        profile=None,
+        platform=Platform.RELAY,
+    )
     assert runner._is_user_authorized(src) is True
+
+
+def test_ownerless_relay_marker_cannot_grant_upstream_authorization(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _ = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    src = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="267171776755269633",
+        chat_id="1400724139874058314",
+        chat_type="dm",
+        delivered_via_upstream_relay=True,
+    )
+
+    assert runner._is_user_authorized(src) is False
 
 
 def test_event_from_wire_stamps_routed_profile():

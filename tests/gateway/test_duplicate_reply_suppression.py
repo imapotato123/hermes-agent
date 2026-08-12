@@ -23,7 +23,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -55,16 +55,18 @@ class StubAdapter(BasePlatformAdapter):
 
 
 def _make_event(text="hello", chat_id="c1", user_id="u1"):
-    return MessageEvent(
-        text=text,
-        source=SessionSource(
-            platform=Platform.DISCORD,
-            chat_id=chat_id,
-            chat_type="dm",
-            user_id=user_id,
-        ),
-        message_id="m1",
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_type="dm",
+        user_id=user_id,
     )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.DISCORD,
+    )
+    return MessageEvent(text=text, source=source, message_id="m1")
 
 
 # ===================================================================
@@ -92,6 +94,7 @@ class TestBaseInterruptSuppression:
         adapter.set_message_handler(fake_handler)
 
         event_a = _make_event(text="first question")
+        stamp_source_transport_owner(event_a.source, adapter=adapter)
         session_key = build_session_key(event_a.source)
 
         # Simulate: message A is being processed, message B arrives
@@ -101,6 +104,7 @@ class TestBaseInterruptSuppression:
         adapter._active_sessions[session_key] = interrupt_event
 
         event_b = _make_event(text="second question")
+        stamp_source_transport_owner(event_b.source, adapter=adapter)
         adapter._pending_messages[session_key] = event_b
 
         await adapter._process_message_background(event_a, session_key)

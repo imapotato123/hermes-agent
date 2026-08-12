@@ -23,7 +23,12 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 _NOTICE = (
@@ -157,15 +162,17 @@ def _make_runner(adapter: CaptureSlackAdapter, results: list[dict]) -> gateway_r
 
 
 def _make_event(message_id: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+    )
+    stamp_source_transport_owner(source, profile="default")
     return MessageEvent(
         text="hello",
-        source=SessionSource(
-            platform=Platform.SLACK,
-            chat_id="C123",
-            chat_type="channel",
-            thread_id="171717",
-            user_id="U123",
-        ),
+        source=source,
         message_id=message_id,
     )
 
@@ -633,6 +640,12 @@ async def test_shared_runner_state_does_not_cross_suppress_profiles():
     second._keep_typing = keep_typing
     first_event = _make_event("m-alpha")
     second_event = _make_event("m-beta")
+    stamp_source_transport_owner(
+        first_event.source, profile="alpha", adapter=first
+    )
+    stamp_source_transport_owner(
+        second_event.source, profile="beta", adapter=second
+    )
     raw_session_key = build_session_key(first_event.source)
 
     await first._process_message_background(first_event, raw_session_key)
@@ -667,6 +680,12 @@ async def test_default_profile_does_not_collide_with_named_main_profile():
     named_main_adapter._keep_typing = keep_typing
     default_event = _make_event("m-default")
     named_main_event = _make_event("m-main")
+    stamp_source_transport_owner(
+        default_event.source, profile="default", adapter=default_adapter
+    )
+    stamp_source_transport_owner(
+        named_main_event.source, profile="main", adapter=named_main_adapter
+    )
     raw_session_key = build_session_key(default_event.source)
 
     await default_adapter._process_message_background(default_event, raw_session_key)
@@ -811,12 +830,67 @@ async def test_routed_runtime_reconnect_uses_secondary_transport_replacement(
     )
 
 
+@pytest.mark.asyncio
+async def test_restored_routed_source_withholds_final_from_runtime_adapter(
+    monkeypatch,
+    tmp_path,
+):
+    """Serialization loss cannot redirect an alpha-owned turn through beta."""
+    stale_owner = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_owner,
+        [_successful_result("private alpha reply")],
+    )
+    runner._profile_name_for_source = lambda source: "beta"
+    runner._share_backend_notice_state(stale_owner, profile_name="alpha")
+
+    live_source = stale_owner.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-restored-routed",
+    )
+    assert live_source.profile == "beta"
+    restored_source = SessionSource.from_dict(live_source.to_dict())
+
+    active_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(active_adapter, profile_name="main")
+    runtime_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(runtime_adapter, profile_name="beta")
+    runner._active_profile_name = lambda: "main"
+    runner.adapters = {Platform.SLACK: active_adapter}
+    runner._profile_adapters = {
+        "beta": {Platform.SLACK: runtime_adapter},
+    }
+
+    assert runner._adapter_for_source(restored_source) is None
+    await stale_owner._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=restored_source,
+            message_id="m-restored-routed",
+        ),
+        build_session_key(restored_source),
+    )
+
+    assert stale_owner.sent == []
+    assert active_adapter.sent == []
+    assert runtime_adapter.sent == []
+
+
 def test_missing_secondary_transport_owner_keeps_secondary_policy_scope():
     runner = cast(Any, object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {}
     runner._profile_adapters = {}
     source = SessionSource(platform=Platform.SLACK, chat_id="C123")
-    setattr(source, "_transport_profile", "coder")
+    stamp_source_transport_owner(
+        source,
+        profile="coder",
+        platform=Platform.SLACK,
+    )
 
     assert runner._adapter_for_source(source) is None
     assert runner._adapter_profile_for_source(source) == "coder"
@@ -918,6 +992,8 @@ async def test_owner_appearing_after_initial_probe_receives_final_text(
         message_id="m-owner-appears-after-probe",
     )
     live_adapter = CaptureSlackAdapter()
+    live_adapter.gateway_runner = runner
+    runner.adapters[Platform.SLACK] = live_adapter
     resolver = MagicMock(side_effect=[None, live_adapter, live_adapter])
     monkeypatch.setattr(stale_adapter, "_final_delivery_adapter", resolver)
 

@@ -22,7 +22,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -55,12 +55,18 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
 
 
 def _event(text="hello agent"):
+    source = SessionSource(
+        platform=Platform.SLACK, chat_id="C1", chat_type="channel"
+    )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.SLACK,
+    )
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=SessionSource(
-            platform=Platform.SLACK, chat_id="C1", chat_type="channel"
-        ),
+        source=source,
         message_id="msg-42",
     )
 
@@ -98,6 +104,7 @@ def _blocking_probe():
 
 
 async def _run(adapter, event, response="final answer"):
+    stamp_source_transport_owner(event.source, adapter=adapter)
     adapter._message_handler = AsyncMock(return_value=response)
     session_key = "agent:main:slack:channel:C1"
     adapter._active_sessions[session_key] = asyncio.Event()

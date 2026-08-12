@@ -27,7 +27,7 @@ import gateway.slash_commands as slash_commands
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 # --------------------------------------------------------------------------- #
@@ -44,10 +44,14 @@ def _make_runner():
 
 def _make_event():
     """A bare ``/model`` (no args) — triggers the listing branch."""
+    source = stamp_source_transport_owner(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        profile=None,
+    )
     return MessageEvent(
         text="/model",
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"),
+        source=source,
     )
 
 

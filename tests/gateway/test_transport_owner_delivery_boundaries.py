@@ -24,7 +24,11 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    stamp_source_transport_owner,
+)
 
 
 def _source(*, stamped: bool = True, profile: str | None = "coder") -> SessionSource:
@@ -35,8 +39,11 @@ def _source(*, stamped: bool = True, profile: str | None = "coder") -> SessionSo
         message_id="m1",
     )
     if stamped:
-        source._transport_profile = profile
-        source._transport_platform = Platform.SLACK
+        stamp_source_transport_owner(
+            source,
+            profile=profile,
+            platform=Platform.SLACK,
+        )
     return source
 
 
@@ -74,6 +81,30 @@ class _RetryBoundaryAdapter(BasePlatformAdapter):
         return {}
 
 
+class _IngressBoundaryAdapter(_RetryBoundaryAdapter):
+    def __init__(
+        self,
+        name: str,
+        *,
+        platform: Platform = Platform.SLACK,
+        profile: str | None = None,
+    ):
+        BasePlatformAdapter.__init__(
+            self,
+            PlatformConfig(enabled=True, token="t"),
+            platform,
+        )
+        self._name = name
+        self._transport_profile = profile
+        self.handled_events: list[MessageEvent] = []
+
+        async def _handler(event: MessageEvent):
+            self.handled_events.append(event)
+            return None
+
+        self._message_handler = _handler
+
+
 def _runner(*, primary=None, coder=None) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.SLACK: primary} if primary is not None else {}
@@ -104,12 +135,92 @@ def test_registered_owner_uses_physical_transport_platform():
         scope_id="guild-1",
         user_id="user-1",
     )
-    source._transport_profile = None
-    source._transport_platform = Platform.RELAY
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
     setattr(source, "_transport_identity", "discord:app-1")
 
     assert runner._adapter_for_source(source) is relay
     relay.prime_routing_source.assert_called_once_with(source)
+
+
+def test_nonrelay_physical_platform_mismatch_fails_closed():
+    slack = _adapter("slack")
+    discord = _adapter("discord")
+    discord.platform = Platform.DISCORD
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {
+        Platform.SLACK: slack,
+        Platform.DISCORD: discord,
+    }
+    runner._profile_adapters = {}
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.DISCORD,
+    )
+
+    assert runner._adapter_for_source(source) is None
+
+
+@pytest.mark.parametrize("platform", [Platform.HOMEASSISTANT, Platform.WEBHOOK])
+def test_ownerless_authenticated_system_platforms_still_fail_closed(platform):
+    runner = _runner()
+    source = SessionSource(platform=platform, chat_id="system-event")
+
+    assert runner._is_user_authorized(source) is False
+
+    stamp_source_transport_owner(source, profile=None, platform=platform)
+    assert runner._is_user_authorized(source) is True
+
+
+@pytest.mark.asyncio
+async def test_native_handle_message_stamps_fresh_matching_source():
+    adapter = _IngressBoundaryAdapter("slack", profile="coder")
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    event = MessageEvent(text="hello", source=source)
+
+    await BasePlatformAdapter.handle_message(adapter, event)
+
+    pending = list(adapter._session_tasks.values())
+    assert len(pending) == 1
+    await asyncio.gather(*pending)
+
+    assert source_has_transport_owner(source) is True
+    assert source._transport_platform == Platform.SLACK
+    assert source._transport_profile == "coder"
+    assert adapter.handled_events == [event]
+
+
+@pytest.mark.asyncio
+async def test_native_handle_message_rejects_ownerless_cross_platform_source():
+    adapter = _IngressBoundaryAdapter("discord", platform=Platform.DISCORD)
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    event = MessageEvent(text="hello", source=source)
+
+    await BasePlatformAdapter.handle_message(adapter, event)
+
+    assert source_has_transport_owner(source) is False
+    assert adapter._session_tasks == {}
+    assert adapter.handled_events == []
+
+
+@pytest.mark.asyncio
+async def test_background_processing_cannot_mint_owner_for_ownerless_source():
+    adapter = _IngressBoundaryAdapter("slack")
+    adapter._active_sessions["s1"] = asyncio.Event()
+    adapter._release_session_guard = MagicMock()
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+    event = MessageEvent(text="hello", source=source)
+
+    await BasePlatformAdapter._process_message_background(adapter, event, "s1")
+
+    assert source_has_transport_owner(source) is False
+    assert adapter.handled_events == []
+    adapter._release_session_guard.assert_called_once_with("s1")
 
 
 def test_relay_registration_keeps_profile_independent_owner_identity():
@@ -139,14 +250,17 @@ def test_relay_replacement_primes_routing_from_inflight_source():
         user_id="user-1",
         delivered_via_upstream_relay=True,
     )
-    source._transport_profile = None
-    source._transport_platform = Platform.RELAY
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
 
     assert runner._adapter_for_source(source) is relay
     relay.prime_routing_source.assert_called_once_with(source)
 
 
-def test_restored_primary_source_routes_to_primary_not_runtime_profile():
+def test_generic_roundtrip_drops_primary_owner_and_fails_closed():
     primary = _adapter("primary")
     runtime = _adapter("runtime")
     runner = _runner(primary=primary, coder=runtime)
@@ -155,14 +269,18 @@ def test_restored_primary_source_routes_to_primary_not_runtime_profile():
         chat_id="C1",
         profile="coder",
     )
-    source._transport_profile = None
-    source._transport_platform = Platform.SLACK
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.SLACK,
+    )
     restored = SessionSource.from_dict(source.to_dict())
 
-    assert runner._adapter_for_source(restored) is primary
+    assert source_has_transport_owner(restored) is False
+    assert runner._adapter_for_source(restored) is None
 
 
-def test_restored_missing_owner_fails_closed_not_runtime_fallback():
+def test_forged_dictionary_owner_fails_closed_not_runtime_fallback():
     primary = _adapter("primary")
     runner = _runner(primary=primary)
     source = SessionSource(
@@ -170,10 +288,16 @@ def test_restored_missing_owner_fails_closed_not_runtime_fallback():
         chat_id="C1",
         profile="coder",
     )
-    source._transport_profile = "missing"
-    source._transport_platform = Platform.SLACK
-    restored = SessionSource.from_dict(source.to_dict())
+    restored = SessionSource.from_dict(
+        {
+            **source.to_dict(),
+            "transport_owner_stamped": True,
+            "transport_profile": "missing",
+            "transport_platform": "slack",
+        }
+    )
 
+    assert source_has_transport_owner(restored) is False
     assert runner._adapter_for_source(restored) is None
 
 
@@ -212,7 +336,7 @@ async def test_queued_text_missing_stamped_owner_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
+async def test_queued_hand_built_unstamped_source_fails_closed():
     legacy = _adapter("legacy")
     runner = _runner()
 
@@ -223,7 +347,55 @@ async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
         deliver_media=False,
     )
 
+    legacy.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_deserialized_legacy_source_keeps_compatibility():
+    legacy = _adapter("legacy")
+    runner = _runner()
+    source = SessionSource.from_dict(
+        SessionSource(platform=Platform.SLACK, chat_id="C1").to_dict(),
+        allow_legacy_unstamped=True,
+    )
+
+    await runner._deliver_queued_first_response(
+        "legacy answer",
+        source,
+        legacy,
+        deliver_media=False,
+    )
+
     legacy.send.assert_awaited_once()
+
+
+def test_hand_built_unstamped_runtime_profile_cannot_nominate_credential():
+    primary = _adapter("primary")
+    runtime = _adapter("runtime")
+    runner = _runner(primary=primary, coder=runtime)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        profile="coder",
+    )
+
+    assert runner._adapter_for_source(source) is None
+
+
+def test_deserialized_legacy_runtime_profile_keeps_exact_compatibility_route():
+    primary = _adapter("primary")
+    runtime = _adapter("runtime")
+    runner = _runner(primary=primary, coder=runtime)
+    source = SessionSource.from_dict(
+        SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="coder",
+        ).to_dict(),
+        allow_legacy_unstamped=True,
+    )
+
+    assert runner._adapter_for_source(source) is runtime
 
 
 @pytest.mark.asyncio
@@ -835,8 +1007,11 @@ def test_live_delivery_operation_accepts_relay_owner_for_underlying_platform():
     relay.fronts_platform = MagicMock(return_value=True)
     relay.matches_transport_identity = MagicMock(return_value=True)
     source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
-    source._transport_profile = None
-    source._transport_platform = Platform.RELAY
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
     setattr(source, "_transport_identity", "discord:app-1")
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.RELAY: relay}
@@ -853,8 +1028,11 @@ def test_relay_owner_not_fronting_logical_platform_fails_closed():
     relay.platform = Platform.RELAY
     relay.fronts_platform = MagicMock(return_value=False)
     source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
-    source._transport_profile = None
-    source._transport_platform = Platform.RELAY
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.RELAY: relay}
     runner._profile_adapters = {}
@@ -866,19 +1044,22 @@ def test_restored_relay_owner_with_different_bot_identity_fails_closed():
     relay = _adapter("relay")
     relay.platform = Platform.RELAY
     relay.fronts_platform = MagicMock(return_value=True)
-    relay.transport_identity_for_platform = MagicMock(
-        return_value="discord:replacement-app"
+    relay.matches_transport_identity = MagicMock(return_value=False)
+    restored = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+    stamp_source_transport_owner(
+        restored,
+        profile=None,
+        platform=Platform.RELAY,
     )
-    source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
-    source._transport_profile = None
-    source._transport_platform = Platform.RELAY
-    source._transport_identity = "discord:original-app"
-    restored = SessionSource.from_dict(source.to_dict())
+    restored._transport_identity = "discord:original-app"
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.RELAY: relay}
     runner._profile_adapters = {}
 
     assert runner._adapter_for_source(restored) is None
+    relay.matches_transport_identity.assert_called_once_with(
+        "discord:original-app"
+    )
 
 
 def test_live_relay_source_with_different_replacement_identity_fails_closed():
@@ -891,8 +1072,11 @@ def test_live_relay_source_with_different_replacement_identity_fails_closed():
         chat_id="C1",
         delivered_via_upstream_relay=True,
     )
-    setattr(source, "_transport_profile", None)
-    setattr(source, "_transport_platform", Platform.RELAY)
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.RELAY,
+    )
     setattr(source, "_transport_identity", "discord:original-app")
     runner = object.__new__(GatewayRunner)
     setattr(runner, "adapters", {Platform.RELAY: relay})
