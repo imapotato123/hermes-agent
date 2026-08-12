@@ -146,6 +146,28 @@ def test_relay_replacement_primes_routing_from_inflight_source():
     relay.prime_routing_source.assert_called_once_with(source)
 
 
+def test_relay_replacement_without_platform_advertisement_fails_closed():
+    runner = object.__new__(GatewayRunner)
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        prime_routing_source=MagicMock(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+
+    assert runner._adapter_for_source(source) is None
+    relay.prime_routing_source.assert_not_called()
+
+
 def test_restored_primary_source_routes_to_primary_not_runtime_profile():
     primary = _adapter("primary")
     runtime = _adapter("runtime")
@@ -874,6 +896,48 @@ async def test_recovery_relay_owner_never_uses_same_platform_native_adapter(
     assert primed_source.user_id == "user-1"
     assert primed_source.chat_type == "channel"
     native.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_slack_workspace_scope_reaches_send_metadata(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="slack-workspace-row",
+        session_key="agent:main:slack:channel:C_SHARED",
+        platform="slack",
+        chat_id="C_SHARED",
+        thread_id="171.001",
+        content="workspace private answer",
+        transport_platform="slack",
+        transport_profile=None,
+        transport_profile_stamped=True,
+        route_scope_id="T_OTHER",
+        route_user_id="U_OTHER",
+        route_chat_type="channel",
+    )
+    _orphan("slack-workspace-row")
+
+    slack = _adapter("primary")
+    slack._transport_profile = None
+    runner = _runner(primary=slack)
+    runner._thread_metadata_for_source = GatewayRunner._thread_metadata_for_source.__get__(
+        runner, GatewayRunner
+    )
+    runner._thread_metadata_for_target = GatewayRunner._thread_metadata_for_target.__get__(
+        runner, GatewayRunner
+    )
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    assert slack.send.await_args.kwargs["metadata"] == {
+        "thread_id": "171.001",
+        "slack_team_id": "T_OTHER",
+    }
 
 
 def test_live_delivery_operation_accepts_relay_owner_for_underlying_platform():
