@@ -330,6 +330,7 @@ class TestConsumerLifecycle:
             assert consumer.completed is False
             assert consumer._aborted is True
             assert consumer.suppress_whole_file is True
+            assert consumer.done is True
 
         _run_test(run)
 
@@ -694,11 +695,12 @@ class TestPostAudioTimeoutAbort:
 
             # Simulate the outer loop's abort-on-timeout behaviour.
             consumer.abort("streaming TTS finalisation timeout")
-            await asyncio.sleep(0.05)
+            await consumer.wait_complete(timeout=2.0)
 
             # The consumer must not complete later in the background.
             assert consumer.completed is False
             assert consumer._aborted is True
+            assert consumer.done is True
 
         _run_test(run)
 
