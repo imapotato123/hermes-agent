@@ -220,6 +220,9 @@ class TestRunTurn:
                 "error": {
                     "code": "internal_error",
                     "message": "The server had an error processing your request",
+                    "codexErrorInfo": {
+                        "httpConnectionFailed": {"httpStatusCode": 401}
+                    },
                 },
             },
         )
@@ -227,6 +230,9 @@ class TestRunTurn:
         result = make_session(client).run_turn("hi", turn_timeout=2.0)
 
         assert result.error_code == "internal_error"
+        assert result.codex_error_info == {
+            "httpConnectionFailed": {"httpStatusCode": 401}
+        }
         assert "internal_error" in (result.error or "")
 
 
