@@ -278,6 +278,143 @@ async def test_base_image_fanout_re_resolves_between_physical_images():
     latest.send_image.assert_awaited_once()
 
 
+class _NativeChunkAdapter(_ImageFanoutAdapter):
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        metadata=None,
+        human_delay=0.0,
+        *,
+        source=None,
+    ):
+        await self.send_image(
+            chat_id=chat_id,
+            image_url=images[0][0],
+            caption=images[0][1],
+            metadata=metadata,
+        )
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images[1:],
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
+            return
+        await self.send_image(
+            chat_id=chat_id,
+            image_url=images[1][0],
+            caption=images[1][1],
+            metadata=metadata,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_image_chunk_hands_remainder_to_replacement():
+    first = _NativeChunkAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    latest = _ImageFanoutAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    latest.send_multiple_images = AsyncMock()
+    runner = _runner(coder=first)
+    setattr(first, "gateway_runner", runner)
+    source = _source()
+    first.send_image = AsyncMock()
+
+    async def replace_after_first(**kwargs):
+        runner._profile_adapters["coder"][Platform.SLACK] = latest
+        return SendResult(success=True, message_id="first")
+
+    first.send_image.side_effect = replace_after_first
+    await first.send_multiple_images(
+        "C1",
+        [("https://example.invalid/one.png", "one"),
+         ("https://example.invalid/two.png", "two")],
+        source=source,
+    )
+
+    first.send_image.assert_awaited_once()
+    latest.send_multiple_images.assert_awaited_once()
+    assert latest.send_multiple_images.await_args.kwargs["images"] == [
+        ("https://example.invalid/two.png", "two")
+    ]
+
+
+class _NativeFallbackAdapter(_ImageFanoutAdapter):
+    async def send_multiple_images(
+        self,
+        chat_id,
+        images,
+        metadata=None,
+        human_delay=0.0,
+        *,
+        source=None,
+    ):
+        await super().send_multiple_images(
+            chat_id,
+            images,
+            metadata,
+            human_delay,
+            source=source,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_fallback_does_not_return_to_retired_generation():
+    stale = _NativeFallbackAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    latest = _ImageFanoutAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    runner = _runner(coder=latest)
+    setattr(stale, "gateway_runner", runner)
+    setattr(latest, "gateway_runner", runner)
+    stale.send_image = AsyncMock()
+    latest.send_image = AsyncMock(
+        return_value=SendResult(success=True, message_id="latest")
+    )
+
+    await stale.send_multiple_images(
+        "C1",
+        [("https://example.invalid/one.png", "one")],
+        source=_source(),
+    )
+
+    stale.send_image.assert_not_awaited()
+    latest.send_image.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_batch_never_retries_on_retired_owner():
+    stale = _NativeFallbackAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    latest = _ImageFanoutAdapter(
+        PlatformConfig(enabled=True, token="t"), Platform.SLACK
+    )
+    runner = _runner(coder=latest)
+    setattr(stale, "gateway_runner", runner)
+    setattr(latest, "gateway_runner", runner)
+    stale.send_image = AsyncMock()
+    latest.send_multiple_images = AsyncMock(side_effect=RuntimeError("send failed"))
+
+    handed_off = await stale._handoff_image_batch_if_replaced(
+        source=_source(),
+        chat_id="C1",
+        images=[("https://example.invalid/one.png", "one")],
+        metadata=None,
+        human_delay=0.0,
+    )
+
+    assert handed_off is True
+    latest.send_multiple_images.assert_awaited_once()
+    stale.send_image.assert_not_awaited()
+
+
 class _NoDeleteAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False):
         return True
