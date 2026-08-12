@@ -208,7 +208,31 @@ def test_missing_stamped_transport_pairing_store_fails_closed(monkeypatch):
 
 
 def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
-    """Hand-built/restored sources retain the historical profile lookup."""
+    """Only trusted deserialized records retain historical profile lookup."""
+    runner, _active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner = cast(Any, runner)
+    routed_store = MagicMock()
+    routed_store.is_approved.return_value = True
+    runner.pairing_stores = {"routed": routed_store}
+
+    source = SessionSource.from_dict(
+        SessionSource(
+            platform=Platform.WECOM,
+            user_id="legacy-routed-user",
+            chat_id="dm-chat",
+            chat_type="dm",
+            profile="routed",
+        ).to_dict(),
+        allow_legacy_unstamped=True,
+    )
+
+    assert runner._is_user_authorized(source) is True
+    routed_store.is_approved.assert_called_once_with(
+        Platform.WECOM.value, "legacy-routed-user"
+    )
+
+
+def test_hand_built_unstamped_pairing_cannot_borrow_runtime_store(monkeypatch):
     runner, _active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
     runner = cast(Any, runner)
     routed_store = MagicMock()
@@ -217,16 +241,14 @@ def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
 
     source = SessionSource(
         platform=Platform.WECOM,
-        user_id="legacy-routed-user",
+        user_id="ownerless-user",
         chat_id="dm-chat",
         chat_type="dm",
         profile="routed",
     )
 
-    assert runner._is_user_authorized(source) is True
-    routed_store.is_approved.assert_called_once_with(
-        Platform.WECOM.value, "legacy-routed-user"
-    )
+    assert runner._pairing_store_for(source) is None
+    routed_store.is_approved.assert_not_called()
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
@@ -255,6 +277,12 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
+    adapter = MagicMock()
+    adapter.platform = Platform.WECOM
+    adapter._transport_profile = "coder"
+    runner.adapters = {}
+    runner._profile_adapters = {"coder": {Platform.WECOM: adapter}}
+    runner._active_profile_name = lambda: "main"
 
     captured: dict = {}
 

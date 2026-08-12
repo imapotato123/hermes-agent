@@ -216,12 +216,15 @@ class GatewayAuthorizationMixin:
                 if callable(prime):
                     prime(source)
             return adapter
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
-        )
+        # Only an explicit deserialization marker proves this is a genuinely
+        # historical unstamped record. Fresh hand-built sources have no
+        # physical-owner authority and fail closed.
+        if getattr(source, "_legacy_transport_owner_unstamped", False) is True:
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "profile", None),
+            )
+        return None
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -295,7 +298,9 @@ class GatewayAuthorizationMixin:
             ).get(platform):
                 return None
             return transport_profile
-        return getattr(source, "profile", None)
+        if getattr(source, "_legacy_transport_owner_unstamped", False) is True:
+            return getattr(source, "profile", None)
+        return None
 
     def _adapter_authorization_is_upstream(
         self,
@@ -490,10 +495,13 @@ class GatewayAuthorizationMixin:
             isinstance(source_attrs, dict)
             and "_transport_profile" in source_attrs
         )
+        is_legacy = (
+            getattr(source, "_legacy_transport_owner_unstamped", False) is True
+        )
         profile = (
             source_attrs.get("_transport_profile")
             if has_transport_owner
-            else getattr(source, "profile", None)
+            else getattr(source, "profile", None) if is_legacy else None
         )
         if profile and profile in per_profile:
             return per_profile[profile]
@@ -507,6 +515,8 @@ class GatewayAuthorizationMixin:
                     active_profile = None
             if profile != active_profile:
                 return None
+        if not has_transport_owner and not is_legacy:
+            return None
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:

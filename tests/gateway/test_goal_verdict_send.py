@@ -17,7 +17,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 @pytest.fixture()
@@ -35,12 +40,15 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 def _make_source() -> SessionSource:
-    return SessionSource(
-        platform=Platform.TELEGRAM,
-        user_id="u1",
-        chat_id="c1",
-        user_name="tester",
-        chat_type="dm",
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="u1",
+            chat_id="c1",
+            user_name="tester",
+            chat_type="dm",
+        ),
+        profile=None,
     )
 
 

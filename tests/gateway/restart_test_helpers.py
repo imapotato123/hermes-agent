@@ -9,7 +9,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
 )
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class RestartTestAdapter(BasePlatformAdapter):
@@ -41,13 +41,14 @@ def make_restart_source(
     chat_type: str = "dm",
     thread_id: str | None = None,
 ) -> SessionSource:
-    return SessionSource(
+    source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id=chat_id,
         chat_type=chat_type,
         user_id="u1",
         thread_id=thread_id,
     )
+    return stamp_source_transport_owner(source, profile=None)
 
 
 def make_restart_runner(

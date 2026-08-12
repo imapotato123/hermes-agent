@@ -2439,8 +2439,12 @@ from gateway.session import (
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    copy_session_source,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    session_source_from_trusted_marker,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -7127,7 +7131,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         if recovered is None:
             return source
-        return dataclasses.replace(source, thread_id=recovered)
+        return copy_session_source(source, thread_id=recovered)
 
     def _resolve_session_agent_runtime(
         self,
@@ -9739,8 +9743,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
-                if not adapter:
+                if source is not None and source_is_legacy_unstamped(source):
+                    adapter, send = self._legacy_marker_delivery_operation(source)
+                elif source is not None:
+                    adapter, send = self._live_delivery_operation(
+                        source,
+                        None,
+                        "send",
+                    )
+                else:
+                    adapter = self.adapters.get(platform)
+                    method = getattr(adapter, "send", None)
+                    send = (
+                        cast(Callable[..., Awaitable[Any]], method)
+                        if callable(method)
+                        else None
+                    )
+                if adapter is None or send is None:
                     continue
 
                 platform_cfg = self.config.platforms.get(platform)
@@ -9762,16 +9781,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
-                    reply_to_message_id=reply_to_message_id,
-                    adapter=adapter,
-                )
+                if source is not None:
+                    metadata = self._thread_metadata_for_source(
+                        source,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                else:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        chat_id,
+                        thread_id,
+                        chat_type=None,
+                        reply_to_message_id=reply_to_message_id,
+                        adapter=adapter,
+                    )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -10814,11 +10839,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key
                     )
                 except Exception:
-                    logger.debug(
+                    logger.error(
                         "clear_resume_pending failed for owed session %s",
                         session_key,
                         exc_info=True,
                     )
+            # Persistence is best-effort, but suppression is not: a ledger row
+            # proves the answer already exists, so this boot must never
+            # regenerate that turn through another runtime or credential.
+            self._ledger_owed_session_keys = set(owed_session_keys)
             # Claim only rows whose exact transport credential is connected.
             # Legacy rows have no owner stamp and retain the historical primary
             # route. A same-platform adapter owned by another profile is never
@@ -11035,6 +11064,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and entry.session_key
+                    not in getattr(self, "_ledger_owed_session_keys", set())
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -11074,7 +11105,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # Rebuild from the durable representation rather than passing the
+            # canonical routing-entry object into a live adapter. This drops a
+            # retired process-local adapter reference while retaining the
+            # stamped platform/profile/identity needed to resolve the current
+            # physical owner. Ownerless modern sources remain ownerless.
+            origin = entry.origin
+            if origin is None:
+                continue
+            source = SessionSource.from_dict(
+                origin.to_dict(),
+                allow_legacy_unstamped=source_is_legacy_unstamped(origin),
+            )
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -12436,6 +12478,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
+        )
+        stamp_source_transport_owner(
+            dest_source,
+            adapter=adapter,
+            platform=getattr(adapter, "platform", platform),
         )
 
         # Compute the gateway's session_key for that destination using the
@@ -14548,6 +14595,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            adapter = self._authorization_adapter(platform, profile_name)
+            if adapter is None:
+                return False
+            stamp_source_transport_owner(
+                source,
+                adapter=adapter,
+                platform=getattr(adapter, "platform", platform),
+            )
             return self._is_user_authorized(source)
         return check
 
@@ -15209,7 +15264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_type == "dm"
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
-                    profile=source.profile,
+                    profile=self._adapter_profile_for_source(source),
                 )
                 == "pair"
             ):
@@ -17088,7 +17143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cached_sources = OrderedDict()
             self._session_sources = cached_sources
         try:
-            cached_sources[session_key] = dataclasses.replace(source)
+            cached_sources[session_key] = copy_session_source(source)
         except Exception:
             logger.debug("Failed to cache live session source for %s", session_key, exc_info=True)
             return
@@ -17117,7 +17172,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                source=getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -17213,7 +17271,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
                 source.chat_id, source.user_id, source.thread_id, recovered,
             )
-            source = dataclasses.replace(source, thread_id=recovered)
+            source = copy_session_source(source, thread_id=recovered)
             try:
                 event.source = source
             except Exception:
@@ -20095,6 +20153,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+        stamp_source_transport_owner(
+            source,
+            adapter=adapter,
+            platform=Platform.DISCORD,
+        )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20240,8 +20303,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             isinstance(source_attrs, dict)
             and "_transport_profile" in source_attrs
         )
-        if not stamped:
+        if not stamped and source_is_legacy_unstamped(source):
             adapter = fallback_adapter
+        elif not stamped:
+            adapter = None
         else:
             try:
                 adapter = self._adapter_for_source(source)
@@ -20257,6 +20322,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         method = getattr(adapter, operation, None)
         if not callable(method):
             return adapter, None
+        return adapter, cast(Callable[..., Awaitable[Any]], method)
+
+    def _legacy_marker_delivery_operation(
+        self,
+        source: SessionSource,
+    ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+        """Resolve a trusted pre-owner lifecycle marker's historical route."""
+        config = getattr(self, "config", None)
+        transport = (
+            resolve_delivery_transport(source.platform, config, self.adapters)
+            if config is not None
+            else None
+        )
+        if transport is not None:
+            async def send(
+                chat_id: str,
+                content: str,
+                **kwargs: Any,
+            ) -> Any:
+                return await transport.send(
+                    source.platform,
+                    chat_id,
+                    content,
+                    **kwargs,
+                )
+
+            return transport.adapter, send
+        adapter = self.adapters.get(source.platform)
+        method = getattr(adapter, "send", None)
+        if adapter is None or not callable(method):
+            return None, None
         return adapter, cast(Callable[..., Awaitable[Any]], method)
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
@@ -21260,7 +21356,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if loop is None or loop.is_closed():
             return
         try:
-            copied_source = dataclasses.replace(source)
+            copied_source = copy_session_source(source)
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
@@ -21408,7 +21504,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if loop is None or loop.is_closed():
             return
         try:
-            copied_source = dataclasses.replace(source)
+            copied_source = copy_session_source(source)
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
@@ -22105,40 +22201,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
-        # Resolve the adapter and chat_id for sending messages
-        adapter = None
+        # Resolve the exact marker source once; resolve its live owner before
+        # every outward operation so reconnects cannot strand or misroute a
+        # long-running update.
+        source = None
         chat_id = None
         session_key = None
-        metadata = None
+        platform = None
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
                     pending = json.loads(path.read_text(encoding="utf-8"))
-                    platform_str = pending.get("platform")
-                    chat_id = pending.get("chat_id")
-                    chat_type = pending.get("chat_type")
-                    session_key = pending.get("session_key")
-                    thread_id = pending.get("thread_id")
-                    message_id = pending.get("message_id")
-                    if platform_str and chat_id:
-                        platform = Platform(platform_str)
-                        adapter = self.adapters.get(platform)
-                        metadata = self._thread_metadata_for_target(
-                            platform,
-                            chat_id,
-                            thread_id,
-                            chat_type=chat_type,
-                            reply_to_message_id=message_id,
-                            adapter=adapter,
-                        )
-                        # Fallback session key if not stored (old pending files)
+                    source = session_source_from_trusted_marker(pending)
+                    if source is not None:
+                        platform = source.platform
+                        chat_id = source.chat_id
+                        session_key = pending.get("session_key")
                         if not session_key:
-                            session_key = f"{platform_str}:{chat_id}"
+                            session_key = f"{platform.value}:{chat_id}"
                     break
                 except Exception:
                     pass
 
-        if not adapter or not chat_id:
+        def _live_update_operation(
+            method_name: str = "send",
+        ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+            if source is None:
+                return None, None
+            if source_is_legacy_unstamped(source):
+                if method_name != "send":
+                    adapter, _send = self._legacy_marker_delivery_operation(source)
+                    method = getattr(adapter, method_name, None)
+                    if adapter is None or not callable(method):
+                        return adapter, None
+                    return adapter, cast(Callable[..., Awaitable[Any]], method)
+                return self._legacy_marker_delivery_operation(source)
+            return self._live_delivery_operation(source, None, method_name)
+
+        adapter, send = _live_update_operation()
+        metadata = (
+            self._thread_metadata_for_source(source) if source is not None else None
+        )
+        if adapter is None or send is None or not chat_id:
             logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
             # Fall back to completion-only: wait for the exit code and send the
             # final notification. _send_update_notification re-resolves the
@@ -22174,30 +22278,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_stream_time = loop.time()
         buffer = ""
 
-        async def _flush_buffer() -> None:
-            """Send buffered output to the user."""
+        async def _flush_buffer() -> bool:
+            """Send buffered output, retaining the exact unsent suffix on failure."""
             nonlocal buffer, last_stream_time
             if not buffer.strip():
                 buffer = ""
-                return
-            # Chunk to fit message limits (Telegram: 4096, others: generous)
+                return True
+            # Chunk to fit message limits (Telegram: 4096, others: generous).
             clean = _strip_ansi(buffer).strip()
-            buffer = ""
-            last_stream_time = loop.time()
             if not clean:
-                return
-            # Split into chunks if too long
+                buffer = ""
+                return True
             max_chunk = 3500
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
-            for chunk in chunks:
+            last_stream_time = loop.time()
+            for chunk_index, chunk in enumerate(chunks):
                 try:
-                    await adapter.send(
+                    _adapter, live_send = _live_update_operation()
+                    if _adapter is None or live_send is None:
+                        logger.debug("Update stream deferred: exact owner unavailable")
+                        buffer = "".join(chunks[chunk_index:])
+                        return False
+                    result = await live_send(
                         chat_id,
                         f"```\n{chunk}\n```",
                         metadata=_non_conversational_metadata(metadata, platform=platform),
                     )
+                    if result is not None and getattr(result, "success", True) is False:
+                        logger.debug(
+                            "Update stream send returned success=False: %s",
+                            getattr(result, "error", "unknown delivery failure"),
+                        )
+                        buffer = "".join(chunks[chunk_index:])
+                        return False
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
+                    buffer = "".join(chunks[chunk_index:])
+                    return False
+            buffer = ""
+            return True
 
         while loop.time() < deadline:
             # Check for completion
@@ -22210,27 +22329,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             buffer += chunk
                     except OSError:
                         pass
-                await _flush_buffer()
+                flushed = await _flush_buffer()
+                if not flushed:
+                    await asyncio.sleep(poll_interval)
+                    continue
 
                 # Send final status
                 try:
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
+                    _adapter, final_send = _live_update_operation()
+                    if _adapter is None or final_send is None:
+                        logger.info("Update final notification deferred: exact owner unavailable")
+                        await asyncio.sleep(poll_interval)
+                        continue
                     if exit_code == 0:
-                        await adapter.send(
+                        final_result = await final_send(
                             chat_id,
                             "✅ Hermes update finished.",
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     else:
-                        await adapter.send(
+                        final_result = await final_send(
                             chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
+                    if final_result is not None and getattr(
+                        final_result, "success", True
+                    ) is False:
+                        logger.info(
+                            "Update final notification deferred after delivery failure: %s",
+                            getattr(final_result, "error", "unknown delivery failure"),
+                        )
+                        await asyncio.sleep(poll_interval)
+                        continue
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
+                    await asyncio.sleep(poll_interval)
+                    continue
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
@@ -22276,23 +22414,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # context before the prompt
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
+                        prompt_adapter, prompt_send = _live_update_operation()
+                        if prompt_adapter is None or prompt_send is None:
+                            logger.debug("Update prompt deferred: exact owner unavailable")
+                            await asyncio.sleep(poll_interval)
+                            continue
                         sent_buttons = False
-                        if getattr(type(adapter), "send_update_prompt", None) is not None:
+                        _button_adapter, send_prompt = _live_update_operation(
+                            "send_update_prompt"
+                        )
+                        native_prompt_method = (
+                            getattr(type(_button_adapter), "send_update_prompt", None)
+                            if _button_adapter is not None
+                            else None
+                        )
+                        if send_prompt is not None and callable(native_prompt_method):
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await send_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                     metadata=_non_conversational_metadata(metadata, platform=platform),
                                 )
-                                sent_buttons = True
+                                sent_buttons = (
+                                    prompt_result is None
+                                    or getattr(prompt_result, "success", True) is not False
+                                )
+                                if not sent_buttons:
+                                    logger.debug(
+                                        "Button-based update prompt returned success=False: %s",
+                                        getattr(
+                                            prompt_result,
+                                            "error",
+                                            "unknown delivery failure",
+                                        ),
+                                    )
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
-                            _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
+                            _p = getattr(prompt_adapter, "typed_command_prefix", "/")
+                            prompt_result = await prompt_send(
                                 chat_id,
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
@@ -22300,6 +22463,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"or type your answer directly.",
                                 metadata=_non_conversational_metadata(metadata, platform=platform),
                             )
+                            if prompt_result is not None and getattr(
+                                prompt_result, "success", True
+                            ) is False:
+                                logger.debug(
+                                    "Update prompt returned success=False: %s",
+                                    getattr(
+                                        prompt_result,
+                                        "error",
+                                        "unknown delivery failure",
+                                    ),
+                                )
+                                await asyncio.sleep(poll_interval)
+                                continue
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
                         # next watcher can recover by re-forwarding it from
@@ -22321,11 +22497,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
+                _adapter, timeout_send = _live_update_operation()
+                if _adapter is not None and timeout_send is not None:
+                    await timeout_send(
+                        chat_id,
+                        "❌ Hermes update timed out after 30 minutes.",
+                        metadata=_non_conversational_metadata(
+                            metadata, platform=platform
+                        ),
+                    )
             except Exception:
                 pass
             for p in (pending_path, claimed_path, output_path,
@@ -22388,21 +22568,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if output_path.exists():
                 output = output_path.read_bytes().decode("utf-8", errors="replace")
 
-            # Resolve adapter
-            platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
+            # Resolve the exact persisted transport owner. New markers are
+            # stamped; only trusted pre-owner marker files may use the legacy
+            # physical-route fallback.
+            source = session_source_from_trusted_marker(pending)
+            platform = source.platform if source is not None else None
+            if source is not None and source_is_legacy_unstamped(source):
+                adapter, send = self._legacy_marker_delivery_operation(source)
+            elif source is not None:
+                adapter, send = self._live_delivery_operation(
+                    source,
+                    None,
+                    "send",
+                )
+            else:
+                adapter, send = None, None
 
-            if not adapter and chat_id:
-                # The update finished, but the target platform has not
-                # reconnected yet (common right after the restart that
-                # `hermes update` triggers). Treating "adapter missing" as a
-                # definitive skip would delete the markers and silently lose the
-                # completion notification — the user never learns whether the
-                # update succeeded or timed out. Preserve the markers instead so
-                # a later retry (the watcher poll loop, or the next gateway
-                # startup) can deliver the result once the adapter is back.
+            if (adapter is None or send is None) and chat_id:
+                # The update finished, but the exact owner has not reconnected.
+                # Preserve markers instead of leaking through another profile.
                 logger.info(
-                    "Update notification deferred: %s adapter not connected yet",
+                    "Update notification deferred: exact owner not connected for %s",
                     platform_str,
                 )
                 cleanup = False
@@ -22410,15 +22596,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 claimed_path.replace(pending_path)
                 return False
 
-            if adapter and chat_id:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=chat_type,
-                    reply_to_message_id=message_id,
-                    adapter=adapter,
-                )
+            if adapter and send and source is not None and chat_id:
+                metadata = self._thread_metadata_for_source(source)
                 # Strip ANSI escape codes for clean display
                 from tools.ansi_strip import strip_ansi
                 output = strip_ansi(output).strip()
@@ -22433,7 +22612,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
+                await send(
                     chat_id,
                     msg,
                     metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -22461,24 +22640,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        cleanup = True
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
-            chat_type = data.get("chat_type")
-            thread_id = data.get("thread_id")
-            message_id = data.get("message_id")
+            source = session_source_from_trusted_marker(data)
 
-            if not platform_str or not chat_id:
+            if source is None:
                 return None
 
-            platform = Platform(platform_str)
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
-            if transport is None:
+            platform = source.platform
+            platform_str = platform.value
+            chat_id = source.chat_id
+            thread_id = source.thread_id
+            if source_is_legacy_unstamped(source):
+                adapter, send = self._legacy_marker_delivery_operation(source)
+            else:
+                adapter, send = self._live_delivery_operation(
+                    source,
+                    None,
+                    "send",
+                )
+            if adapter is None or send is None:
                 logger.debug(
-                    "Restart notification skipped: no live transport for %s",
+                    "Restart notification deferred: exact owner unavailable for %s",
                     platform_str,
                 )
+                cleanup = False
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
@@ -22489,22 +22678,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
-            metadata = self._thread_metadata_for_target(
-                platform,
-                chat_id,
-                thread_id,
-                chat_type=chat_type,
-                reply_to_message_id=message_id,
-                adapter=transport.adapter,
-            )
-            if data.get("delivered_via_upstream_relay") is True:
+            metadata = self._thread_metadata_for_source(source)
+            if source.delivered_via_upstream_relay is True:
                 metadata = dict(metadata or {})
-                if data.get("user_id"):
-                    metadata["user_id"] = str(data["user_id"])
-                if data.get("scope_id"):
-                    metadata["scope_id"] = str(data["scope_id"])
-            result = await transport.send(
-                platform,
+                if source.user_id:
+                    metadata["user_id"] = str(source.user_id)
+                if source.scope_id:
+                    metadata["scope_id"] = str(source.scope_id)
+            result = await send(
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -22532,7 +22713,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup:
+                notify_path.unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,

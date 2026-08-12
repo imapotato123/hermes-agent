@@ -212,7 +212,7 @@ async def test_queued_text_missing_stamped_owner_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
+async def test_queued_hand_built_unstamped_source_fails_closed():
     legacy = _adapter("legacy")
     runner = _runner()
 
@@ -223,7 +223,55 @@ async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
         deliver_media=False,
     )
 
+    legacy.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_deserialized_legacy_source_keeps_compatibility():
+    legacy = _adapter("legacy")
+    runner = _runner()
+    source = SessionSource.from_dict(
+        SessionSource(platform=Platform.SLACK, chat_id="C1").to_dict(),
+        allow_legacy_unstamped=True,
+    )
+
+    await runner._deliver_queued_first_response(
+        "legacy answer",
+        source,
+        legacy,
+        deliver_media=False,
+    )
+
     legacy.send.assert_awaited_once()
+
+
+def test_hand_built_unstamped_runtime_profile_cannot_nominate_credential():
+    primary = _adapter("primary")
+    runtime = _adapter("runtime")
+    runner = _runner(primary=primary, coder=runtime)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        profile="coder",
+    )
+
+    assert runner._adapter_for_source(source) is None
+
+
+def test_deserialized_legacy_runtime_profile_keeps_exact_compatibility_route():
+    primary = _adapter("primary")
+    runtime = _adapter("runtime")
+    runner = _runner(primary=primary, coder=runtime)
+    source = SessionSource.from_dict(
+        SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="coder",
+        ).to_dict(),
+        allow_legacy_unstamped=True,
+    )
+
+    assert runner._adapter_for_source(source) is runtime
 
 
 @pytest.mark.asyncio

@@ -591,7 +591,14 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    copy_session_source,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
+)
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
 if TYPE_CHECKING:
@@ -3774,7 +3781,7 @@ class BasePlatformAdapter(ABC):
         if recovered is None or str(recovered) == str(source.thread_id or ""):
             return
         try:
-            event.source = dataclasses.replace(source, thread_id=str(recovered))
+            event.source = copy_session_source(source, thread_id=str(recovered))
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
@@ -5637,26 +5644,26 @@ class BasePlatformAdapter(ABC):
         """
         runner = getattr(self, "gateway_runner", None)
         resolve = getattr(runner, "_adapter_for_source", None)
-        if not callable(resolve):
+        if source is None:
             return self
-        source_attrs = getattr(source, "__dict__", {})
-        has_transport_owner = (
-            isinstance(source_attrs, dict)
-            and "_transport_profile" in source_attrs
-        )
+        if not callable(resolve):
+            adapter_ref = getattr(source, "_transport_adapter_ref", None)
+            if callable(adapter_ref) and adapter_ref() is self:
+                return self
+            return self if source_is_legacy_unstamped(source) else None
         try:
             live_adapter = resolve(source)
         except Exception:
             logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
-            return None if has_transport_owner else self
+            return self if source_is_legacy_unstamped(source) else None
         if live_adapter is None:
             # An explicitly stamped live source must never fall back to the
             # disconnected generation when its credential owner is missing.
-            return None if has_transport_owner else self
+            return self if source_is_legacy_unstamped(source) else None
         if getattr(live_adapter, "platform", None) != self.platform:
-            return None if has_transport_owner else self
+            return self if source_is_legacy_unstamped(source) else None
         if not callable(getattr(live_adapter, "_send_with_retry", None)):
-            return None if has_transport_owner else self
+            return self if source_is_legacy_unstamped(source) else None
         # Plugin adapters are intentionally duck-typed; requiring inheritance
         # here would reject a valid replacement and revive the stale transport.
         return live_adapter
@@ -6212,6 +6219,9 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        if not source_has_transport_owner(event.source):
+            stamp_source_transport_owner(event.source, adapter=self)
+
         coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
@@ -6501,6 +6511,8 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        if not source_has_transport_owner(event.source):
+            stamp_source_transport_owner(event.source, adapter=self)
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False

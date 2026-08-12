@@ -24,7 +24,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     _thread_metadata_for_source,
 )
-from gateway.session import build_session_key
+from gateway.session import build_session_key, stamp_source_transport_owner
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -328,6 +328,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
         thread_id="20197",
         user_id="user-1",
     )
+    stamp_source_transport_owner(source, profile=None)
     event = MessageEvent(
         text="busy follow-up",
         message_type=MessageType.TEXT,
