@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session import Platform, SessionSource
+from gateway.session import Platform, SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -41,24 +41,30 @@ def _make_bare_runner():
 
 def _make_slack_bot_source():
     # Workflow Builder / app posts: subtype=bot_message, user=None.
-    return SessionSource(
-        platform=Platform.SLACK,
-        chat_id="C0123",
-        chat_type="group",
-        user_id=None,
-        user_name="",
-        is_bot=True,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C0123",
+            chat_type="group",
+            user_id=None,
+            user_name="",
+            is_bot=True,
+        ),
+        profile=None,
     )
 
 
 def _make_slack_human_source(user_id="U_human"):
-    return SessionSource(
-        platform=Platform.SLACK,
-        chat_id="C0123",
-        chat_type="group",
-        user_id=user_id,
-        user_name="Human",
-        is_bot=False,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C0123",
+            chat_type="group",
+            user_id=user_id,
+            user_name="Human",
+            is_bot=False,
+        ),
+        profile=None,
     )
 
 
