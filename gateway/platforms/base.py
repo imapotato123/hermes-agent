@@ -7555,6 +7555,30 @@ class BasePlatformAdapter(ABC):
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            # The callback may have been registered on an adapter generation
+            # that retired while the turn was running. Resolve the stamped
+            # owner and release its matching callback too; generation ownership
+            # keeps this one-shot and prevents stealing a newer run's callback.
+            _live_adapter = self._final_delivery_adapter(event.source)
+            if (
+                _live_adapter is not None
+                and _live_adapter is not self
+                and hasattr(_live_adapter, "pop_post_delivery_callback")
+            ):
+                _live_cb = _live_adapter.pop_post_delivery_callback(
+                    session_key,
+                    generation=_callback_generation,
+                )
+                if callable(_live_cb):
+                    try:
+                        _live_result = _live_cb()
+                        if inspect.isawaitable(_live_result):
+                            await asyncio.wait_for(
+                                _live_result,
+                                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                            )
+                    except (asyncio.TimeoutError, Exception):
+                        pass
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

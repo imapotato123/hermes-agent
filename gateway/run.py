@@ -3841,6 +3841,39 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    def _live_adapter(self) -> Any:
+        resolver = self._ctx._live_adapter
+        return resolver() if callable(resolver) else self._ctx._status_adapter
+
+    def _live_operation(self, name: str) -> tuple[Any, Any]:
+        resolver = self._ctx._live_operation
+        if callable(resolver):
+            return resolver(name)
+        adapter = self._live_adapter()
+        method = getattr(adapter, name, None) if adapter is not None else None
+        return adapter, method if callable(method) else None
+
+    async def _call_live(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        _adapter, result = await self._call_live_with_adapter(
+            name, *args, **kwargs
+        )
+        return result
+
+    async def _call_live_with_adapter(
+        self, name: str, *args: Any, **kwargs: Any
+    ) -> tuple[Any, Any]:
+        adapter, method = self._live_operation(name)
+        if method is None:
+            from gateway.platforms.base import SendResult
+            return (
+                None,
+                SendResult(
+                    success=False,
+                    error="stamped transport owner unavailable",
+                ),
+            )
+        return adapter, await method(*args, **kwargs)
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
@@ -3857,17 +3890,29 @@ class TurnRunner:
             and tool_name != "_thinking"
         ):
             try:
-                if event_type == "tool.started" and tool_name and ctx._run_still_current():
+                _status_state_adapter = self._live_adapter()
+                if not getattr(
+                    _status_state_adapter, "supports_status_text", False
+                ):
+                    _status_state_adapter = None
+                if (
+                    _status_state_adapter is not None
+                    and event_type == "tool.started"
+                    and tool_name
+                    and ctx._run_still_current()
+                ):
                     from agent.display import build_status_phrase
                     _phrase = build_status_phrase(
                         tool_name,
                         args if ctx._live_status_mode == "full" else None,
                     )
-                    ctx._live_status_adapter.set_status_text(ctx.source.chat_id, _phrase)
-                elif event_type == "tool.completed":
+                    _status_state_adapter.set_status_text(
+                        ctx.source.chat_id, _phrase
+                    )
+                elif _status_state_adapter is not None and event_type == "tool.completed":
                     # Between tools the model is genuinely "thinking"
                     # again — revert to the static default.
-                    ctx._live_status_adapter.set_status_text(ctx.source.chat_id, None)
+                    _status_state_adapter.set_status_text(ctx.source.chat_id, None)
             except Exception as _ls_err:
                 logger.debug("live status update failed: %s", _ls_err)
         # "log" mode: append tool.started lines to the log queue and stay
@@ -4107,7 +4152,7 @@ class TurnRunner:
         if not ctx.progress_queue:
             return
 
-        adapter = self._runner._adapter_for_source(ctx.source)
+        adapter = self._live_adapter()
         if not adapter:
             return
 
@@ -4128,6 +4173,7 @@ class TurnRunner:
 
         progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
         progress_msg_id = None   # ID of the current progress message to edit
+        progress_msg_owner = None  # Adapter generation that minted progress_msg_id
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -4181,11 +4227,25 @@ class TurnRunner:
                 "message_id": message_id,
                 "content": content,
             }
-            if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+            _edit_adapter, edit_message = self._live_operation("edit_message")
+            if edit_message is None or (
+                progress_msg_owner is not None
+                and _edit_adapter is not progress_msg_owner
+            ):
+                from gateway.platforms.base import SendResult
+                return SendResult(
+                    success=False,
+                    error=(
+                        "stamped transport owner unavailable"
+                        if edit_message is None
+                        else "message transport owner generation changed"
+                    ),
+                )
+            if getattr(_edit_adapter, "REQUIRES_EDIT_FINALIZE", False):
                 kwargs["finalize"] = True
             if _edit_accepts_metadata:
                 kwargs["metadata"] = ctx._progress_metadata
-            return await adapter.edit_message(**kwargs)
+            return await edit_message(**kwargs)
 
         def _progress_text(lines: list) -> str:
             return "\n".join(str(line) for line in lines)
@@ -4205,23 +4265,26 @@ class TurnRunner:
                 groups.append(current)
             return groups
 
-        def _track_progress_result(result) -> None:
+        def _track_progress_result(result, owner) -> None:
             if (
                 ctx._cleanup_progress
                 and getattr(result, "success", False)
                 and getattr(result, "message_id", None)
             ):
-                ctx._cleanup_msg_ids.append(str(result.message_id))
+                _mid = str(result.message_id)
+                ctx._cleanup_msg_ids.append(_mid)
+                ctx._cleanup_msg_owners[_mid] = owner
 
         async def _send_progress_text(text: str):
-            result = await adapter.send(
+            owner, result = await self._call_live_with_adapter(
+                "send",
                 chat_id=ctx.source.chat_id,
                 content=text,
                 reply_to=ctx._progress_reply_to,
                 metadata=ctx._progress_metadata,
             )
-            _track_progress_result(result)
-            return result
+            _track_progress_result(result, owner)
+            return owner, result
 
         async def _roll_progress_overflow_if_needed() -> bool:
             """Start fresh editable progress bubbles before a bubble exceeds limit.
@@ -4231,7 +4294,14 @@ class TurnRunner:
                 intact for a later retry.  In either case the caller should skip
                 the normal send/edit path for this tick.
                 """
-            nonlocal progress_msg_id, progress_lines, can_edit
+            nonlocal progress_msg_id, progress_msg_owner, progress_lines, can_edit
+            if (
+                progress_msg_id is not None
+                and progress_msg_owner is not None
+                and self._live_adapter() is not progress_msg_owner
+            ):
+                progress_msg_id = None
+                progress_msg_owner = None
             if not progress_lines or not can_edit:
                 return False
             groups = _split_progress_groups(progress_lines)
@@ -4252,12 +4322,14 @@ class TurnRunner:
                     # Fall back to the existing non-edit behavior below.
                     return False
             else:
-                result = await _send_progress_text(first_text)
+                progress_msg_owner, result = await _send_progress_text(first_text)
                 if result.success and result.message_id:
                     progress_msg_id = result.message_id
 
             for group in groups[1:]:
-                result = await _send_progress_text(_progress_text(group))
+                progress_msg_owner, result = await _send_progress_text(
+                    _progress_text(group)
+                )
                 if result.success and result.message_id:
                     progress_msg_id = result.message_id
 
@@ -4311,6 +4383,7 @@ class TurnRunner:
                     # on the content side. (Issue: tool + content
                     # linearization regression after PR #7885.)
                     progress_msg_id = None
+                    progress_msg_owner = None
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
@@ -4323,7 +4396,11 @@ class TurnRunner:
                     _last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
                     if ctx._run_still_current():
-                        await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                        await self._call_live(
+                            "send_typing",
+                            ctx.source.chat_id,
+                            metadata=ctx._progress_metadata,
+                        )
                     continue
 
                 # Throttle edits: batch rapid tool updates into fewer
@@ -4341,6 +4418,14 @@ class TurnRunner:
 
                 if not ctx._run_still_current():
                     return
+
+                if (
+                    progress_msg_id is not None
+                    and progress_msg_owner is not None
+                    and self._live_adapter() is not progress_msg_owner
+                ):
+                    progress_msg_id = None
+                    progress_msg_owner = None
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
@@ -4369,47 +4454,64 @@ class TurnRunner:
                             _last_edit_ts = time.monotonic()
                         else:
                             can_edit = False
-                        _flood_result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        _flood_owner, _flood_result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=msg,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                         if (
                             ctx._cleanup_progress
                             and getattr(_flood_result, "success", False)
                             and getattr(_flood_result, "message_id", None)
                         ):
-                            ctx._cleanup_msg_ids.append(str(_flood_result.message_id))
+                            _mid = str(_flood_result.message_id)
+                            ctx._cleanup_msg_ids.append(_mid)
+                            ctx._cleanup_msg_owners[_mid] = _flood_owner
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
                         full_text = "\n".join(progress_lines)
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=full_text,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        progress_msg_owner, result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=full_text,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                     else:
                         # Editing unsupported: send just this line
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        progress_msg_owner, result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=msg,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
                         if ctx._cleanup_progress:
-                            ctx._cleanup_msg_ids.append(str(result.message_id))
+                            _mid = str(result.message_id)
+                            ctx._cleanup_msg_ids.append(_mid)
+                            ctx._cleanup_msg_owners[_mid] = progress_msg_owner
 
                 _last_edit_ts = time.monotonic()
 
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
                 if ctx._run_still_current():
-                    await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                    await self._call_live(
+                        "send_typing",
+                        ctx.source.chat_id,
+                        metadata=ctx._progress_metadata,
+                    )
 
             except queue.Empty:
                 await asyncio.sleep(0.3)
@@ -4435,6 +4537,7 @@ class TurnRunner:
                                 except Exception:
                                     pass
                             progress_msg_id = None
+                            progress_msg_owner = None
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
@@ -4465,12 +4568,12 @@ class TurnRunner:
         if not ctx._run_still_current():
             return
         ctx._voice_ack_fired[0] = True
-        _adapter = self._runner.adapters.get(Platform.DISCORD)
-        if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
+        _adapter, _play_ack = self._live_operation("play_ack_in_voice")
+        if _adapter is None or _play_ack is None:
             return
         try:
             safe_schedule_threadsafe(
-                _adapter.play_ack_in_voice(ctx._voice_ack_guild[0]),
+                _play_ack(ctx._voice_ack_guild[0]),
                 ctx._voice_ack_loop,
                 logger=logger,
                 log_message="voice ack scheduling error",
@@ -4576,6 +4679,7 @@ class TurnRunner:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
             return
+
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
             event_type,
@@ -4589,8 +4693,20 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        async def _send_live_status():
+            adapter = self._live_adapter()
+            if adapter is None:
+                return None
+            return adapter, await _send_or_update_status_coro(
+                adapter,
+                ctx._status_chat_id,
+                event_type,
+                prepared_message,
+                ctx._status_thread_metadata,
+            )
+
         _fut = safe_schedule_threadsafe(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
+            _send_live_status(),
             ctx._loop_for_step,
             logger=logger,
             log_message=f"status_callback ({event_type}) scheduling error",
@@ -4600,12 +4716,14 @@ class TurnRunner:
         if ctx._cleanup_progress:
             def _track_status_id(fut) -> None:
                 try:
-                    res = fut.result()
+                    owner, res = fut.result()
                 except Exception:
                     return
                 mid = getattr(res, "message_id", None)
                 if getattr(res, "success", False) and mid:
-                    ctx._cleanup_msg_ids.append(str(mid))
+                    _mid = str(mid)
+                    ctx._cleanup_msg_ids.append(_mid)
+                    ctx._cleanup_msg_owners[_mid] = owner
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
@@ -4736,6 +4854,7 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        adapter_resolver=ctx._live_adapter,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -4766,10 +4885,11 @@ class TurnRunner:
                 else:
                     _stream_consumer.on_commentary(display_text)
                 return
-            if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
+            if already_streamed or not str(display_text or "").strip():
                 return
             safe_schedule_threadsafe(
-                ctx._status_adapter.send(
+                self._call_live(
+                    "send",
                     ctx._status_chat_id,
                     display_text,
                     metadata=ctx._status_thread_metadata,
@@ -5134,10 +5254,11 @@ class TurnRunner:
         _bg_review_pending_lock = threading.Lock()
 
         def _deliver_bg_review_message(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if not ctx._run_still_current():
                 return
             safe_schedule_threadsafe(
-                ctx._status_adapter.send(
+                self._call_live(
+                    "send",
                     ctx._status_chat_id,
                     message,
                     metadata=_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform),
@@ -5157,7 +5278,7 @@ class TurnRunner:
 
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if not ctx._run_still_current():
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -5169,15 +5290,20 @@ class TurnRunner:
         agent.background_review_callback = _bg_review_send
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
-        if ctx._status_adapter and ctx.session_key:
-            if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
-                ctx._status_adapter.register_post_delivery_callback(
+        if ctx.session_key:
+            _callback_adapter = self._live_adapter()
+            if _callback_adapter and getattr(
+                type(_callback_adapter),
+                "register_post_delivery_callback",
+                None,
+            ) is not None:
+                _callback_adapter.register_post_delivery_callback(
                     ctx.session_key,
                     _release_bg_review_messages,
                     generation=ctx.run_generation,
                 )
-            else:
-                _pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
+            elif _callback_adapter is not None:
+                _pdc = getattr(_callback_adapter, "_post_delivery_callbacks", None)
                 if _pdc is not None:
                     _pdc[ctx.session_key] = _release_bg_review_messages
         # Memory update notifications in chat.  Config: display.memory_notifications
@@ -5204,7 +5330,7 @@ class TurnRunner:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
-            if not ctx._status_adapter:
+            if self._live_adapter() is None:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
@@ -5221,7 +5347,11 @@ class TurnRunner:
             # an "Other" response on platforms that disable input while
             # typing is active (Slack Assistant API).
             try:
-                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+                _pause_adapter, pause_typing = self._live_operation(
+                    "pause_typing_for_chat"
+                )
+                if pause_typing is not None:
+                    pause_typing(ctx._status_chat_id)
             except Exception:
                 pass
 
@@ -5246,7 +5376,8 @@ class TurnRunner:
 
             send_ok = False
             fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
+                self._call_live(
+                    "send_clarify",
                     chat_id=ctx._status_chat_id,
                     question=question,
                     choices=list(choices) if choices else None,
@@ -5381,7 +5512,11 @@ class TurnRunner:
             # is active.  The approval message send auto-clears the Slack
             # status; pausing prevents _keep_typing from re-setting it.
             # Typing resumes in _handle_approve_command/_handle_deny_command.
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            _pause_adapter, pause_typing = self._live_operation(
+                "pause_typing_for_chat"
+            )
+            if pause_typing is not None:
+                pause_typing(ctx._status_chat_id)
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
@@ -5397,10 +5532,14 @@ class TurnRunner:
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+            _approval_adapter, _send_exec = self._live_operation(
+                "send_exec_approval"
+            )
+            if _send_exec is not None:
                 try:
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
+                        self._call_live(
+                            "send_exec_approval",
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
@@ -5432,7 +5571,7 @@ class TurnRunner:
             # typed prefix so Slack/Matrix users are told the form they
             # can actually type (`!approve`) — typed "/" is blocked in
             # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
+            _p = getattr(self._live_adapter(), "typed_command_prefix", "/")
             msg = _format_exec_approval_fallback(
                 cmd,
                 desc,
@@ -5443,7 +5582,8 @@ class TurnRunner:
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
+                    self._call_live(
+                        "send",
                         ctx._status_chat_id,
                         msg,
                         metadata=ctx._status_thread_metadata,
@@ -25504,11 +25644,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
-            def _pause_typing_before_finalize(
-                _adapter=adapter,
-                _chat_id=source.chat_id,
-            ) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+            def _pause_typing_before_finalize(_chat_id=source.chat_id) -> None:
+                _adapter, _pause = self._live_delivery_operation(
+                    source,
+                    None,
+                    "pause_typing_for_chat",
+                )
+                if _adapter is not None and _pause is not None:
+                    _pause(_chat_id)
         # Platforms that don't support editing sent messages
         # (e.g. QQ, WeChat) should skip streaming entirely —
         # without edit support, the consumer sends a partial
@@ -25685,6 +25828,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        adapter_resolver=lambda: self._live_delivery_operation(
+                            source,
+                            None,
+                            "send",
+                        )[0],
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -25695,10 +25843,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             stream_task = asyncio.create_task(_stream_consumer.run())
 
         # Send typing indicator
-        _adapter = self._adapter_for_source(source)
-        if _adapter:
+        _adapter, _send_typing = self._live_delivery_operation(
+            source,
+            None,
+            "send_typing",
+        )
+        if _adapter and _send_typing:
             try:
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
+                await _send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
                 pass
 
@@ -26055,6 +26207,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
+
+        def _live_adapter() -> Any:
+            return self._adapter_for_source(source)
+
+        def _live_operation(name: str) -> tuple[Any, Any]:
+            adapter = _live_adapter()
+            method = getattr(adapter, name, None) if adapter is not None else None
+            return adapter, method if callable(method) else None
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -26259,6 +26419,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _cleanup_msg_owners: dict[str, Any] = {}
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -26267,6 +26428,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
+            _live_adapter=_live_adapter,
+            _live_operation=_live_operation,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
             _thinking_enabled=_thinking_enabled,
@@ -26283,6 +26446,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
+            _cleanup_msg_owners=_cleanup_msg_owners,
             message=message,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,
@@ -26541,7 +26705,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #
         # Gates: voice input, auto-TTS enabled for this chat, adapter
         # supports streaming, and a usable streaming TTS provider configured.
-        _stts_adapter = self._adapter_for_source(source)
+        _stts_adapter = turn_ctx._live_adapter()
         _is_voice_input = (
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
@@ -26562,6 +26726,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     tts_config=_tts_cfg,
                     loop=_gateway_loop,
                     metadata=_status_thread_metadata,
+                    adapter_resolver=turn_ctx._live_adapter,
                 )
                 if _stts_consumer.active:
                     streaming_tts_consumer_holder[0] = _stts_consumer
@@ -26723,8 +26888,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
-            _notify_adapter = self._adapter_for_source(source)
-            if not _notify_adapter:
+            if _live_adapter() is None:
                 return
             # Track the heartbeat message id so we can edit-in-place on
             # platforms that support it (Telegram, Discord, Slack, etc.)
@@ -26732,6 +26896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
+            _heartbeat_msg_owner = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 # Stop heartbeating once this run no longer owns the session
@@ -26784,8 +26949,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 try:
+                    _notify_adapter = _live_adapter()
+                    if _notify_adapter is None:
+                        continue
                     _notify_res = None
-                    if _heartbeat_msg_id:
+                    if (
+                        _heartbeat_msg_id
+                        and _heartbeat_msg_owner is _notify_adapter
+                    ):
                         try:
                             _notify_res = await _notify_adapter.edit_message(
                                 source.chat_id,
@@ -26795,6 +26966,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
+                    elif _heartbeat_msg_id:
+                        _heartbeat_msg_id = None
+                        _heartbeat_msg_owner = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
@@ -26805,8 +26979,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _notify_res, "message_id", None
                         ):
                             _heartbeat_msg_id = str(_notify_res.message_id)
+                            _heartbeat_msg_owner = _notify_adapter
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(_heartbeat_msg_id)
+                                _cleanup_msg_owners[_heartbeat_msg_id] = _notify_adapter
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -27680,16 +27856,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # inside the tail message. Fall through to the normal final send
                 # instead (#78541).
                 _sc_msg_id = _sc.message_id
-                _sc_adapter = getattr(_sc, "adapter", None)
                 if getattr(_sc, "_turn_split_delivery", False):
                     logger.info(
                         "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
                         session_key or "?",
                     )
-                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__":
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
-                            chat_id=source.chat_id,
+                        _reconcile_res = await _sc._edit_message(
                             message_id=_sc_msg_id,
                             content=_final,
                             finalize=True,
@@ -27722,17 +27896,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
+                        _transform_res = await _sc._edit_message(
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_res, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Plugin-transformed stream edit unavailable for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_transform_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
@@ -27754,17 +27934,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             _ids_snapshot = list(_cleanup_msg_ids)
+            _owners_snapshot = dict(_cleanup_msg_owners)
             _chat_id_snapshot = source.chat_id
-            _adapter_snapshot = _cleanup_adapter
             _loop_snapshot = asyncio.get_running_loop()
 
             def _cleanup_temp_bubbles() -> None:
                 async def _delete_all() -> None:
                     for _mid in _ids_snapshot:
                         try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
+                            _delete_adapter, delete_message = (
+                                self._live_delivery_operation(
+                                    source,
+                                    None,
+                                    "delete_message",
+                                )
                             )
+                            if _delete_adapter is None or delete_message is None:
+                                return
+                            if _owners_snapshot.get(_mid) is not _delete_adapter:
+                                continue
+                            await delete_message(_chat_id_snapshot, _mid)
                         except Exception:
                             pass
                 try:
@@ -27777,7 +27966,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
             try:
-                _cleanup_adapter.register_post_delivery_callback(
+                _live_cleanup_adapter = self._live_delivery_operation(
+                    source,
+                    None,
+                    "register_post_delivery_callback",
+                )[0]
+                if _live_cleanup_adapter is None:
+                    raise RuntimeError("stamped cleanup owner unavailable")
+                _live_cleanup_adapter.register_post_delivery_callback(
                     session_key,
                     _cleanup_temp_bubbles,
                     generation=run_generation,

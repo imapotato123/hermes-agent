@@ -170,6 +170,7 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     """Build a StreamingTTSConsumer with pre-set internals for testing."""
     consumer = StreamingTTSConsumer.__new__(StreamingTTSConsumer)
     consumer._adapter = adapter
+    consumer._adapter_resolver = None
     consumer._chat_id = chat_id
     consumer._tts_config = {}
     consumer._loop = loop
@@ -328,6 +329,66 @@ class TestConsumerLifecycle:
             # The consumer is aborted, not completed.
             assert consumer.completed is False
             assert consumer._aborted is True
+            assert consumer.suppress_whole_file is True
+
+        _run_test(run)
+
+
+class TestOwnerReplacement:
+    """An in-flight audio handle never crosses adapter generations."""
+
+    def test_replacement_before_first_chunk_fails_closed_and_allows_fallback(self):
+        async def run(loop):
+            stale = FakeVoiceAdapter("stale")
+            replacement = FakeVoiceAdapter("replacement")
+            owner = {"adapter": stale}
+            streamer = SlowFirstChunkStreamer()
+            consumer = _make_consumer(stale, "chat1", loop, streamer)
+            consumer._adapter_resolver = lambda: owner["adapter"]
+
+            consumer.start()
+            consumer.on_delta("A sentence. ")
+            consumer.finish()
+            await asyncio.wait_for(
+                asyncio.to_thread(streamer.started.wait, 1.0),
+                timeout=1.0,
+            )
+            owner["adapter"] = replacement
+            streamer.allow_first_chunk.set()
+            await consumer.wait_complete(timeout=2.0)
+
+            assert stale.written_chunks == []
+            assert replacement.written_chunks == []
+            assert consumer.completed is False
+            assert consumer.suppress_whole_file is False
+
+        _run_test(run)
+
+    def test_replacement_after_audible_prefix_stops_without_replay(self):
+        async def run(loop):
+            stale = FakeVoiceAdapter("stale")
+            replacement = FakeVoiceAdapter("replacement")
+            owner = {"adapter": stale}
+            streamer = BlockingSecondChunkStreamer()
+            consumer = _make_consumer(stale, "chat1", loop, streamer)
+            consumer._adapter_resolver = lambda: owner["adapter"]
+
+            consumer.start()
+            consumer.on_delta("A sentence. ")
+            consumer.finish()
+            await asyncio.wait_for(
+                asyncio.to_thread(streamer.first_chunk_written.wait, 1.0),
+                timeout=1.0,
+            )
+            await asyncio.sleep(0)
+            owner["adapter"] = replacement
+            streamer.allow_remaining_chunks.set()
+            await consumer.wait_complete(timeout=2.0)
+
+            assert stale.written_chunks == [b"chunk-1-0"]
+            assert replacement.written_chunks == []
+            assert consumer.completed is False
+            assert consumer.partial is True
             assert consumer.suppress_whole_file is True
 
         _run_test(run)
