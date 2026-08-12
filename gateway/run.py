@@ -11109,7 +11109,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
             metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+                self._thread_metadata_for_source(_recovery_source)
+                if _recovery_source is not None
+                else (
+                    {"thread_id": row["thread_id"]}
+                    if row.get("thread_id")
+                    else None
+                )
             )
             try:
                 if row.get("transport_profile_stamped"):

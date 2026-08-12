@@ -170,7 +170,7 @@ class GatewayAuthorizationMixin:
                 ):
                     return None
             fronts = getattr(adapter, "fronts_platform", None)
-            if callable(fronts) and not fronts(
+            if not callable(fronts) or not fronts(
                 getattr(source, "platform", None)
             ):
                 return None
