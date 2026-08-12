@@ -104,6 +104,20 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    source_attrs = getattr(source, "__dict__", {})
+    if (
+        isinstance(source_attrs, dict)
+        and source_attrs.get("_transport_platform") == Platform.RELAY
+    ):
+        logical_platform = _platform_name(getattr(source, "platform", None))
+        if logical_platform and logical_platform != Platform.RELAY.value:
+            metadata["_relay_logical_platform"] = logical_platform
+        scope_id = getattr(source, "scope_id", None)
+        user_id = getattr(source, "user_id", None)
+        if scope_id:
+            metadata["scope_id"] = str(scope_id)
+        if user_id:
+            metadata["user_id"] = str(user_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -5647,6 +5661,14 @@ class BasePlatformAdapter(ABC):
         # here would reject a valid replacement and revive the stale transport.
         return live_adapter
 
+    def _retry_delivery_adapter(
+        self, source: Optional[SessionSource]
+    ) -> Optional[Any]:
+        """Resolve the current owner immediately before one physical retry."""
+        if source is None:
+            return self
+        return self._final_delivery_adapter(source)
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -5655,6 +5677,7 @@ class BasePlatformAdapter(ABC):
         metadata: Any = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
+        source: Optional[SessionSource] = None,
     ) -> "SendResult":
         """
         Send a message with automatic retry for transient network errors.
@@ -5665,7 +5688,10 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        result = await self.send(
+        send_adapter = self._retry_delivery_adapter(source)
+        if send_adapter is None:
+            return SendResult(success=False, error="transport owner unavailable")
+        result = await send_adapter.send(
             chat_id=chat_id,
             content=content,
             reply_to=reply_to,
@@ -5699,7 +5725,12 @@ class BasePlatformAdapter(ABC):
                     self.name, attempt, max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
-                result = await self.send(
+                send_adapter = self._retry_delivery_adapter(source)
+                if send_adapter is None:
+                    return SendResult(
+                        success=False, error="transport owner unavailable"
+                    )
+                result = await send_adapter.send(
                     chat_id=chat_id,
                     content=content,
                     reply_to=reply_to,
@@ -5721,14 +5752,24 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    send_adapter = self._retry_delivery_adapter(source)
+                    if send_adapter is not None:
+                        await send_adapter.send(
+                            chat_id=chat_id,
+                            content=notice,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
+        send_adapter = self._retry_delivery_adapter(source)
+        if send_adapter is None:
+            return SendResult(success=False, error="transport owner unavailable")
+        fallback_result = await send_adapter.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
@@ -6133,6 +6174,7 @@ class BasePlatformAdapter(ABC):
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
+                    source=event.source,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -6249,6 +6291,7 @@ class BasePlatformAdapter(ABC):
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
+                            source=event.source,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -6302,6 +6345,7 @@ class BasePlatformAdapter(ABC):
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
+                                source=event.source,
                             )
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
@@ -6920,13 +6964,36 @@ class BasePlatformAdapter(ABC):
                                     if _transport_profile_stamped
                                     else None
                                 )
+                                _transport_identity = (
+                                    _source_attrs.get("_transport_identity")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
+                                _transport_platform = (
+                                    _source_attrs.get("_transport_platform")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
+                                _transport_platform_value = getattr(
+                                    _transport_platform,
+                                    "value",
+                                    _transport_platform,
+                                )
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
+                                    transport_platform=_transport_platform_value,
                                     transport_profile=_transport_profile,
                                     transport_profile_stamped=(
                                         _transport_profile_stamped
+                                    ),
+                                    transport_identity=_transport_identity,
+                                    route_scope_id=getattr(
+                                        event.source, "scope_id", None
+                                    ),
+                                    route_user_id=getattr(
+                                        event.source, "user_id", None
                                     ),
                                 )
                                 await asyncio.to_thread(
@@ -6940,9 +7007,20 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    transport_platform=_transport_platform_value,
                                     transport_profile=_transport_profile,
                                     transport_profile_stamped=(
                                         _transport_profile_stamped
+                                    ),
+                                    transport_identity=_transport_identity,
+                                    route_scope_id=getattr(
+                                        event.source, "scope_id", None
+                                    ),
+                                    route_user_id=getattr(
+                                        event.source, "user_id", None
+                                    ),
+                                    route_chat_type=getattr(
+                                        event.source, "chat_type", None
                                     ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
@@ -6968,6 +7046,7 @@ class BasePlatformAdapter(ABC):
                                     content=text_content,
                                     reply_to=_reply_anchor,
                                     metadata=_final_thread_metadata,
+                                    source=event.source,
                                 )
                                 delivered = bool(
                                     getattr(send_result, "success", False)
@@ -7009,6 +7088,7 @@ class BasePlatformAdapter(ABC):
                                 content=text_content,
                                 reply_to=_reply_anchor,
                                 metadata=_final_thread_metadata,
+                                source=event.source,
                             )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -7720,9 +7800,9 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
-        # In-process transport provenance is deliberately not serialized by
-        # SessionSource.to_dict(). The live receiving adapter is authoritative
-        # for this turn even when profile_routes selects a different runtime.
+        # The exact generation stays process-local, while the physical platform
+        # and profile form the durable transport owner. ``source.platform`` is
+        # only the logical chat namespace and may differ for relay ingress.
         source._transport_adapter_ref = weakref.ref(self)
         # The weakref identifies this exact generation while it remains in the
         # runner registry. Preserve its owning profile independently so a turn
@@ -7732,6 +7812,7 @@ class BasePlatformAdapter(ABC):
             "_transport_profile",
             getattr(self, "_transport_profile", None),
         )
+        setattr(source, "_transport_platform", self.platform)
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

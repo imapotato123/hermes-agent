@@ -126,11 +126,21 @@ class TestStateMachine:
                 ).fetchall()
             }
             owner = migrated.execute(
-                "SELECT transport_profile, transport_profile_stamped "
+                "SELECT transport_platform, transport_profile, "
+                "transport_profile_stamped, transport_identity, route_scope_id, "
+                "route_user_id, route_chat_type "
                 "FROM delivery_obligations WHERE obligation_id='ob-1'"
             ).fetchone()
-        assert {"transport_profile", "transport_profile_stamped"} <= columns
-        assert owner == (None, 0)
+        assert {
+            "transport_platform",
+            "transport_profile",
+            "transport_profile_stamped",
+            "transport_identity",
+            "route_scope_id",
+            "route_user_id",
+            "route_chat_type",
+        } <= columns
+        assert owner == (None, None, 0, None, None, None, None)
 
 
 class TestObligationId:
@@ -143,6 +153,72 @@ class TestObligationId:
         assert a != dl.compute_obligation_id("sk1", "msg2", "hello")
         assert a != dl.compute_obligation_id("sk1", "msg1", "other")
         assert len(a) == 24
+
+    def test_stamped_physical_platform_is_part_of_identity(self):
+        native = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="discord",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+        relay = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+
+        assert native != relay
+
+    def test_transport_identity_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-2",
+        )
+
+        assert first != second
+
+    def test_relay_tenant_discriminator_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-1",
+            route_user_id="user-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-2",
+            route_user_id="user-2",
+        )
+
+        assert first != second
 
 
 class TestSweep:

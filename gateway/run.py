@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, Iterable, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -6008,7 +6008,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``source.profile`` is the runtime/session namespace and may be changed
         # by a chat-based profile route. Keep the credential/transport owner
         # separately so an in-flight turn can find this adapter's replacement.
-        adapter._transport_profile = str(profile_name or "").strip() or None
+        # Relay is a single process-level socket shared across runtime profiles,
+        # so its owner profile is intentionally ``None`` and route discovery
+        # advertises that exact durable identity.
+        if getattr(adapter, "platform", None) == Platform.RELAY:
+            adapter._transport_profile = None
+        else:
+            adapter._transport_profile = str(profile_name or "").strip() or None
         setter = getattr(adapter, "set_backend_notice_state", None)
         if callable(setter):
             setter(
@@ -10820,15 +10826,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _deliverable_routes = set()
             for _platform, _adapter in self.adapters.items():
                 _platform_value = getattr(_platform, "value", str(_platform))
-                _deliverable_routes.add((_platform_value, False, None))
+                _deliverable_routes.add((_platform_value, False, None, None))
                 if hasattr(_adapter, "_transport_profile"):
-                    _deliverable_routes.add(
-                        (
-                            _platform_value,
-                            True,
-                            getattr(_adapter, "_transport_profile", None),
+                    _identity_values = (None,)
+                    if _platform == Platform.RELAY:
+                        _identity_fn = getattr(
+                            _adapter, "acknowledged_transport_identities", None
                         )
-                    )
+                        _identity_values = (
+                            tuple(cast(Iterable[Any], _identity_fn()))
+                            if callable(_identity_fn)
+                            else ()
+                        )
+                    for _identity in _identity_values:
+                        _deliverable_routes.add(
+                            (
+                                _platform_value,
+                                True,
+                                getattr(_adapter, "_transport_profile", None),
+                                _identity,
+                            )
+                        )
             for _profile, _profile_adapters in (
                 getattr(self, "_profile_adapters", None) or {}
             ).items():
@@ -10838,6 +10856,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             getattr(_platform, "value", str(_platform)),
                             True,
                             _profile,
+                            None,
                         )
                     )
             claimed = await asyncio.to_thread(
@@ -10853,6 +10872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         redelivered = 0
         for row in claimed:
+            _recovery_source: Optional[SessionSource] = None
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -10860,18 +10880,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "obligation %s: unknown platform %r",
                     row["obligation_id"], row.get("platform"),
                 )
+                try:
+                    await asyncio.to_thread(
+                        release_claim, row["obligation_id"]
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: malformed-row claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
                 continue
             if row.get("transport_profile_stamped"):
                 _recovery_source = SessionSource(
                     platform=platform,
                     chat_id=str(row["chat_id"]),
                     thread_id=row.get("thread_id"),
+                    scope_id=row.get("route_scope_id"),
+                    user_id=row.get("route_user_id"),
+                    chat_type=row.get("route_chat_type") or "dm",
                 )
                 setattr(
                     _recovery_source,
                     "_transport_profile",
                     row.get("transport_profile"),
                 )
+                try:
+                    _transport_platform = Platform(
+                        row.get("transport_platform") or row["platform"]
+                    )
+                except (TypeError, ValueError):
+                    _transport_platform = None
+                setattr(
+                    _recovery_source,
+                    "_transport_platform",
+                    _transport_platform,
+                )
+                if row.get("transport_identity") is not None:
+                    setattr(
+                        _recovery_source,
+                        "_transport_identity",
+                        str(row.get("transport_identity")),
+                    )
                 adapter = self._adapter_for_source(_recovery_source)
             else:
                 adapter = self.adapters.get(platform)
@@ -10896,11 +10946,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
-                )
+                if row.get("transport_profile_stamped"):
+                    assert _recovery_source is not None
+                    adapter, send = self._live_delivery_operation(
+                        _recovery_source, adapter, "send"
+                    )
+                    if send is None:
+                        await asyncio.to_thread(
+                            release_claim, row["obligation_id"]
+                        )
+                        continue
+                    if adapter is not None:
+                        prime = getattr(adapter, "prime_routing_source", None)
+                        if callable(prime):
+                            prime(_recovery_source)
+                    result = await send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await cast(Any, adapter).send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
@@ -20179,7 +20249,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = None
         if adapter is None:
             return None, None
-        if stamped and getattr(adapter, "platform", None) != source.platform:
+        expected_platform = source_attrs.get(
+            "_transport_platform", getattr(source, "platform", None)
+        )
+        if stamped and getattr(adapter, "platform", None) != expected_platform:
             return None, None
         method = getattr(adapter, operation, None)
         if not callable(method):
@@ -20571,12 +20644,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_urls = media_urls or []
         media_types = media_types or []
 
-        adapter = self._adapter_for_source(source)
+        adapter: Any = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        suppress_failure_fallback = False
 
         try:
             user_config = _load_gateway_config()
@@ -20585,11 +20659,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
+                _, send = self._live_delivery_operation(source, adapter, "send")
+                if send is not None:
+                    await send(
+                        source.chat_id,
+                        f"❌ Background task {task_id} failed: no provider credentials configured.",
+                        metadata=_thread_metadata,
+                    )
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -20667,98 +20743,186 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            is_backend_unavailable = bool(
+                isinstance(result, dict)
+                and _is_backend_unavailable_agent_result(result)
+            )
+            response = (
+                result.get("final_response", "")
+                if isinstance(result, dict)
+                else ""
+            )
+            if is_backend_unavailable:
+                suppress_failure_fallback = True
+                # Preserve the retry loop's structured classification. Never
+                # surface provider endpoints/details from ``error`` and never
+                # treat this synthetic notice as a durable answer obligation.
+                response = _BACKEND_UNAVAILABLE_NOTICE
+            elif (
+                not response
+                and isinstance(result, dict)
+                and result.get("error")
+            ):
                 response = f"Error: {result['error']}"
 
-            # Extract media files from the response
-            if response:
-                media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
+            async def _deliver(operation: str, **kwargs):
+                """Resolve the stamped owner immediately before one physical send."""
+                _, method = self._live_delivery_operation(source, adapter, operation)
+                if method is None:
+                    return None
+                return await method(**kwargs)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
+            backend_notice_claimed = False
+            backend_notice_key = ""
+            if is_backend_unavailable:
+                session_key = self._session_key_for_source(source)
+                notice_adapter = self._adapter_for_source(source)
+                notice_key_fn = getattr(
+                    notice_adapter, "_backend_notice_session_key", None
+                )
+                notice_key_value = (
+                    notice_key_fn(session_key, source)
+                    if callable(notice_key_fn)
+                    else session_key
+                )
+                backend_notice_key = str(notice_key_value)
+                backend_notice_claimed = await (
+                    self._backend_notice_state_for_adapters().claim(
+                        backend_notice_key, "backend_unavailable"
                     )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
+                )
+                if not backend_notice_claimed:
+                    return
+
+            notice_delivered = False
+            try:
+                # Extraction is pure parsing; all resulting physical operations
+                # independently re-resolve their current owner via ``_deliver``.
+                if response:
+                    if is_backend_unavailable:
+                        # Synthetic notices bypass media parsing and generated
+                        # attachments/TTS just like foreground outage notices.
+                        media_files = []
+                        images = []
+                        text_content = response
+                    else:
+                        media_files, response = adapter.extract_media(response)
+                        from gateway.platforms.base import BasePlatformAdapter
+                        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                        images, text_content = adapter.extract_images(response)
+
+                    preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                    header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                    outbound_text = (
+                        text_content
+                        if is_backend_unavailable
+                        else header + text_content
                     )
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
+                    if text_content:
+                        send_result = await _deliver(
+                            "send",
                             chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
+                            content=outbound_text,
                             metadata=_thread_metadata,
                         )
-                    except Exception:
-                        pass
+                        notice_delivered = bool(
+                            getattr(send_result, "success", False)
+                        )
+                    elif not images and not media_files:
+                        await _deliver(
+                            "send",
+                            chat_id=source.chat_id,
+                            content=header + "(No response generated)",
+                            metadata=_thread_metadata,
+                        )
 
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
-                from gateway.platforms.base import (
-                    should_send_media_as_audio as _should_send_media_as_audio,
-                )
-                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-                for media_path, _is_voice in (media_files or []):
-                    _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
+                    # Send extracted images. Resolve between every item because
+                    # native batches and uploads may reconnect independently.
+                    for image_url, alt_text in (images or []):
+                        try:
+                            await _deliver(
+                                "send_image",
                                 chat_id=source.chat_id,
-                                audio_path=media_path,
+                                image_url=image_url,
+                                caption=alt_text,
                                 metadata=_thread_metadata,
                             )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
-            else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
-                )
+                        except Exception:
+                            pass
 
-        except Exception as e:
+                    # Route each generated file by type and re-resolve between
+                    # files; trailing artifacts must never stay on a retired owner.
+                    from gateway.platforms.base import (
+                        should_send_media_as_audio as _should_send_media_as_audio,
+                    )
+                    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                    _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                    for media_path, _is_voice in (media_files or []):
+                        _ext = os.path.splitext(media_path)[1].lower()
+                        try:
+                            if _should_send_media_as_audio(source.platform, _ext, _is_voice):
+                                await _deliver(
+                                    "send_voice",
+                                    chat_id=source.chat_id,
+                                    audio_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            elif _ext in _VIDEO_EXTS:
+                                await _deliver(
+                                    "send_video",
+                                    chat_id=source.chat_id,
+                                    video_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            elif _ext in _IMAGE_EXTS:
+                                await _deliver(
+                                    "send_image_file",
+                                    chat_id=source.chat_id,
+                                    image_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            else:
+                                await _deliver(
+                                    "send_document",
+                                    chat_id=source.chat_id,
+                                    file_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                        except Exception:
+                            pass
+                else:
+                    preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                    await _deliver(
+                        "send",
+                        chat_id=source.chat_id,
+                        content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                        metadata=_thread_metadata,
+                    )
+            finally:
+                if backend_notice_claimed:
+                    self._backend_notice_state_for_adapters().finish_claim(
+                        backend_notice_key,
+                        "backend_unavailable",
+                        time.monotonic(),
+                        delivered=notice_delivered,
+                    )
+
+        except Exception:
             logger.exception("Background task %s failed", task_id)
+            if suppress_failure_fallback:
+                # A failed synthetic-notice send releases its shared claim for
+                # a later retry. Do not bypass that contract with an ordinary
+                # background-failure message from this same failed transport.
+                return
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                _, send = self._live_delivery_operation(source, adapter, "send")
+                if send is not None:
+                    await send(
+                        chat_id=source.chat_id,
+                        content=f"❌ Background task {task_id} failed.",
+                        metadata=_thread_metadata,
+                    )
             except Exception:
                 pass
 
@@ -21785,6 +21949,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        source_attrs = getattr(source, "__dict__", {})
+        if (
+            isinstance(source_attrs, dict)
+            and source_attrs.get("_transport_platform") == Platform.RELAY
+        ):
+            logical_platform = getattr(
+                getattr(source, "platform", None),
+                "value",
+                getattr(source, "platform", None),
+            )
+            if logical_platform and logical_platform != Platform.RELAY.value:
+                metadata = dict(metadata or {})
+                metadata["_relay_logical_platform"] = str(logical_platform)
+            scope_id = getattr(source, "scope_id", None)
+            user_id = getattr(source, "user_id", None)
+            if scope_id:
+                metadata = dict(metadata or {})
+                metadata["scope_id"] = str(scope_id)
+            if user_id:
+                metadata = dict(metadata or {})
+                metadata["user_id"] = str(user_id)
         return metadata
 
     def _thread_metadata_for_target(

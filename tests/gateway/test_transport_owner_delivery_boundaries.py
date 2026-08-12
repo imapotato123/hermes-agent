@@ -7,6 +7,7 @@ the legacy passed/default-adapter behavior.
 
 import asyncio
 import threading
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -35,6 +36,7 @@ def _source(*, stamped: bool = True, profile: str | None = "coder") -> SessionSo
     )
     if stamped:
         source._transport_profile = profile
+        source._transport_platform = Platform.SLACK
     return source
 
 
@@ -52,6 +54,26 @@ def _adapter(name: str):
     )
 
 
+class _RetryBoundaryAdapter(BasePlatformAdapter):
+    def __init__(self, name: str):
+        super().__init__(PlatformConfig(enabled=True, token="t"), Platform.SLACK)
+        self._name = name
+        self.physical_sends = 0
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.physical_sends += 1
+        return SendResult(success=True)
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
 def _runner(*, primary=None, coder=None) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.SLACK: primary} if primary is not None else {}
@@ -64,6 +86,95 @@ def _runner(*, primary=None, coder=None) -> GatewayRunner:
         lambda source, anchor=None: {"thread_id": source.thread_id}
     )
     return runner
+
+
+def test_registered_owner_uses_physical_transport_platform():
+    runner = object.__new__(GatewayRunner)
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        fronts_platform=MagicMock(return_value=True),
+        matches_transport_identity=MagicMock(return_value=True),
+        prime_routing_source=MagicMock(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+    setattr(source, "_transport_identity", "discord:app-1")
+
+    assert runner._adapter_for_source(source) is relay
+    relay.prime_routing_source.assert_called_once_with(source)
+
+
+def test_relay_registration_keeps_profile_independent_owner_identity():
+    runner = object.__new__(GatewayRunner)
+    runner._backend_notice_state = None
+    runner._active_profile_name = lambda: "main"
+    relay = SimpleNamespace(platform=Platform.RELAY)
+
+    runner._share_backend_notice_state(relay)
+
+    assert relay._transport_profile is None
+
+
+def test_relay_replacement_primes_routing_from_inflight_source():
+    runner = object.__new__(GatewayRunner)
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        fronts_platform=MagicMock(return_value=True),
+        prime_routing_source=MagicMock(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+
+    assert runner._adapter_for_source(source) is relay
+    relay.prime_routing_source.assert_called_once_with(source)
+
+
+def test_restored_primary_source_routes_to_primary_not_runtime_profile():
+    primary = _adapter("primary")
+    runtime = _adapter("runtime")
+    runner = _runner(primary=primary, coder=runtime)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        profile="coder",
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.SLACK
+    restored = SessionSource.from_dict(source.to_dict())
+
+    assert runner._adapter_for_source(restored) is primary
+
+
+def test_restored_missing_owner_fails_closed_not_runtime_fallback():
+    primary = _adapter("primary")
+    runner = _runner(primary=primary)
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        profile="coder",
+    )
+    source._transport_profile = "missing"
+    source._transport_platform = Platform.SLACK
+    restored = SessionSource.from_dict(source.to_dict())
+
+    assert runner._adapter_for_source(restored) is None
 
 
 @pytest.mark.asyncio
@@ -507,7 +618,7 @@ def test_ledger_persists_stamped_transport_owner(isolated_ledger):
     _orphan("owner-row")
 
     rows = dl.sweep_recoverable(
-        deliverable_routes={("slack", True, "coder")}
+        deliverable_routes={("slack", True, "coder", None)}
     )
 
     assert rows[0]["transport_profile"] == "coder"
@@ -597,6 +708,49 @@ async def test_recovery_route_disappearing_after_claim_releases_budget(
     assert owner_pid is None
 
 
+@pytest.mark.asyncio
+async def test_recovery_owner_disappearing_immediately_before_send_releases_budget(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="pre-send-vanished-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_platform="slack",
+        transport_profile="coder",
+        transport_profile_stamped=True,
+    )
+    _orphan("pre-send-vanished-row")
+    replacement = _adapter("replacement")
+    runner = _runner(coder=replacement)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+    calls = 0
+
+    def resolve_then_vanish(_source):
+        nonlocal calls
+        calls += 1
+        return replacement if calls == 1 else None
+
+    monkeypatch.setattr(runner, "_adapter_for_source", resolve_then_vanish)
+
+    assert await runner._redeliver_pending_obligations() == 0
+    replacement.send.assert_not_awaited()
+    with dl._connect() as conn:
+        row = conn.execute(
+            "SELECT attempts, owner_pid, owner_started_at "
+            "FROM delivery_obligations WHERE obligation_id=?",
+            ("pre-send-vanished-row",),
+        ).fetchone()
+    assert row == (0, None, None)
+
+
 def test_release_claim_rejects_foreign_owner(isolated_ledger):
     dl.record_obligation(
         obligation_id="foreign-row",
@@ -620,3 +774,198 @@ def test_release_claim_rejects_foreign_owner(isolated_ledger):
         ).fetchone()
     assert attempts == 2
     assert owner_pid == 999999999
+
+
+@pytest.mark.asyncio
+async def test_recovery_relay_owner_never_uses_same_platform_native_adapter(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="relay-row",
+        session_key="agent:main:discord:channel:C1",
+        platform="discord",
+        chat_id="C1",
+        thread_id=None,
+        content="relay private answer",
+        transport_platform="relay",
+        transport_profile=None,
+        transport_profile_stamped=True,
+        transport_identity="discord:app-1",
+        route_scope_id="guild-1",
+        route_user_id="user-1",
+        route_chat_type="channel",
+    )
+    _orphan("relay-row")
+
+    native = SimpleNamespace(platform=Platform.DISCORD, send=AsyncMock())
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        _transport_profile=None,
+        fronts_platform=MagicMock(return_value=True),
+        acknowledged_transport_identities=MagicMock(
+            return_value=("discord:app-1",)
+        ),
+        matches_transport_identity=MagicMock(return_value=True),
+        send=AsyncMock(),
+        prime_routing_source=MagicMock(),
+    )
+    relay.send.return_value = SendResult(success=True)
+    runner = _runner(primary=native)
+    runner.adapters[Platform.RELAY] = relay
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    relay.send.assert_awaited_once()
+    primed_source = relay.prime_routing_source.call_args.args[0]
+    assert primed_source.platform == Platform.DISCORD
+    assert primed_source.scope_id == "guild-1"
+    assert primed_source.user_id == "user-1"
+    assert primed_source.chat_type == "channel"
+    native.send.assert_not_awaited()
+
+
+def test_live_delivery_operation_accepts_relay_owner_for_underlying_platform():
+    stale = _adapter("native")
+    relay = _adapter("relay")
+    relay.platform = Platform.RELAY
+    relay.fronts_platform = MagicMock(return_value=True)
+    relay.matches_transport_identity = MagicMock(return_value=True)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+    setattr(source, "_transport_identity", "discord:app-1")
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+
+    selected, send = runner._live_delivery_operation(source, stale, "send")
+
+    assert selected is relay
+    assert send == relay.send
+
+
+def test_relay_owner_not_fronting_logical_platform_fails_closed():
+    relay = _adapter("relay")
+    relay.platform = Platform.RELAY
+    relay.fronts_platform = MagicMock(return_value=False)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+
+    assert runner._adapter_for_source(source) is None
+
+
+def test_restored_relay_owner_with_different_bot_identity_fails_closed():
+    relay = _adapter("relay")
+    relay.platform = Platform.RELAY
+    relay.fronts_platform = MagicMock(return_value=True)
+    relay.transport_identity_for_platform = MagicMock(
+        return_value="discord:replacement-app"
+    )
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+    source._transport_identity = "discord:original-app"
+    restored = SessionSource.from_dict(source.to_dict())
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+
+    assert runner._adapter_for_source(restored) is None
+
+
+def test_live_relay_source_with_different_replacement_identity_fails_closed():
+    relay = _adapter("relay")
+    relay.platform = Platform.RELAY
+    relay.fronts_platform = MagicMock(return_value=True)
+    relay.matches_transport_identity = MagicMock(return_value=False)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        delivered_via_upstream_relay=True,
+    )
+    setattr(source, "_transport_profile", None)
+    setattr(source, "_transport_platform", Platform.RELAY)
+    setattr(source, "_transport_identity", "discord:original-app")
+    runner = object.__new__(GatewayRunner)
+    setattr(runner, "adapters", {Platform.RELAY: relay})
+    runner._profile_adapters = {}
+
+    assert runner._adapter_for_source(source) is None
+
+
+@pytest.mark.asyncio
+async def test_send_retry_re_resolves_stamped_owner_between_attempts(monkeypatch):
+    stale = _RetryBoundaryAdapter("stale")
+    replacement = _RetryBoundaryAdapter("replacement")
+    runner = _runner(coder=stale)
+    runner._share_backend_notice_state(stale, profile_name="coder")
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    source = stale.build_source(chat_id="C1")
+
+    async def stale_failure(**_kwargs):
+        runner._profile_adapters["coder"][Platform.SLACK] = replacement
+        stale.physical_sends += 1
+        return SendResult(success=False, error="network down", retryable=True)
+
+    stale.send = stale_failure
+    replacement.send = AsyncMock(return_value=SendResult(success=True))
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", no_sleep)
+    result = await stale._send_with_retry(
+        chat_id="C1",
+        content="private answer",
+        max_retries=1,
+        base_delay=0,
+        source=source,
+    )
+
+    assert result.success is True
+    assert stale.physical_sends == 1
+    replacement.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unknown_logical_platform_releases_claim_without_spending_budget(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="future-platform-row",
+        session_key="agent:main:future:channel:C1",
+        platform="future-platform",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_platform="slack",
+        transport_profile=None,
+        transport_profile_stamped=True,
+    )
+    _orphan("future-platform-row")
+    primary = _adapter("primary")
+    primary._transport_profile = None
+    runner = _runner(primary=primary)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 0
+    with dl._connect() as conn:
+        state, attempts, owner_pid = conn.execute(
+            "SELECT state, attempts, owner_pid FROM delivery_obligations "
+            "WHERE obligation_id='future-platform-row'"
+        ).fetchone()
+    assert state == "pending"
+    assert attempts == 0
+    assert owner_pid is None

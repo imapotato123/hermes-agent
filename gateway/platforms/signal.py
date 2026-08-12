@@ -1211,6 +1211,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
 
         attachments: List[str] = []
+        valid_images: List[Tuple[str, str]] = []
         skipped_download = 0
         skipped_missing = 0
         skipped_oversize = 0
@@ -1239,6 +1240,7 @@ class SignalAdapter(BasePlatformAdapter):
                 continue
 
             attachments.append(file_path)
+            valid_images.append((image_url, _alt_text))
 
         if not attachments:
             logger.error(
@@ -1280,7 +1282,7 @@ class SignalAdapter(BasePlatformAdapter):
             if await self._handoff_image_batch_if_replaced(
                 source=source,
                 chat_id=chat_id,
-                images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                images=valid_images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
                 metadata=metadata,
                 human_delay=human_delay,
             ):
@@ -1295,7 +1297,7 @@ class SignalAdapter(BasePlatformAdapter):
                 if await self._handoff_image_batch_if_replaced(
                     source=source,
                     chat_id=chat_id,
-                    images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                    images=valid_images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
                     metadata=metadata,
                     human_delay=human_delay,
                 ):
@@ -1312,7 +1314,7 @@ class SignalAdapter(BasePlatformAdapter):
                 if await self._handoff_image_batch_if_replaced(
                     source=source,
                     chat_id=chat_id,
-                    images=images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
+                    images=valid_images[idx * SIGNAL_MAX_ATTACHMENTS_PER_MSG :],
                     metadata=metadata,
                     human_delay=human_delay,
                 ):
@@ -1328,6 +1330,16 @@ class SignalAdapter(BasePlatformAdapter):
                         if success:
                             self._track_sent_timestamp(result)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
+                            if await self._handoff_image_batch_if_replaced(
+                                source=source,
+                                chat_id=chat_id,
+                                images=valid_images[
+                                    (idx + 1) * SIGNAL_MAX_ATTACHMENTS_PER_MSG :
+                                ],
+                                metadata=metadata,
+                                human_delay=human_delay,
+                            ):
+                                return
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
                                 "(attempt %d/%d)",

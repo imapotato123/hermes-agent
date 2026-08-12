@@ -14,6 +14,7 @@ The stub:
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from dataclasses import replace
 
 from gateway.platforms.base import MessageEvent
 from gateway.relay.descriptor import CapabilityDescriptor
@@ -61,6 +62,11 @@ class StubConnector:
 
     async def handshake(self) -> CapabilityDescriptor:
         return self._descriptor
+
+    def descriptor_for_platform(self, platform: str) -> Optional[CapabilityDescriptor]:
+        if any(p == platform for p, _ in self._identities):
+            return replace(self._descriptor, platform=platform)
+        return None
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         self._inbound = handler

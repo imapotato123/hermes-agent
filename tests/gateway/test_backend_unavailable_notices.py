@@ -1337,6 +1337,7 @@ async def test_reconnect_after_text_uses_latest_adapter_for_attachment(
     )
 
     async def send_text_then_reconnect(*args, **kwargs):
+        kwargs.pop("source", None)
         result = await initial_replacement.send(*args, **kwargs)
         runner._profile_adapters["coder"][Platform.SLACK] = latest_replacement
         return result

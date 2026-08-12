@@ -356,7 +356,9 @@ async def test_status_command_bypasses_active_session_guard():
 
     sent = []
 
-    async def fake_send_with_retry(chat_id, content, reply_to=None, metadata=None):
+    async def fake_send_with_retry(
+        chat_id, content, reply_to=None, metadata=None, source=None
+    ):
         sent.append(content)
 
     adapter._send_with_retry = fake_send_with_retry

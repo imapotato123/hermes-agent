@@ -166,6 +166,110 @@ class TestRunBackgroundTask:
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_reconnect_during_agent_run_delivers_only_through_replacement(self):
+        runner = _make_runner()
+        stale = MagicMock()
+        stale.platform = Platform.TELEGRAM
+        stale.send = AsyncMock()
+        stale.extract_media = MagicMock(return_value=([], "done"))
+        stale.extract_images = MagicMock(return_value=([], "done"))
+        replacement = MagicMock()
+        replacement.platform = Platform.TELEGRAM
+        replacement.send = AsyncMock()
+        replacement.extract_media = stale.extract_media
+        replacement.extract_images = stale.extract_images
+        runner.adapters[Platform.TELEGRAM] = stale
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.TELEGRAM
+
+        def run_and_replace(*_args, **_kwargs):
+            runner.adapters[Platform.TELEGRAM] = replacement
+            return {"final_response": "done", "messages": []}
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.side_effect = run_and_replace
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        stale.send.assert_not_awaited()
+        replacement.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_structured_background_outage_never_exposes_raw_error(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.send = AsyncMock()
+        adapter.extract_media = MagicMock(return_value=([], ""))
+        adapter.extract_images = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.TELEGRAM
+        raw = "provider https://secret.invalid/v1 overloaded"
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = {
+                "failed": True,
+                "failure_reason": "server_error",
+                "final_response": "",
+                "error": raw,
+            }
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        adapter.send.assert_awaited_once()
+        content = adapter.send.await_args.kwargs["content"]
+        assert "temporarily unavailable" in content
+        assert raw not in content
+
+    @pytest.mark.asyncio
+    async def test_failed_outage_notice_does_not_send_ordinary_failure_fallback(self):
+        runner = _make_runner()
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.send = AsyncMock(side_effect=RuntimeError("transport down"))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._profile_adapters = {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.TELEGRAM
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = {
+                "failed": True,
+                "failure_reason": "server_error",
+                "final_response": "",
+                "error": "raw provider detail",
+            }
+            mock_agent.return_value = instance
+            await runner._run_background_task("prompt", source, "bg_test")
+
+        assert adapter.send.await_count == 1
+        assert "temporarily unavailable" in adapter.send.await_args.kwargs["content"]
+
 
 # ---------------------------------------------------------------------------
 # /background in help and known_commands

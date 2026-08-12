@@ -107,8 +107,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
+            transport_platform TEXT,
             transport_profile TEXT,
             transport_profile_stamped INTEGER NOT NULL DEFAULT 0,
+            transport_identity TEXT,
+            route_scope_id TEXT,
+            route_user_id TEXT,
+            route_chat_type TEXT,
             last_error TEXT
         )"""
     )
@@ -123,11 +128,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE delivery_obligations ADD COLUMN transport_profile TEXT"
         )
+    if "transport_platform" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN transport_platform TEXT"
+        )
     if "transport_profile_stamped" not in columns:
         conn.execute(
             "ALTER TABLE delivery_obligations ADD COLUMN "
             "transport_profile_stamped INTEGER NOT NULL DEFAULT 0"
         )
+    if "transport_identity" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN transport_identity TEXT"
+        )
+    for column in ("route_scope_id", "route_user_id", "route_chat_type"):
+        if column not in columns:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {column} TEXT"
+            )
 
 
 @contextmanager
@@ -199,15 +217,22 @@ def compute_obligation_id(
     message_ref: str,
     content: str,
     *,
+    transport_platform: Optional[str] = None,
     transport_profile: Optional[str] = None,
     transport_profile_stamped: bool = False,
+    transport_identity: Optional[str] = None,
+    route_scope_id: Optional[str] = None,
+    route_user_id: Optional[str] = None,
 ) -> str:
     """Stable id for one turn, payload, and transport credential owner."""
     payload = f"{session_key}|{message_ref}|{content}"
     if transport_profile_stamped:
         payload = (
             f"{session_key}|{message_ref}|"
-            f"stamped:{transport_profile or ''}|{content}"
+            f"stamped:{transport_platform or ''}:"
+            f"{transport_profile or ''}:"
+            f"{transport_identity or ''}:"
+            f"{route_scope_id or ''}:{route_user_id or ''}|{content}"
         )
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
@@ -220,8 +245,13 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    transport_platform: Optional[str] = None,
     transport_profile: Optional[str] = None,
     transport_profile_stamped: bool = False,
+    transport_identity: Optional[str] = None,
+    route_scope_id: Optional[str] = None,
+    route_user_id: Optional[str] = None,
+    route_chat_type: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to one transport owner."""
     now = time.time()
@@ -231,9 +261,10 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, transport_profile,
-                transport_profile_stamped)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, transport_platform, transport_profile,
+                transport_profile_stamped, transport_identity, route_scope_id,
+                route_user_id, route_chat_type)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 obligation_id,
                 session_key,
@@ -245,8 +276,13 @@ def record_obligation(
                 now,
                 pid,
                 started,
+                transport_platform,
                 transport_profile,
                 1 if transport_profile_stamped else 0,
+                transport_identity,
+                route_scope_id,
+                route_user_id,
+                route_chat_type,
             ),
         )
     _prune()
@@ -329,7 +365,9 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      transport_profile, transport_profile_stamped,
+                      transport_platform, transport_profile,
+                      transport_profile_stamped, transport_identity,
+                      route_scope_id, route_user_id, route_chat_type,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
@@ -344,8 +382,13 @@ def sweep_recoverable(
             state,
             attempts,
             created_at,
+            transport_platform,
             transport_profile,
             transport_profile_stamped,
+            transport_identity,
+            route_scope_id,
+            route_user_id,
+            route_chat_type,
             owner_pid,
             owner_started_at,
         ) in rows:
@@ -366,9 +409,12 @@ def sweep_recoverable(
                 # send, so claiming would spend an attempt on a no-op.
                 continue
             route = (
-                platform,
+                (transport_platform or platform)
+                if transport_profile_stamped
+                else platform,
                 bool(transport_profile_stamped),
                 transport_profile if transport_profile_stamped else None,
+                transport_identity if transport_profile_stamped else None,
             )
             if deliverable_routes is not None and route not in deliverable_routes:
                 # A different profile on the same platform is not a valid
@@ -389,10 +435,15 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
+                    "transport_platform": transport_platform,
                     "transport_profile": transport_profile,
                     "transport_profile_stamped": bool(
                         transport_profile_stamped
                     ),
+                    "transport_identity": transport_identity,
+                    "route_scope_id": route_scope_id,
+                    "route_user_id": route_user_id,
+                    "route_chat_type": route_chat_type,
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
