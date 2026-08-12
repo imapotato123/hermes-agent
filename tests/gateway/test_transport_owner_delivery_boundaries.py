@@ -533,7 +533,7 @@ async def test_recovery_missing_secondary_owner_never_uses_primary(isolated_ledg
     store = MagicMock()
     store.clear_resume_pending = AsyncMock()
     store._store = None
-    runner.session_store = None
+    setattr(runner, "session_store", None)
     runner._async_session_store = store
 
     assert await runner._redeliver_pending_obligations() == 0
@@ -545,3 +545,78 @@ async def test_recovery_missing_secondary_owner_never_uses_primary(isolated_ledg
         ).fetchone()
     assert state == "pending"
     assert attempts == 0
+    store.clear_resume_pending.assert_awaited_once_with(
+        "agent:main:slack:channel:C1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_route_disappearing_after_claim_releases_budget(
+    isolated_ledger, monkeypatch
+):
+    dl.record_obligation(
+        obligation_id="vanished-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+        transport_profile="coder",
+        transport_profile_stamped=True,
+    )
+    _orphan("vanished-row")
+
+    primary = _adapter("primary")
+    coder = _adapter("coder")
+    runner = _runner(primary=primary, coder=coder)
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    real_sweep = dl.sweep_recoverable
+
+    def sweep_then_disconnect(*args, **kwargs):
+        rows = real_sweep(*args, **kwargs)
+        runner._profile_adapters = {}
+        return rows
+
+    monkeypatch.setattr(dl, "sweep_recoverable", sweep_then_disconnect)
+
+    assert await runner._redeliver_pending_obligations() == 0
+    primary.send.assert_not_awaited()
+    coder.send.assert_not_awaited()
+    with dl._connect() as conn:
+        state, attempts, owner_pid = conn.execute(
+            "SELECT state, attempts, owner_pid FROM delivery_obligations "
+            "WHERE obligation_id='vanished-row'"
+        ).fetchone()
+    assert state == "pending"
+    assert attempts == 0
+    assert owner_pid is None
+
+
+def test_release_claim_rejects_foreign_owner(isolated_ledger):
+    dl.record_obligation(
+        obligation_id="foreign-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="private answer",
+    )
+    with dl._connect() as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET owner_pid=999999999, "
+            "owner_started_at=1, attempts=2 WHERE obligation_id='foreign-row'"
+        )
+
+    assert dl.release_claim("foreign-row") is False
+    with dl._connect() as conn:
+        attempts, owner_pid = conn.execute(
+            "SELECT attempts, owner_pid FROM delivery_obligations "
+            "WHERE obligation_id='foreign-row'"
+        ).fetchone()
+    assert attempts == 2
+    assert owner_pid == 999999999

@@ -264,6 +264,32 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def undelivered_session_keys() -> set[str]:
+    """Return sessions whose completed answer is still durably owed."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT session_key FROM delivery_obligations
+               WHERE state IN ('pending', 'attempting', 'failed')"""
+        ).fetchall()
+    return {str(row[0]) for row in rows if row and row[0]}
+
+
+def release_claim(obligation_id: str) -> bool:
+    """Release this process's recovery claim without spending an attempt."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=NULL, owner_started_at=NULL,
+                   attempts=CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   updated_at=?
+               WHERE obligation_id=? AND owner_pid=?
+                 AND (owner_started_at IS ? OR owner_started_at=?)""",
+            (time.time(), obligation_id, pid, started, started),
+        )
+    return bool(cursor.rowcount)
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(

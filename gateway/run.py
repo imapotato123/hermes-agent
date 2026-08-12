@@ -10788,11 +10788,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                release_claim,
                 sweep_recoverable,
+                undelivered_session_keys,
             )
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
+            # A ledger row means the turn already produced its answer. Clear
+            # resume_pending even when the exact transport owner is currently
+            # unavailable, otherwise startup can regenerate the completed turn
+            # through a different runtime/credential while delivery is owed.
+            owed_session_keys = await asyncio.to_thread(
+                undelivered_session_keys
+            )
+            for session_key in owed_session_keys:
+                try:
+                    await self.async_session_store.clear_resume_pending(
+                        session_key
+                    )
+                except Exception:
+                    logger.debug(
+                        "clear_resume_pending failed for owed session %s",
+                        session_key,
+                        exc_info=True,
+                    )
             # Claim only rows whose exact transport credential is connected.
             # Legacy rows have no owner stamp and retain the historical primary
             # route. A same-platform adapter owned by another profile is never
@@ -10856,7 +10876,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 adapter = self.adapters.get(platform)
             if adapter is None:
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # The route existed at claim time but vanished before delivery.
+                # Fail closed and restore the recovery budget for a later boot.
+                try:
+                    await asyncio.to_thread(
+                        release_claim, row["obligation_id"]
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -10895,17 +10926,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
 
-            # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
-            session_key = row.get("session_key") or ""
-            if session_key:
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception:
-                    logger.debug(
-                        "clear_resume_pending failed for %s", session_key,
-                        exc_info=True,
-                    )
+            # The answer reached (or was owed to) this session. Its resume
+            # marker was cleared before sweeping, including for unavailable
+            # owners, so there is nothing further to do here.
         return redelivered
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
