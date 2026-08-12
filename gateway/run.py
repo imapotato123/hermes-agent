@@ -11041,8 +11041,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
-            adapter = self._adapter_for_source(source)
+            # SessionSource transport provenance is intentionally runtime-only.
+            # Startup recovery must therefore rebuild a clean source from the
+            # private durable owner fields captured by mark_turn_active(). A
+            # routed runtime profile alone never nominates a physical bot.
+            if getattr(entry, "transport_owner_stamped", False) is True:
+                try:
+                    transport_platform = Platform(entry.transport_platform)
+                    source = SessionSource.from_dict(entry.origin.to_dict())
+                except Exception:
+                    logger.debug(
+                        "Skipping auto-resume for %s: invalid durable transport owner",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                    continue
+                if transport_platform == Platform.RELAY:
+                    source.delivered_via_upstream_relay = True
+                    adapter = self.adapters.get(Platform.RELAY)
+                else:
+                    if transport_platform != source.platform:
+                        logger.warning(
+                            "Skipping auto-resume for %s: transport platform %s "
+                            "does not match logical origin %s",
+                            entry.session_key,
+                            transport_platform.value,
+                            getattr(source.platform, "value", source.platform),
+                        )
+                        continue
+                    stamp_source_transport_owner(
+                        source,
+                        profile=entry.transport_profile,
+                    )
+                    adapter = self._adapter_for_source(source)
+                    if adapter is not None:
+                        stamp_source_transport_owner(
+                            source,
+                            profile=entry.transport_profile,
+                            adapter_ref=_weakref.ref(adapter),
+                        )
+            elif source_has_transport_owner(entry.origin) or getattr(
+                entry.origin, "delivered_via_upstream_relay", False
+            ) is True:
+                # Same-process fixtures/reconnects can retain the explicit stamp
+                # on the in-memory origin. A fresh routing-index load cannot enter
+                # this branch because SessionSource restoration drops both trust
+                # signals. Copy before use so the canonical entry is not mutated.
+                source = dataclasses.replace(entry.origin)
+                adapter = self._adapter_for_source(source)
+            else:
+                logger.debug(
+                    "Skipping auto-resume for %s: transport owner is unknown",
+                    entry.session_key,
+                )
+                continue
             if adapter is None:
                 logger.debug(
                     "Skipping auto-resume for %s: adapter not ready for %s",
@@ -17084,7 +17136,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                source=getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -20243,26 +20298,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _live_delivery_operation(
         self,
         source: SessionSource,
-        fallback_adapter: Any,
         operation: str,
     ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
-        """Resolve one current transport operation, preserving legacy sources.
+        """Resolve one operation through the source's physical transport owner.
 
-        Explicit owner stamps are authoritative and fail closed. Hand-built or
-        restored legacy sources without a stamp retain the historical captured
-        adapter fallback. Operations are duck-typed for plugin compatibility.
+        Explicit owner stamps are authoritative. Hand-built/restored sources
+        without one fail closed; a captured adapter is only a reconnect fallback
+        for an already-stamped owner. Operations remain duck-typed for plugins.
         """
         stamped = source_has_transport_owner(source)
         if not stamped:
-            adapter = fallback_adapter
-        else:
-            try:
-                adapter = self._adapter_for_source(source)
-            except Exception:
-                adapter = None
+            return None, None
+        try:
+            adapter = self._adapter_for_source(source)
+        except Exception:
+            adapter = None
+        # The source's explicit owner stamp is authoritative. A stale/dead
+        # weakref may be recovered only through the current owner registry in
+        # ``_adapter_for_source``; never resurrect a captured adapter merely
+        # because its platform still matches.
         if adapter is None:
             return None, None
-        if stamped and getattr(adapter, "platform", None) != source.platform:
+        if getattr(adapter, "platform", None) != source.platform:
             return None, None
         method = getattr(adapter, operation, None)
         if not callable(method):
@@ -20340,8 +20397,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            fallback_adapter = self._adapter_for_source(event.source)
-
             # If connected to a voice channel, play there instead of sending a file.
             # Re-evaluate this policy and operation for each generated file because
             # reconnect can replace the credential while an earlier send awaits.
@@ -20356,7 +20411,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for actual_path in actual_paths:
                 adapter, play_in_voice_channel = self._live_delivery_operation(
                     event.source,
-                    fallback_adapter,
                     "play_in_voice_channel",
                 )
                 is_in_voice_channel = getattr(
@@ -20375,7 +20429,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _, send_voice = self._live_delivery_operation(
                     event.source,
-                    fallback_adapter,
                     "send_voice",
                 )
                 if not callable(send_voice):
@@ -20486,7 +20539,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     live_adapter, image_send = GatewayRunner._live_delivery_operation(
                         self,
                         event.source,
-                        adapter,
                         "send_multiple_images",
                     )
                     if not callable(image_send):
@@ -20535,7 +20587,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     live_adapter, media_send = GatewayRunner._live_delivery_operation(
                         self,
                         event.source,
-                        adapter,
                         method_name,
                     )
                     if not callable(media_send):
@@ -20574,7 +20625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
                 _, send = self._live_delivery_operation(
-                    source, adapter, "send"
+                    source, "send"
                 )
                 if not callable(send):
                     logger.warning(

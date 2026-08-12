@@ -23,7 +23,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, stamp_source_transport_owner
 
 
 class _DrainProbeAdapter(BasePlatformAdapter):
@@ -62,13 +62,16 @@ class _DrainProbeAdapter(BasePlatformAdapter):
 
 
 def _slack_thread_source() -> SessionSource:
-    return SessionSource(
-        platform=Platform.SLACK,
-        user_id="U1",
-        chat_id="C1",
-        user_name="tester",
-        chat_type="channel",
-        thread_id="1718600000.000100",
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.SLACK,
+            user_id="U1",
+            chat_id="C1",
+            user_name="tester",
+            chat_type="channel",
+            thread_id="1718600000.000100",
+        ),
+        profile=None,
     )
 
 

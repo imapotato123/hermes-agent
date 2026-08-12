@@ -18,7 +18,11 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 class _MediaRoutingAdapter(BasePlatformAdapter):
@@ -45,6 +49,7 @@ def _event(thread_id=None):
         chat_type="dm",
         thread_id=thread_id,
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(
         text="make speech",
         message_type=MessageType.TEXT,
@@ -222,6 +227,10 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -241,6 +250,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata={"thread_id": "topic-1"},
+        source=event.source,
     )
 
 
@@ -272,6 +282,10 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -291,6 +305,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata=routing_metadata,
+        source=event.source,
     )
 
 
@@ -312,6 +327,10 @@ async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     response = "See this mockup\nhttps://example.com/mockup.png"
     await GatewayRunner._deliver_queued_first_response(
@@ -355,6 +374,10 @@ async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     response = f"The inspected file is at {media_file}."
     await GatewayRunner._deliver_queued_first_response(
@@ -394,6 +417,10 @@ async def test_queued_followup_delivery_preserves_protected_media_example():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     response = "Tag files like `MEDIA:/tmp/example.png` in tool output."
     await GatewayRunner._deliver_queued_first_response(
@@ -435,6 +462,10 @@ async def test_queued_followup_delivery_skips_media_when_turn_failed():
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
     )
+    adapter.platform = event.source.platform
+    runner.adapters = {event.source.platform: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     await GatewayRunner._deliver_queued_first_response(
         runner,
@@ -554,6 +585,7 @@ async def test_queued_resend_branch_delivers_media_and_preserves_protected_examp
         chat_type="dm",
         thread_id="topic-1",
     )
+    stamp_source_transport_owner(source, profile=None)
     session_key = build_session_key(source)
     adapter._pending_messages[session_key] = MessageEvent(
         text="queued follow-up",

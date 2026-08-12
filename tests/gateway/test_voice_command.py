@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+import weakref
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -53,6 +54,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.session import stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +62,14 @@ from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 # ---------------------------------------------------------------------------
 
 def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") -> MessageEvent:
+    from gateway.config import Platform
+
     source = SessionSource(
         chat_id=chat_id,
         user_id="user1",
-        platform=MagicMock(),
+        platform=Platform.TELEGRAM,
     )
-    source.platform.value = "telegram"
+    stamp_source_transport_owner(source, profile=None)
     source.thread_id = None
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
@@ -173,9 +177,11 @@ class TestHandleVoiceCommand:
     @pytest.mark.asyncio
     async def test_platform_isolation(self, runner):
         """Same chat_id on different platforms must not collide (#12542)."""
+        from gateway.config import Platform
+
         telegram_event = _make_event("/voice on", chat_id="999")
         slack_event = _make_event("/voice off", chat_id="999")
-        slack_event.source.platform.value = "slack"
+        slack_event.source.platform = Platform.SLACK
 
         await runner._handle_voice_command(telegram_event)
         await runner._handle_voice_command(slack_event)
@@ -300,10 +306,12 @@ class TestSendVoiceReply:
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send_voice = AsyncMock()
         event = _make_event()
         event.source.platform = Platform.TELEGRAM
         runner.adapters[event.source.platform] = mock_adapter
+        event.source._transport_adapter_ref = weakref.ref(mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -325,6 +333,7 @@ class TestSendVoiceReply:
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()
+        mock_adapter.platform = Platform.TELEGRAM
         mock_adapter.send_voice = AsyncMock()
         event = _make_event()
         event.source.platform = Platform.TELEGRAM
@@ -332,6 +341,7 @@ class TestSendVoiceReply:
         event.source.thread_id = "20197"
         event.message_id = "462"
         runner.adapters[event.source.platform] = mock_adapter
+        event.source._transport_adapter_ref = weakref.ref(mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -535,12 +545,14 @@ class TestVoiceChannelCommands:
     def _make_discord_event(self, text="/voice channel", chat_id="123",
                             guild_id=111, user_id="user1"):
         """Create event with raw_message carrying guild info."""
+        from gateway.config import Platform
+
         source = SessionSource(
             chat_id=chat_id,
             user_id=user_id,
-            platform=MagicMock(),
+            platform=Platform.DISCORD,
         )
-        source.platform.value = "discord"
+        stamp_source_transport_owner(source, profile=None)
         source.thread_id = None
         event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
         event.message_id = "msg42"

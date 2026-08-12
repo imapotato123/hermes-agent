@@ -1,8 +1,8 @@
 """Transport-owner authority at runner and durable-delivery boundaries.
 
 Every new user-visible operation must resolve the live adapter that owns the
-inbound source. Explicitly stamped owners fail closed; unstamped sources keep
-the legacy passed/default-adapter behavior.
+inbound source. Explicitly stamped owners route to their current generation;
+unstamped and otherwise unresolvable sources fail closed.
 """
 
 import asyncio
@@ -88,10 +88,12 @@ async def test_queued_text_missing_stamped_owner_fails_closed():
     stale = _adapter("stale")
     primary = _adapter("primary")
     runner = _runner(primary=primary)
+    source = _source()
+    source._transport_adapter_ref = lambda: stale
 
     await runner._deliver_queued_first_response(
         "private answer",
-        _source(),
+        source,
         stale,
         deliver_media=False,
     )
@@ -101,7 +103,7 @@ async def test_queued_text_missing_stamped_owner_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
+async def test_queued_unstamped_source_fails_closed():
     legacy = _adapter("legacy")
     runner = _runner()
 
@@ -112,7 +114,7 @@ async def test_queued_unstamped_source_keeps_legacy_adapter_compatibility():
         deliver_media=False,
     )
 
-    legacy.send.assert_awaited_once()
+    legacy.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

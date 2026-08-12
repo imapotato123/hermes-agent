@@ -30,6 +30,7 @@ from gateway.platforms.base import (
     Platform,
     SessionSource,
     build_session_key,
+    stamp_source_transport_owner,
 )
 
 
@@ -45,6 +46,7 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram"):
         chat_type="private",
         user_id="user1",
     )
+    stamp_source_transport_owner(source, profile=None)
     evt = MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
@@ -117,6 +119,7 @@ class TestBusySessionAck:
             chat_type="dm",
             user_id="user1",
         )
+        stamp_source_transport_owner(source, profile=None)
         sk = build_session_key(source)
         runner.adapters[source.platform] = adapter
 
@@ -339,6 +342,7 @@ class TestBusySessionAck:
                 platform=shared_platform, chat_id="123",
                 chat_type="dm", user_id="user1",
             )
+            stamp_source_transport_owner(src, profile=None)
             return MessageEvent(text=text, message_type=MessageType.TEXT,
                                 source=src, message_id=f"m-{text[:5]}")
 

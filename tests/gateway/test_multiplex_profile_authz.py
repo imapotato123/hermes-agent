@@ -56,7 +56,7 @@ def _make_multiplex_runner(monkeypatch):
 
 
 def test_default_profile_still_trusts_own_allowlist(monkeypatch):
-    """Default-profile allowlist trust is unchanged when profile is unstamped."""
+    """A stamped unnamed/default owner keeps the primary allowlist policy."""
     runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
 
     source = SessionSource(
@@ -67,6 +67,7 @@ def test_default_profile_still_trusts_own_allowlist(monkeypatch):
         chat_type="dm",
         profile=None,
     )
+    stamp_source_transport_owner(source, profile=None)
 
     assert runner._is_user_authorized(source) is True
 
@@ -211,8 +212,8 @@ def test_missing_stamped_transport_pairing_store_fails_closed(monkeypatch):
     runner.pairing_store.is_approved.assert_not_called()
 
 
-def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
-    """Hand-built/restored sources retain the historical profile lookup."""
+def test_unstamped_routed_source_cannot_borrow_runtime_pairing(monkeypatch):
+    """Ownerless restored/hand-built sources cannot borrow routed credentials."""
     runner, _active_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
     runner = cast(Any, runner)
     routed_store = MagicMock()
@@ -227,14 +228,15 @@ def test_unstamped_legacy_pairing_keeps_runtime_profile_fallback(monkeypatch):
         profile="routed",
     )
 
-    assert runner._is_user_authorized(source) is True
-    routed_store.is_approved.assert_called_once_with(
-        Platform.WECOM.value, "legacy-routed-user"
-    )
+    assert source_has_transport_owner(source) is False
+    assert runner._adapter_for_source(source) is None
+    assert runner._adapter_profile_for_source(source) is None
+    assert runner._is_user_authorized(source) is False
+    routed_store.is_approved.assert_not_called()
 
 
-def test_restored_named_source_resolves_named_profile_not_default(monkeypatch):
-    """Wire-restored named sources must not collapse onto primary credentials."""
+def test_restored_named_source_withholds_owner_sensitive_resolution(monkeypatch):
+    """A routed runtime name is not proof that its bot received the message."""
     runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
     source = SessionSource.from_dict(
         SessionSource(
@@ -247,9 +249,10 @@ def test_restored_named_source_resolves_named_profile_not_default(monkeypatch):
     )
 
     assert source_has_transport_owner(source) is False
-    assert runner._adapter_for_source(source) is secondary_adapter
+    assert runner._adapter_for_source(source) is None
     assert runner._adapter_for_source(source) is not default_adapter
-    assert runner._adapter_profile_for_source(source) == "coder"
+    assert runner._adapter_for_source(source) is not secondary_adapter
+    assert runner._adapter_profile_for_source(source) is None
 
 
 def test_restored_missing_named_source_fails_closed(monkeypatch):

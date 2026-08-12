@@ -43,7 +43,12 @@ from gateway.run import (
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    source_has_transport_owner,
+)
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -614,6 +619,98 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
     # No slot was claimed and nothing was persisted for the skipped session.
     assert pending_entry.session_key not in runner._running_agents
     runner._persist_active_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_uses_durable_owner_not_routed_runtime():
+    """A persisted alpha-owned/beta-routed turn resumes only through alpha."""
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+
+    runner, active_adapter = make_restart_runner()
+    alpha_adapter = RestartTestAdapter()
+    beta_adapter = RestartTestAdapter()
+    active_adapter.handle_message = AsyncMock()
+    alpha_adapter.handle_message = AsyncMock()
+    beta_adapter.handle_message = AsyncMock()
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {
+        "alpha": {Platform.TELEGRAM: alpha_adapter},
+        "beta": {Platform.TELEGRAM: beta_adapter},
+    }
+
+    source = make_restart_source(chat_id="alpha-owned")
+    source.profile = "beta"
+    pending_entry = SessionEntry(
+        session_key="agent:4:beta:telegram:dm:alpha-owned",
+        session_id="sid-alpha",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    pending_entry.transport_owner_stamped = True
+    pending_entry.transport_platform = Platform.TELEGRAM.value
+    pending_entry.transport_profile = "alpha"
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+
+    authorized_sources = []
+    runner._is_user_authorized = lambda restored: authorized_sources.append(restored) or True
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    alpha_adapter.handle_message.assert_awaited_once()
+    active_adapter.handle_message.assert_not_called()
+    beta_adapter.handle_message.assert_not_called()
+    (restored_source,) = authorized_sources
+    assert restored_source is not source
+    assert restored_source.profile == "beta"
+    assert source_has_transport_owner(restored_source) is True
+    assert restored_source._transport_profile == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_leaves_ownerless_legacy_entry_pending():
+    """Legacy routing metadata cannot nominate the routed runtime's bot."""
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+
+    runner, active_adapter = make_restart_runner()
+    beta_adapter = RestartTestAdapter()
+    active_adapter.handle_message = AsyncMock()
+    beta_adapter.handle_message = AsyncMock()
+    runner._active_profile_name = lambda: "main"
+    runner._profile_adapters = {"beta": {Platform.TELEGRAM: beta_adapter}}
+
+    source = SessionSource.from_dict(
+        make_restart_source(chat_id="legacy-ownerless").to_dict()
+    )
+    source.profile = "beta"
+    pending_entry = SessionEntry(
+        session_key="agent:4:beta:telegram:dm:legacy-ownerless",
+        session_id="sid-legacy",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    assert pending_entry.resume_pending is True
+    active_adapter.handle_message.assert_not_called()
+    beta_adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio
