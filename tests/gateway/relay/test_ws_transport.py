@@ -137,6 +137,87 @@ async def test_inbound_frame_reaches_handler(server):
         await t.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_exact_duplicate_platform_bot_identity_reaches_wire(server):
+    t = WebSocketRelayTransport(
+        server.url,
+        "discord",
+        "appA",
+        identities=[("discord", "appA"), ("discord", "appB")],
+    )
+    await t.connect()
+    try:
+        await t.handshake()
+        result = await t.send_outbound(
+            {
+                "op": "send",
+                "chat_id": "chan1",
+                "content": "owned by B",
+                "metadata": {
+                    "scope_id": "guild1",
+                    "_relay_transport_identity": "discord:appB",
+                },
+            },
+            platform="discord",
+        )
+        assert result["success"] is True
+        frame = [f for f in server.received if f["type"] == "outbound"][-1]
+        assert frame["platform"] == "discord"
+        assert frame["botId"] == "appB"
+        assert frame["action"]["metadata"] == {"scope_id": "guild1"}
+
+        before = len([f for f in server.received if f["type"] == "outbound"])
+        rejected = await t.send_outbound(
+            {"op": "send", "chat_id": "chan1", "content": "ambiguous"},
+            platform="discord",
+        )
+        assert rejected["success"] is False
+        assert "ambiguous" in rejected["error"]
+        assert len([f for f in server.received if f["type"] == "outbound"]) == before
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_platform_inbound_preserves_bot_id(server):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "botId": "appB",
+            "event": {
+                "text": "from B",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "chan1",
+                    "chat_type": "group",
+                    "scope_id": "guildA",
+                },
+            },
+        }
+    ]
+    received = []
+    t = WebSocketRelayTransport(
+        server.url,
+        "discord",
+        "appA",
+        identities=[("discord", "appA"), ("discord", "appB")],
+    )
+    t.set_inbound_handler(lambda ev: received.append(ev) or asyncio.sleep(0))
+    await t.connect()
+    try:
+        await t.handshake()
+        await asyncio.sleep(0.05)
+        assert len(received) >= 1
+        assert all(
+            getattr(ev.source, "_relay_ingress_transport_identity", None)
+            == "discord:appB"
+            for ev in received
+        )
+    finally:
+        await t.disconnect()
+
+
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────
 
 

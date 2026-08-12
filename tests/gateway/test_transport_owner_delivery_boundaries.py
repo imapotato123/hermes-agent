@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway import delivery_ledger as dl
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -144,6 +144,82 @@ def test_relay_replacement_primes_routing_from_inflight_source():
 
     assert runner._adapter_for_source(source) is relay
     relay.prime_routing_source.assert_called_once_with(source)
+
+
+def test_restored_interaction_loses_auth_trust_but_routes_same_relay_identity():
+    replacement = SimpleNamespace(
+        platform=Platform.RELAY,
+        fronts_platform=MagicMock(
+            side_effect=lambda platform: getattr(platform, "value", platform)
+            == "discord"
+        ),
+        matches_transport_identity=MagicMock(
+            side_effect=lambda identity: identity == "discord:app-1"
+        ),
+        prime_routing_source=MagicMock(),
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: replacement}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        delivered_via_upstream_relay=True,
+    )
+    setattr(source, "_transport_profile", None)
+    setattr(source, "_transport_platform", Platform.RELAY)
+    setattr(source, "_transport_identity", "discord:app-1")
+
+    restored = SessionSource.from_dict(source.to_dict())
+
+    assert restored.delivered_via_upstream_relay is False
+    assert runner._adapter_for_source(restored) is replacement
+    replacement.prime_routing_source.assert_called_once_with(restored)
+
+
+def test_relay_replacement_without_platform_advertisement_fails_closed():
+    runner = object.__new__(GatewayRunner)
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        prime_routing_source=MagicMock(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+
+    assert runner._adapter_for_source(source) is None
+    relay.prime_routing_source.assert_not_called()
+
+
+def test_relay_replacement_advertisement_error_fails_closed():
+    runner = object.__new__(GatewayRunner)
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        fronts_platform=MagicMock(side_effect=RuntimeError("relay unavailable")),
+        prime_routing_source=MagicMock(),
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+
+    assert runner._adapter_for_source(source) is None
+    relay.prime_routing_source.assert_not_called()
 
 
 def test_restored_primary_source_routes_to_primary_not_runtime_profile():
@@ -868,12 +944,162 @@ async def test_recovery_relay_owner_never_uses_same_platform_native_adapter(
 
     assert await runner._redeliver_pending_obligations() == 1
     relay.send.assert_awaited_once()
+    assert relay.send.await_args.kwargs["metadata"] == {
+        "thread_id": None,
+        "_relay_logical_platform": "discord",
+        "_relay_transport_identity": "discord:app-1",
+        "scope_id": "guild-1",
+        "user_id": "user-1",
+    }
     primed_source = relay.prime_routing_source.call_args.args[0]
     assert primed_source.platform == Platform.DISCORD
     assert primed_source.scope_id == "guild-1"
     assert primed_source.user_id == "user-1"
     assert primed_source.chat_type == "channel"
     native.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_legacy_unstamped_relay_row_uses_advertised_logical_route(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="legacy-relay-row",
+        session_key="agent:main:discord:channel:C1",
+        platform="discord",
+        chat_id="C1",
+        thread_id=None,
+        content="legacy relay answer",
+        transport_profile_stamped=False,
+        route_scope_id="guild-legacy",
+        route_user_id="user-legacy",
+        route_chat_type="channel",
+    )
+    _orphan("legacy-relay-row")
+
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        _transport_profile=None,
+        fronts_platform=MagicMock(
+            side_effect=lambda platform: getattr(platform, "value", platform)
+            == "discord"
+        ),
+        acknowledged_transport_identities=MagicMock(
+            return_value=("discord:app-legacy",)
+        ),
+        send_for_platform=AsyncMock(
+            return_value=SendResult(success=True, message_id="legacy-delivered")
+        ),
+        send=AsyncMock(),
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "main"
+    runner.config = GatewayConfig(
+        platforms={Platform.RELAY: PlatformConfig(enabled=True)}
+    )
+    runner._thread_metadata_for_source = (
+        GatewayRunner._thread_metadata_for_source.__get__(runner, GatewayRunner)
+    )
+    runner._thread_metadata_for_target = (
+        GatewayRunner._thread_metadata_for_target.__get__(runner, GatewayRunner)
+    )
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock(return_value=True)
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    relay.send_for_platform.assert_awaited_once_with(
+        Platform.DISCORD,
+        "C1",
+        "legacy relay answer",
+        metadata={
+            "scope_id": "guild-legacy",
+            "user_id": "user-legacy",
+        },
+    )
+    relay.send.assert_not_awaited()
+    store.clear_resume_pending.assert_awaited_once_with(
+        "agent:main:discord:channel:C1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_relay_advertisement_error_does_not_block_native_row(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="native-row",
+        session_key="agent:main:slack:channel:C1",
+        platform="slack",
+        chat_id="C1",
+        thread_id=None,
+        content="native answer",
+        transport_profile_stamped=False,
+    )
+    _orphan("native-row")
+    native = _adapter("native")
+    relay = SimpleNamespace(
+        platform=Platform.RELAY,
+        _transport_profile=None,
+        fronts_platform=MagicMock(side_effect=RuntimeError("relay unavailable")),
+        acknowledged_transport_identities=MagicMock(return_value=()),
+    )
+    runner = _runner(primary=native)
+    runner.adapters[Platform.RELAY] = relay
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    native.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_slack_workspace_scope_reaches_send_metadata(
+    isolated_ledger,
+):
+    dl.record_obligation(
+        obligation_id="slack-workspace-row",
+        session_key="agent:main:slack:channel:C_SHARED",
+        platform="slack",
+        chat_id="C_SHARED",
+        thread_id="171.001",
+        content="workspace private answer",
+        transport_platform="slack",
+        transport_profile=None,
+        transport_profile_stamped=True,
+        route_scope_id="T_OTHER",
+        route_user_id="U_OTHER",
+        route_chat_type="channel",
+    )
+    _orphan("slack-workspace-row")
+
+    slack = _adapter("primary")
+    slack._transport_profile = None
+    runner = _runner(primary=slack)
+    runner._thread_metadata_for_source = GatewayRunner._thread_metadata_for_source.__get__(
+        runner, GatewayRunner
+    )
+    runner._thread_metadata_for_target = GatewayRunner._thread_metadata_for_target.__get__(
+        runner, GatewayRunner
+    )
+    store = MagicMock()
+    store.clear_resume_pending = AsyncMock()
+    store._store = None
+    setattr(runner, "session_store", None)
+    runner._async_session_store = store
+
+    assert await runner._redeliver_pending_obligations() == 1
+    assert slack.send.await_args.kwargs["metadata"] == {
+        "thread_id": "171.001",
+        "slack_team_id": "T_OTHER",
+    }
 
 
 def test_live_delivery_operation_accepts_relay_owner_for_underlying_platform():
@@ -924,6 +1150,23 @@ def test_restored_relay_owner_with_different_bot_identity_fails_closed():
     restored = SessionSource.from_dict(source.to_dict())
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.RELAY: relay}
+    runner._profile_adapters = {}
+
+    assert runner._adapter_for_source(restored) is None
+
+
+def test_restored_relay_owner_with_wrong_identity_platform_fails_closed():
+    relay = _adapter("relay")
+    relay.platform = Platform.RELAY
+    relay.fronts_platform = MagicMock(return_value=True)
+    relay.matches_transport_identity = MagicMock(return_value=True)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+    setattr(source, "_transport_profile", None)
+    setattr(source, "_transport_platform", Platform.RELAY)
+    setattr(source, "_transport_identity", "slack:app-1")
+    restored = SessionSource.from_dict(source.to_dict())
+    runner = object.__new__(GatewayRunner)
+    setattr(runner, "adapters", {Platform.RELAY: relay})
     runner._profile_adapters = {}
 
     assert runner._adapter_for_source(restored) is None

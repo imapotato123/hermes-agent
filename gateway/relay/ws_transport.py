@@ -648,22 +648,15 @@ class WebSocketRelayTransport:
         # and to make the A2 call site explicit.
         return await self._request_response(action, platform=platform)
 
-    def _bot_id_for(self, platform: Optional[str]) -> Optional[str]:
-        """The bot_id this transport advertised at hello for ``platform`` (Phase 1.5).
-
-        The connector validates a per-frame egress target against the SET of
-        ``platform:botId`` pairs it accumulated from the N hellos, so a per-frame
-        ``platform`` must ride with its MATCHING ``botId`` (the session default
-        botId belongs to the first identity and would mis-key for a second
-        platform). Resolved from the identity set this transport was built with.
-        None when the platform isn't one we front (the connector then rejects it
-        with a structured failure — never a wrong-credential send)."""
+    def _bot_ids_for(self, platform: Optional[str]) -> list[str]:
         if not platform:
-            return None
-        for p, b in self._identities:
-            if p == platform:
-                return b
-        return None
+            return []
+        return [str(b or "") for p, b in self._identities if p == platform]
+
+    def _bot_id_for(self, platform: Optional[str]) -> Optional[str]:
+        """The unique bot_id advertised at hello for ``platform`` (Phase 1.5)."""
+        matches = self._bot_ids_for(platform)
+        return matches[0] if len(matches) == 1 else None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         result = await self._request_response(
@@ -767,6 +760,38 @@ class WebSocketRelayTransport:
         *,
         platform: Optional[str] = None,
     ) -> Dict[str, Any]:
+        wire_action = dict(action)
+        action_metadata = wire_action.get("metadata")
+        private_identity = None
+        if isinstance(action_metadata, dict):
+            wire_metadata = dict(action_metadata)
+            private_identity = wire_metadata.pop(
+                "_relay_transport_identity", None
+            )
+            wire_action["metadata"] = wire_metadata
+
+        explicit_bot_id: Optional[str] = None
+        platform_bot_ids = self._bot_ids_for(platform)
+        if private_identity is not None:
+            identity = str(private_identity)
+            prefix = f"{platform}:" if platform else ""
+            if not prefix or not identity.startswith(prefix):
+                return {
+                    "success": False,
+                    "error": "relay transport identity/platform mismatch",
+                }
+            explicit_bot_id = identity[len(prefix):]
+            if explicit_bot_id not in platform_bot_ids:
+                return {
+                    "success": False,
+                    "error": "relay transport identity unavailable",
+                }
+        elif platform and len(platform_bot_ids) != 1:
+            return {
+                "success": False,
+                "error": "relay transport identity ambiguous",
+            }
+
         if self._closing:
             # Teardown in progress: the disconnect() fail-pending loop may
             # already have run, so a future registered now would never be
@@ -779,7 +804,11 @@ class WebSocketRelayTransport:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Dict[str, Any]] = loop.create_future()
         self._pending[request_id] = fut
-        frame: Dict[str, Any] = {"type": frame_type, "requestId": request_id, "action": action}
+        frame: Dict[str, Any] = {
+            "type": frame_type,
+            "requestId": request_id,
+            "action": wire_action,
+        }
         # Phase 1.5: tag the per-frame egress platform on the OutboundFrame
         # envelope (gateway-gateway D-Q1.5b.1), with its MATCHING advertised botId
         # so the connector's `${platform}:${botId}` advertised-set check passes.
@@ -788,8 +817,12 @@ class WebSocketRelayTransport:
         # connector falls back to the session's default platform when absent).
         if platform:
             frame["platform"] = platform
-            bot_id = self._bot_id_for(platform)
-            if bot_id:
+            bot_id = (
+                explicit_bot_id
+                if explicit_bot_id is not None
+                else self._bot_id_for(platform)
+            )
+            if bot_id is not None:
                 frame["botId"] = bot_id
         try:
             await self._send(frame)
@@ -929,6 +962,26 @@ class WebSocketRelayTransport:
         elif ftype == "inbound":
             if self._inbound is not None:
                 event = _event_from_wire(frame.get("event", {}))
+                inbound_platform = str(
+                    getattr(event.source.platform, "value", event.source.platform)
+                )
+                inbound_bot_id = frame.get("botId")
+                if inbound_bot_id is not None:
+                    identity = f"{inbound_platform}:{inbound_bot_id}"
+                    if identity not in {
+                        f"{p}:{b}" for p, b in self._identities
+                    }:
+                        logger.warning(
+                            "relay inbound dropped: unacknowledged transport "
+                            "identity %s",
+                            identity,
+                        )
+                        return
+                    setattr(
+                        event.source,
+                        "_relay_ingress_transport_identity",
+                        identity,
+                    )
                 await self._inbound(event)
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the

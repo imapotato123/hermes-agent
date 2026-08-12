@@ -33,6 +33,7 @@ class StubConnector:
         self.sent: List[Dict[str, Any]] = []
         # Per-frame egress platform recorded alongside each sent action (Phase 1.5).
         self.sent_platforms: List[Optional[str]] = []
+        self.sent_bot_ids: List[Optional[str]] = []
         self.interrupts: List[Dict[str, Any]] = []
         self.follow_ups: List[Dict[str, Any]] = []
         self.follow_up_platforms: List[Optional[str]] = []
@@ -87,8 +88,31 @@ class StubConnector:
     ) -> Dict[str, Any]:
         # Record the per-frame egress platform (Phase 1.5) alongside the action so
         # tests can assert which platform a reply was tagged for.
-        self.sent.append(action)
+        wire_action = dict(action)
+        action_metadata = wire_action.get("metadata")
+        private_identity = None
+        if isinstance(action_metadata, dict):
+            wire_metadata = dict(action_metadata)
+            private_identity = wire_metadata.pop(
+                "_relay_transport_identity", None
+            )
+            wire_action["metadata"] = wire_metadata
+        bot_ids = [str(b or "") for p, b in self._identities if p == platform]
+        if private_identity is not None:
+            prefix = f"{platform}:" if platform else ""
+            identity = str(private_identity)
+            if not prefix or not identity.startswith(prefix):
+                return {"success": False, "error": "identity/platform mismatch"}
+            bot_id = identity[len(prefix):]
+            if bot_id not in bot_ids:
+                return {"success": False, "error": "identity unavailable"}
+        elif platform and len(bot_ids) != 1:
+            return {"success": False, "error": "identity ambiguous"}
+        else:
+            bot_id = bot_ids[0] if len(bot_ids) == 1 else None
+        self.sent.append(wire_action)
         self.sent_platforms.append(platform)
+        self.sent_bot_ids.append(bot_id)
         if action.get("op") == "send":
             return dict(self.next_send_result)
         if action.get("op") == "send_media":
