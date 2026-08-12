@@ -3226,6 +3226,10 @@ class BasePlatformAdapter(ABC):
         # state. The adapter's local session key deliberately keeps the legacy
         # ``agent:main`` namespace, even for multiplexed secondary adapters.
         self._backend_notice_profile: Optional[str] = None
+        # Profile whose credential/connection owns this transport. Unlike a
+        # SessionSource's runtime ``profile``, this does not change when a chat
+        # route selects another agent profile for the turn.
+        self._transport_profile: Optional[str] = None
         self._llm_error_last_posted = self._backend_notice_state.posted
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
@@ -5524,7 +5528,7 @@ class BasePlatformAdapter(ABC):
 
     def _final_delivery_adapter(
         self, source: Optional[SessionSource]
-    ) -> "BasePlatformAdapter":
+    ) -> Optional[Any]:
         """Return the runner's current adapter for a new final-response send.
 
         A reconnect removes the failed adapter from the runner registry before
@@ -5538,16 +5542,26 @@ class BasePlatformAdapter(ABC):
         resolve = getattr(runner, "_adapter_for_source", None)
         if not callable(resolve):
             return self
+        source_attrs = getattr(source, "__dict__", {})
+        has_transport_owner = (
+            isinstance(source_attrs, dict)
+            and "_transport_profile" in source_attrs
+        )
         try:
             live_adapter = resolve(source)
         except Exception:
             logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
-            return self
-        if (
-            not isinstance(live_adapter, BasePlatformAdapter)
-            or live_adapter.platform != self.platform
-        ):
-            return self
+            return None if has_transport_owner else self
+        if live_adapter is None:
+            # An explicitly stamped live source must never fall back to the
+            # disconnected generation when its credential owner is missing.
+            return None if has_transport_owner else self
+        if getattr(live_adapter, "platform", None) != self.platform:
+            return None if has_transport_owner else self
+        if not callable(getattr(live_adapter, "_send_with_retry", None)):
+            return None if has_transport_owner else self
+        # Plugin adapters are intentionally duck-typed; requiring inheritance
+        # here would reject a valid replacement and revive the stale transport.
         return live_adapter
 
     async def _send_with_retry(
@@ -6313,22 +6327,19 @@ class BasePlatformAdapter(ABC):
         session_key: str,
         source: Optional[SessionSource] = None,
     ) -> str:
-        """Restore the logical profile namespace for shared notice state.
+        """Return an injective profile/session key for runner-wide notice state.
 
-        ``handle_message`` builds its adapter-local key before a secondary
-        profile handler stamps ``source.profile`` and intentionally omits the
-        multiplex profile. Reusing that raw key in runner-wide state would let
-        independent profile credentials suppress each other's notices.
+        Adapter-local session keys are built before multiplex routing stamps the
+        source profile. Always prefix the logical profile, including ``default``.
+        Length-prefixing keeps the encoding unambiguous even if plugin profiles
+        or session keys contain separators.
         """
         profile = str(
             (getattr(source, "profile", None) if source is not None else None)
             or self._backend_notice_profile
             or "default"
         ).strip() or "default"
-        # Namespace even the default profile explicitly. Its legacy session key
-        # uses ``agent:main:...`` and would otherwise collide with a valid
-        # multiplex profile literally named ``main``.
-        return f"profile:{profile}:{session_key}"
+        return f"profile:{len(profile)}:{profile}:{session_key}"
 
     def set_backend_notice_state(
         self,
@@ -6652,34 +6663,52 @@ class BasePlatformAdapter(ABC):
                     # adapter's tracker and then sending through a new one
                     # would bypass the replacement's live cooldown.
                     delivery_adapter = self._final_delivery_adapter(event.source)
-                    backend_notice_session_key = (
-                        delivery_adapter._backend_notice_session_key(
-                            session_key, event.source
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Withholding backend-unavailable notice: "
+                            "no live adapter for the stamped transport owner",
+                            self.name,
                         )
-                    )
-                    backend_notice_claimed = (
-                        await delivery_adapter._backend_notice_state.claim(
-                            backend_notice_session_key,
-                            "backend_unavailable",
-                        )
-                    )
-                    if not backend_notice_claimed:
                         backend_notice_suppressed = True
-                        logger.info(
-                            "[%s] Suppressing duplicate backend-unavailable "
-                            "notice for session %s",
-                            delivery_adapter.name,
-                            session_key,
-                        )
                         text_content = ""
+                    else:
+                        backend_notice_session_key = (
+                            self._backend_notice_session_key(
+                                session_key, event.source
+                            )
+                        )
+                        backend_notice_claimed = (
+                            await self._backend_notice_state.claim(
+                                backend_notice_session_key,
+                                "backend_unavailable",
+                            )
+                        )
+                        if not backend_notice_claimed:
+                            backend_notice_suppressed = True
+                            logger.info(
+                                "[%s] Suppressing duplicate backend-unavailable "
+                                "notice for session %s",
+                                getattr(delivery_adapter, "name", self.name),
+                                session_key,
+                            )
+                            text_content = ""
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = (
                         delivery_adapter
                         or self._final_delivery_adapter(event.source)
                     )
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Withholding final response: no live adapter "
+                            "for the stamped transport owner",
+                            self.name,
+                        )
+                        text_content = ""
+                if text_content and not _tts_caption_delivered:
+                    assert delivery_adapter is not None
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
-                        delivery_adapter.name,
+                        getattr(delivery_adapter, "name", self.name),
                         len(text_content),
                         event.source.chat_id,
                     )
@@ -6732,6 +6761,7 @@ class BasePlatformAdapter(ABC):
                             _obligation_id = None
                     if backend_notice_claimed:
                         async def _send_and_finish_backend_notice_claim():
+                            delivered = False
                             try:
                                 send_result = await delivery_adapter._send_with_retry(
                                     chat_id=event.source.chat_id,
@@ -6739,23 +6769,17 @@ class BasePlatformAdapter(ABC):
                                     reply_to=_reply_anchor,
                                     metadata=_final_thread_metadata,
                                 )
-                            except BaseException:
-                                delivery_adapter._backend_notice_state.finish_claim(
+                                delivered = bool(
+                                    getattr(send_result, "success", False)
+                                )
+                                return send_result
+                            finally:
+                                self._backend_notice_state.finish_claim(
                                     backend_notice_session_key,
                                     "backend_unavailable",
                                     time.monotonic(),
-                                    delivered=False,
+                                    delivered=delivered,
                                 )
-                                raise
-                            delivery_adapter._backend_notice_state.finish_claim(
-                                backend_notice_session_key,
-                                "backend_unavailable",
-                                time.monotonic(),
-                                delivered=bool(
-                                    getattr(send_result, "success", False)
-                                ),
-                            )
-                            return send_result
 
                         send_task = asyncio.create_task(
                             _send_and_finish_backend_notice_claim()
@@ -6768,7 +6792,7 @@ class BasePlatformAdapter(ABC):
                             # holds the send task across adapter replacement and
                             # resolves contenders only when the platform result
                             # is known, while this processor unwinds promptly.
-                            delivery_adapter._backend_notice_state.track_delivery_task(
+                            self._backend_notice_state.track_delivery_task(
                                 send_task
                             )
                             raise
@@ -7367,6 +7391,14 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. Preserve its owning profile independently so a turn
+        # that outlives a reconnect can resolve the replacement generation.
+        setattr(
+            source,
+            "_transport_profile",
+            getattr(self, "_transport_profile", None),
+        )
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

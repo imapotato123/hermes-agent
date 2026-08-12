@@ -5996,14 +5996,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
         profile_name: Optional[str] = None,
     ) -> None:
-        """Wire profile-scoped cooldown state across adapter reconnects."""
+        """Wire runner routing and profile-scoped state across reconnects."""
+        # All adapters participate in replacement routing, including direct
+        # built-ins created outside plugin factories.
+        adapter.gateway_runner = self
+        if not profile_name:
+            try:
+                profile_name = self._active_profile_name()
+            except Exception:
+                profile_name = None
+        # ``source.profile`` is the runtime/session namespace and may be changed
+        # by a chat-based profile route. Keep the credential/transport owner
+        # separately so an in-flight turn can find this adapter's replacement.
+        adapter._transport_profile = str(profile_name or "").strip() or None
         setter = getattr(adapter, "set_backend_notice_state", None)
         if callable(setter):
-            if not profile_name:
-                try:
-                    profile_name = self._active_profile_name()
-                except Exception:
-                    profile_name = None
             setter(
                 self._backend_notice_state_for_adapters(),
                 profile_name=profile_name,
