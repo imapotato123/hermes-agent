@@ -139,6 +139,102 @@ async def test_response_bundle_replays_exact_owner_text_images_and_documents(
 
 
 @pytest.mark.asyncio
+async def test_recovery_checkpoints_each_prepared_text_post_before_later_failure(
+    isolated_ledger,
+):
+    payload = {
+        "version": 1,
+        "text": "one two",
+        "text_chunks": [
+            {"content": "one", "recovered_content": "[recovered] one"},
+            {"content": "two", "recovered_content": "[recovered] two"},
+        ],
+        "completed_operations": [],
+    }
+    row = {"obligation_id": "text-prefix", "chat_id": "C1"}
+    live = _adapter("live")
+    live.send_prepared_text_chunk = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="one"),
+            SendResult(success=False, error="second rejected"),
+        ]
+    )
+    runner = _runner(coder=live)
+
+    with patch(
+        "gateway.delivery_ledger.mark_bundle_operation_attempting",
+        return_value=True,
+    ) as attempting, patch(
+        "gateway.delivery_ledger.mark_bundle_operations_completed",
+        return_value=True,
+    ) as completed:
+        result = await runner._redeliver_response_bundle(
+            row=row,
+            payload=payload,
+            adapter=live,
+            source=_source(),
+            metadata={"thread_id": None},
+            platform=Platform.SLACK,
+            legacy_transport=None,
+        )
+
+    assert result.success is False
+    assert [call.args[1] for call in attempting.call_args_list] == [
+        "text:0",
+        "text:1",
+    ]
+    assert completed.call_args_list[0].args[1] == ["text:0"]
+    assert [
+        call.kwargs["content"]
+        for call in live.send_prepared_text_chunk.await_args_list
+    ] == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_persisted_safe_marker_for_exact_ambiguous_text_post(
+    isolated_ledger,
+):
+    payload = {
+        "version": 1,
+        "text": "one two",
+        "text_chunks": [
+            {"content": "one", "recovered_content": "safe-recovered-one"},
+            {"content": "two", "recovered_content": "safe-recovered-two"},
+        ],
+        "completed_operations": ["text:0"],
+        "attempting_operation": "text:1",
+    }
+    live = _adapter("live")
+    live.send_prepared_text_chunk = AsyncMock(
+        return_value=SendResult(success=True, message_id="two")
+    )
+    runner = _runner(coder=live)
+
+    with patch(
+        "gateway.delivery_ledger.mark_bundle_operation_attempting",
+        return_value=True,
+    ), patch(
+        "gateway.delivery_ledger.mark_bundle_operations_completed",
+        return_value=True,
+    ):
+        result = await runner._redeliver_response_bundle(
+            row={"obligation_id": "text-ambiguous", "chat_id": "C1"},
+            payload=payload,
+            adapter=live,
+            source=_source(),
+            metadata={"thread_id": None},
+            platform=Platform.SLACK,
+            legacy_transport=None,
+        )
+
+    assert result.success is True
+    live.send_prepared_text_chunk.assert_awaited_once()
+    assert live.send_prepared_text_chunk.await_args.kwargs["content"] == (
+        "safe-recovered-two"
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_bundle_blocks_later_bundle_for_same_session(isolated_ledger):
     live = _adapter("live")
     live.send = AsyncMock(return_value=SendResult(success=False, error="no"))

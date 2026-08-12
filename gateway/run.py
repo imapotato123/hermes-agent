@@ -11355,7 +11355,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         from gateway.delivery_ledger import response_bundle_operation_keys
 
-        planned_keys = set(response_bundle_operation_keys(payload))
+        ordered_planned_keys = response_bundle_operation_keys(payload)
+        planned_keys = set(ordered_planned_keys)
+        planned_text_keys = [
+            key
+            for key in ordered_planned_keys
+            if key == "text" or key.startswith("text:")
+        ]
         completed_operations = len(completed_keys)
         ambiguous_operation = (
             str(payload.get("attempting_operation"))
@@ -11527,7 +11533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     checkpoint_failure = await _completed(
                         operation_key,
                         *(
-                            ("text",)
+                            tuple(planned_text_keys)
                             if audio_index == 0
                             and payload.get("auto_tts_caption_text")
                             else ()
@@ -11542,7 +11548,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except OSError:
                         pass
 
-        if text and "text" not in completed_keys:
+        text_chunks = payload.get("text_chunks")
+        if isinstance(text_chunks, list):
+            for text_index, text_chunk in enumerate(text_chunks):
+                operation_key = f"text:{text_index}"
+                if operation_key in completed_keys:
+                    continue
+                attempting_failure = await _attempting(operation_key)
+                if attempting_failure is not None:
+                    return attempting_failure
+                content_key = (
+                    "recovered_content"
+                    if ambiguous_operation == operation_key
+                    else "content"
+                )
+                try:
+                    text_result = await _operation(
+                        "send_prepared_text_chunk",
+                        chat_id=row["chat_id"],
+                        content=str(text_chunk[content_key]),
+                        reply_to=(
+                            str(row.get("message_ref") or "") or None
+                            if text_chunk.get(
+                                "reply_to_original", text_index == 0
+                            )
+                            else None
+                        ),
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    return _failure(str(exc))
+                if getattr(text_result, "success", False) is False:
+                    return _failure(
+                        str(
+                            getattr(text_result, "error", "")
+                            or "prepared text send failed"
+                        )
+                    )
+                checkpoint_failure = await _completed(operation_key)
+                if checkpoint_failure is not None:
+                    return checkpoint_failure
+        elif text and "text" not in completed_keys:
             attempting_failure = await _attempting("text")
             if attempting_failure is not None:
                 return attempting_failure

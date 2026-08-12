@@ -207,6 +207,34 @@ class TestStateMachine:
             "forged-bundle", "forged"
         )
 
+    def test_prepared_text_chunks_derive_independent_operation_keys(self):
+        payload = {
+            "version": 1,
+            "text": "one two",
+            "text_chunks": [
+                {"content": "one", "recovered_content": "[recovered] one"},
+                {"content": "two", "recovered_content": "[recovered] two"},
+            ],
+            "operation_keys": ["text", "forged"],
+        }
+
+        assert dl.response_bundle_operation_keys(payload) == ["text:0", "text:1"]
+
+    def test_legacy_bundle_without_prepared_chunks_keeps_single_text_key(self):
+        assert dl.response_bundle_operation_keys(
+            {"version": 1, "text": "legacy answer"}
+        ) == ["text"]
+
+    @pytest.mark.parametrize(
+        "text_chunks",
+        ["not-a-list", ["plain string"], [{"content": "missing recovery"}]],
+    )
+    def test_malformed_prepared_text_chunks_fail_closed(self, text_chunks):
+        with pytest.raises(ValueError):
+            dl.response_bundle_operation_keys(
+                {"version": 1, "text": "answer", "text_chunks": text_chunks}
+            )
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

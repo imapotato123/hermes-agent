@@ -369,7 +369,30 @@ def response_bundle_operation_keys(payload: Dict[str, Any]) -> List[str]:
     if payload.get("auto_tts") and text:
         segment_count = int(payload.get("auto_tts_segment_count") or 1)
         keys.extend(f"auto_tts:{index}" for index in range(segment_count))
-    if text:
+    if "text_chunks" in payload:
+        text_chunks = payload.get("text_chunks")
+        if not isinstance(text_chunks, list):
+            raise ValueError("response bundle text_chunks must be a list")
+        if bool(text) != bool(text_chunks):
+            raise ValueError("response bundle text/text_chunks mismatch")
+        for index, chunk in enumerate(text_chunks):
+            if not isinstance(chunk, dict):
+                raise ValueError("response bundle text chunk must be an object")
+            content = chunk.get("content")
+            recovered_content = chunk.get("recovered_content")
+            reply_to_original = chunk.get("reply_to_original", index == 0)
+            if (
+                not isinstance(content, str)
+                or not content
+                or not isinstance(recovered_content, str)
+                or not recovered_content
+                or not isinstance(reply_to_original, bool)
+            ):
+                raise ValueError("malformed response bundle text chunk")
+            keys.append(f"text:{index}")
+    elif text:
+        # Trusted v1 rows written before physical text planning used one logical
+        # ``text`` operation. Keep those rows readable byte-for-byte.
         keys.append("text")
     keys.extend(
         f"images:{index}"
