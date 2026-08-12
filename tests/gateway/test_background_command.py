@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BackendNoticeState, MessageEvent, SendResult
 from gateway.session import SessionSource, stamp_source_transport_owner
 
 
@@ -284,6 +284,71 @@ class TestRunBackgroundTask:
 
         assert adapter.send.await_count == 1
         assert "temporarily unavailable" in adapter.send.await_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_background_outage_waits_for_ambiguous_send_result(self):
+        runner = _make_runner()
+        runner._backend_notice_state = BackendNoticeState()
+        runner._profile_adapters = {}
+        adapter = MagicMock()
+        adapter.platform = Platform.TELEGRAM
+        adapter.extract_media = MagicMock(return_value=([], ""))
+        adapter.extract_images = MagicMock(return_value=([], ""))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._share_backend_notice_state(adapter)
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.TELEGRAM,
+            adapter=adapter,
+        )
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+
+        async def ambiguous_send(*_args, **_kwargs):
+            send_started.set()
+            await finish_send.wait()
+            return SendResult(success=True, message_id="notice-1")
+
+        adapter.send = ambiguous_send
+        result = {
+            "failed": True,
+            "failure_reason": "server_error",
+            "final_response": "",
+            "error": "raw provider detail",
+        }
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch("gateway.run._load_gateway_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            instance = MagicMock()
+            instance.run_conversation.return_value = result
+            mock_agent.return_value = instance
+            task = asyncio.create_task(
+                runner._run_background_task("prompt", source, "bg_test")
+            )
+            await send_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        state = runner._backend_notice_state
+        assert state._claim_results
+        claim_key = next(iter(state._claim_results))[0]
+        next_claim = asyncio.create_task(
+            state.claim(claim_key, "backend_unavailable")
+        )
+        await asyncio.sleep(0)
+        assert next_claim.done() is False
+
+        finish_send.set()
+        assert await next_claim is False
+        assert state.inflight == set()
+        assert state._claim_results == {}
 
 
 # ---------------------------------------------------------------------------
