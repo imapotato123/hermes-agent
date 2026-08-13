@@ -233,10 +233,115 @@ class TestSweep:
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is False
-        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["attempts"] == 0
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_claim_does_not_spend_attempt_before_attempting_checkpoint(self):
+        _record()
+        _orphan("ob-1")
+
+        for _ in range(dl.MAX_ATTEMPTS + 1):
+            claimed = dl.sweep_recoverable()
+            assert len(claimed) == 1
+            assert claimed[0]["attempts"] == 0
+            with dl._connect() as conn:
+                state, attempts = conn.execute(
+                    "SELECT state, attempts FROM delivery_obligations "
+                    "WHERE obligation_id='ob-1'"
+                ).fetchone()
+                conn.execute(
+                    "UPDATE delivery_obligations SET owner_pid=999999999, "
+                    "owner_started_at=1 WHERE obligation_id='ob-1'"
+                )
+            assert (state, attempts) == ("pending", 0)
+
+        assert _row("ob-1")["state"] == "pending"
+
+    def test_mark_attempting_spends_one_recovery_attempt(self):
+        _record()
+        _orphan("ob-1")
+        claimed = dl.sweep_recoverable()[0]
+
+        assert dl.mark_attempting(
+            "ob-1", recovery_claim=claimed["recovery_claim"]
+        ) is True
+        assert _row("ob-1")["attempts"] == 1
+
+    def test_claim_snapshot_cas_cannot_reopen_concurrent_delivery(self, monkeypatch):
+        _record()
+        _orphan("ob-1")
+
+        class _RacingConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self._raced = False
+
+            def execute(self, sql, params=()):
+                if "SET owner_pid=?" in sql and not self._raced:
+                    self._raced = True
+                    self._conn.execute(
+                        "UPDATE delivery_obligations SET state='delivered', "
+                        "updated_at=updated_at+1 WHERE obligation_id='ob-1'"
+                    )
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        real_transaction = dl._transaction
+
+        @dl.contextmanager
+        def racing_transaction():
+            with real_transaction() as conn:
+                yield _RacingConnection(conn)
+
+        monkeypatch.setattr(dl, "_transaction", racing_transaction)
+
+        assert dl.sweep_recoverable() == []
+        assert _row("ob-1")["state"] == "delivered"
+
+    def test_abandon_snapshot_cas_cannot_overwrite_concurrent_delivery(
+        self, monkeypatch
+    ):
+        _record()
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? "
+                "WHERE obligation_id='ob-1'",
+                (dl.MAX_ATTEMPTS,),
+            )
+
+        class _RacingConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self._raced = False
+
+            def execute(self, sql, params=()):
+                if "SET state='abandoned'" in sql and not self._raced:
+                    self._raced = True
+                    self._conn.execute(
+                        "UPDATE delivery_obligations SET state='delivered', "
+                        "updated_at=updated_at+1 WHERE obligation_id='ob-1'"
+                    )
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        real_transaction = dl._transaction
+
+        @dl.contextmanager
+        def racing_transaction():
+            with real_transaction() as conn:
+                yield _RacingConnection(conn)
+
+        monkeypatch.setattr(dl, "_transaction", racing_transaction)
+
+        assert dl.sweep_recoverable() == []
+        assert _row("ob-1")["state"] == "delivered"
 
     def test_claim_cas_includes_observed_process_start_time(self, monkeypatch):
         """PID reuse between liveness check and UPDATE cannot steal a live claim."""
@@ -284,7 +389,7 @@ class TestSweep:
         _orphan("ob-1")
 
         first = dl.sweep_recoverable()[0]
-        assert first["attempts"] == 1
+        assert first["attempts"] == 0
         first_claim = first["recovery_claim"]
         assert dl.mark_attempting("ob-1", recovery_claim=first_claim) is True
         assert dl.release_claim(
@@ -292,9 +397,10 @@ class TestSweep:
         ) is True
 
         second = dl.sweep_recoverable()[0]
-        assert second["attempts"] == 2
+        assert second["attempts"] == 1
         second_claim = second["recovery_claim"]
         assert second_claim != first_claim
+        assert dl.mark_attempting("ob-1", recovery_claim=second_claim) is True
 
         assert dl.release_claim(
             "ob-1", consume_attempt=True, recovery_claim=first_claim
@@ -322,6 +428,23 @@ class TestPrune:
             )
         dl._prune()
         assert _row("ob-1") is None
+
+    def test_capacity_prune_never_deletes_live_unresolved_rows(self, monkeypatch):
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+        for index in range(3):
+            _record(oid=f"live-{index}")
+
+        with dl._connect() as conn:
+            rows = conn.execute(
+                "SELECT obligation_id, state FROM delivery_obligations "
+                "ORDER BY obligation_id"
+            ).fetchall()
+
+        assert rows == [
+            ("live-0", "pending"),
+            ("live-1", "pending"),
+            ("live-2", "pending"),
+        ]
 
 
 class TestLedgerEnabled:
@@ -489,7 +612,7 @@ class TestAttemptsOnlySpentOnRealSends:
         _orphan("ob-1")
         claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
         assert len(claimed) == 1
-        assert claimed[0]["attempts"] == 1
+        assert claimed[0]["attempts"] == 0
 
 
 class TestUnconnectedPlatformKeepsItsBudget:

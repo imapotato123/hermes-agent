@@ -33,8 +33,9 @@ ambiguous sends):
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
-Everything here is best-effort by design: ledger failures must never block
-or delay an actual send. Callers wrap every call in try/except.
+The pending and attempting checkpoints are an egress gate for final output:
+an uncheckpointed physical send is not a durable delivery attempt. Recovery
+and diagnostic callers may still handle ledger failures explicitly.
 """
 
 from __future__ import annotations
@@ -109,6 +110,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             recovery_claim TEXT,
+            recovery_attempt_charged INTEGER NOT NULL DEFAULT 0,
             transport_platform TEXT,
             transport_profile TEXT,
             transport_profile_stamped INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +148,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     if "recovery_claim" not in columns:
         conn.execute(
             "ALTER TABLE delivery_obligations ADD COLUMN recovery_claim TEXT"
+        )
+    if "recovery_attempt_charged" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN "
+            "recovery_attempt_charged INTEGER NOT NULL DEFAULT 0"
         )
     for column in ("route_scope_id", "route_user_id", "route_chat_type"):
         if column not in columns:
@@ -297,9 +304,31 @@ def record_obligation(
 def mark_attempting(
     obligation_id: str, *, recovery_claim: Optional[str] = None
 ) -> bool:
-    return _update_state(
-        obligation_id, "attempting", recovery_claim=recovery_claim
-    )
+    if recovery_claim is not None:
+        pid, started = _owner_stamp()
+        with _DB_LOCK, _transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', attempts=attempts+1,
+                       recovery_attempt_charged=1, updated_at=?, last_error=NULL
+                   WHERE obligation_id=? AND owner_pid=?
+                     AND (owner_started_at IS ? OR owner_started_at=?)
+                     AND recovery_claim=?
+                     AND recovery_attempt_charged=0
+                     AND attempts < ?
+                     AND state IN ('pending', 'attempting', 'failed')""",
+                (
+                    time.time(),
+                    obligation_id,
+                    pid,
+                    started,
+                    started,
+                    recovery_claim,
+                    MAX_ATTEMPTS,
+                ),
+            )
+        return bool(cursor.rowcount)
+    return _update_state(obligation_id, "attempting")
 
 
 def mark_delivered(
@@ -343,11 +372,12 @@ def release_claim(
 ) -> bool:
     """Release this process's recovery claim.
 
-    Before transport egress, ``consume_attempt=False`` restores the claim's
-    retry budget.  Once egress may have started, ``consume_attempt=True``
-    clears only the live owner stamp so a later sweep preserves both the spent
-    attempt and the row's ambiguity state. ``restore_state`` is used only for
-    cancellation during the pre-egress attempting checkpoint.
+    Before transport egress, ``consume_attempt=False`` restores a retry charge
+    made by this claim, if any. Claim acquisition itself does not spend budget.
+    Once egress may have started, ``consume_attempt=True`` clears only the live
+    owner stamp so a later sweep preserves both the spent attempt and the row's
+    ambiguity state. ``restore_state`` is used only for cancellation during the
+    pre-egress attempting checkpoint.
 
     The opaque ``recovery_claim`` is minted by ``sweep_recoverable()`` and
     prevents a delayed task in this same process from releasing a newer claim.
@@ -362,8 +392,8 @@ def release_claim(
             "owner_pid=NULL, owner_started_at=NULL, recovery_claim=NULL, "
             "attempts=CASE "
             "WHEN ? THEN attempts "
-            "WHEN attempts > 0 THEN attempts - 1 "
-            "ELSE 0 END"
+            "WHEN recovery_attempt_charged=1 AND attempts > 0 THEN attempts - 1 "
+            "ELSE attempts END, recovery_attempt_charged=0"
         )
         params: List[Any] = [consume_attempt]
         if restore_state is not None:
@@ -391,6 +421,39 @@ def release_claim(
     return bool(cursor.rowcount)
 
 
+def release_original_owner(
+    obligation_id: str,
+    *,
+    expected_state: str,
+) -> bool:
+    """Release a live first-send row so recovery can claim it immediately.
+
+    Original producer rows have no recovery token. The exact process stamp,
+    null-token predicate, and expected state form the CAS boundary, preventing
+    a cancelled or stale producer from releasing a newer recovery claim.
+    """
+    if expected_state not in {"pending", "attempting", "failed"}:
+        return False
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET owner_pid=NULL, owner_started_at=NULL, updated_at=?
+               WHERE obligation_id=? AND state=? AND owner_pid=?
+                 AND (owner_started_at IS ? OR owner_started_at=?)
+                 AND recovery_claim IS NULL""",
+            (
+                time.time(),
+                obligation_id,
+                expected_state,
+                pid,
+                started,
+                started,
+            ),
+        )
+    return bool(cursor.rowcount)
+
+
 def _update_state(
     obligation_id: str,
     state: str,
@@ -411,7 +474,7 @@ def _update_state(
             params.extend((pid, started, started, recovery_claim))
         set_clause = "state=?, updated_at=?, last_error=?"
         if recovery_claim is not None and state in {"delivered", "failed"}:
-            set_clause += ", recovery_claim=NULL"
+            set_clause += ", recovery_claim=NULL, recovery_attempt_charged=0"
         cursor = conn.execute(
             f"""UPDATE delivery_obligations
                 SET {set_clause}
@@ -432,9 +495,9 @@ def sweep_recoverable(
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
 
-    Claiming atomically re-stamps the owner to THIS process and increments
-    ``attempts``, so a second gateway racing the same sweep cannot
-    double-claim (the UPDATE is guarded on the previous owner stamp).
+    Claiming atomically re-stamps the owner to THIS process without spending
+    ``attempts``, so a second gateway racing the same sweep cannot double-claim.
+    ``mark_attempting`` charges exactly once immediately before physical egress.
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
@@ -458,7 +521,8 @@ def sweep_recoverable(
                       transport_platform, transport_profile,
                       transport_profile_stamped, transport_identity,
                       route_scope_id, route_user_id, route_chat_type,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, updated_at, recovery_claim,
+                      recovery_attempt_charged
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
@@ -481,17 +545,44 @@ def sweep_recoverable(
             route_chat_type,
             owner_pid,
             owner_started_at,
+            updated_at,
+            previous_recovery_claim,
+            recovery_attempt_charged,
         ) in rows:
             if oid in excluded:
                 continue
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
-                conn.execute(
+                cursor = conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
-                    (now, oid),
+                       SET state='abandoned', updated_at=?, recovery_claim=NULL,
+                           recovery_attempt_charged=0
+                       WHERE obligation_id=? AND state=? AND attempts=?
+                         AND created_at=? AND updated_at=?
+                         AND (owner_pid IS ? OR owner_pid=?)
+                         AND (owner_started_at IS ? OR owner_started_at=?)
+                         AND recovery_claim IS ?
+                         AND recovery_attempt_charged=?""",
+                    (
+                        now,
+                        oid,
+                        state,
+                        attempts,
+                        created_at,
+                        updated_at,
+                        owner_pid,
+                        owner_pid,
+                        owner_started_at,
+                        owner_started_at,
+                        previous_recovery_claim,
+                        recovery_attempt_charged,
+                    ),
                 )
+                if not cursor.rowcount:
+                    logger.debug(
+                        "obligation %s changed during stale-abandon decision", oid
+                    )
                 continue
             if (
                 deliverable_platforms is not None
@@ -516,20 +607,29 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, recovery_claim=?,
-                       attempts=attempts+1, updated_at=?
-                   WHERE obligation_id=?
+                       recovery_attempt_charged=0, updated_at=?
+                   WHERE obligation_id=? AND state=? AND attempts=?
+                     AND created_at=? AND updated_at=?
                      AND (owner_pid IS ? OR owner_pid=?)
-                     AND (owner_started_at IS ? OR owner_started_at=?)""",
+                     AND (owner_started_at IS ? OR owner_started_at=?)
+                     AND recovery_claim IS ?
+                     AND recovery_attempt_charged=?""",
                 (
                     pid,
                     started,
                     recovery_claim,
                     now,
                     oid,
+                    state,
+                    attempts,
+                    created_at,
+                    updated_at,
                     owner_pid,
                     owner_pid,
                     owner_started_at,
                     owner_started_at,
+                    previous_recovery_claim,
+                    recovery_attempt_charged,
                 ),
             )
             if cursor.rowcount:
@@ -553,7 +653,7 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "claimed_state": state,
-                    "attempts": attempts + 1,
+                    "attempts": attempts,
                     "recovery_claim": recovery_claim,
                 })
                 if max_claims is not None and len(claimed) >= max_claims:
@@ -576,17 +676,20 @@ def _prune(now: Optional[float] = None) -> None:
             ).fetchone()[0]
             excess = max(0, total - _MAX_ROWS)
             if excess:
-                conn.execute(
+                cursor = conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered', 'abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )
+                if cursor.rowcount < excess:
+                    logger.warning(
+                        "delivery ledger exceeds soft row cap with %d unresolved "
+                        "obligation(s); live delivery debt was retained",
+                        excess - cursor.rowcount,
+                    )
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)
 
