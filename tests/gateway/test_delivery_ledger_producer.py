@@ -136,6 +136,48 @@ class TestProducerHook:
         assert rows[0][1] == "failed"
 
     @pytest.mark.asyncio
+    async def test_owner_unavailable_final_is_persisted_pending_for_reconnect(self):
+        adapter = _Adapter()
+        adapter._final_delivery_adapter = lambda _source: None
+
+        await _run(adapter, _event())
+
+        assert adapter.sent == []
+        with dl._connect() as conn:
+            state, attempts, owner_pid = conn.execute(
+                "SELECT state, attempts, owner_pid FROM delivery_obligations"
+            ).fetchone()
+        assert (state, attempts, owner_pid) == ("pending", 0, None)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_initial_send_releases_live_owner(self):
+        adapter = _Adapter()
+        send_started = asyncio.Event()
+
+        async def blocked_send(*_args, **_kwargs):
+            send_started.set()
+            await asyncio.Event().wait()
+
+        adapter.send = blocked_send
+        task = asyncio.create_task(_run(adapter, _event()))
+        await send_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        with dl._connect() as conn:
+            state, attempts, owner_pid, recovery_claim = conn.execute(
+                "SELECT state, attempts, owner_pid, recovery_claim "
+                "FROM delivery_obligations"
+            ).fetchone()
+        assert (state, attempts, owner_pid, recovery_claim) == (
+            "attempting",
+            0,
+            None,
+            None,
+        )
+
+    @pytest.mark.asyncio
     async def test_backend_notice_is_not_durably_replayed_as_plain_text(self):
         adapter = _Adapter()
         await _run(
