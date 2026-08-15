@@ -16,8 +16,12 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
-from gateway.session import SessionSource
+from gateway.platforms.base import MessageEvent, SendResult
+from gateway.session import (
+    SessionSource,
+    session_source_to_trusted_marker,
+    stamp_source_transport_owner,
+)
 
 
 def _make_event(text="/update", platform=Platform.TELEGRAM,
@@ -206,6 +210,62 @@ class TestWatchUpdateProgress:
         assert mock_adapter.send.call_count >= 1
         all_sent = " ".join(str(c) for c in mock_adapter.send.call_args_list)
         assert "update finished" in all_sent.lower()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_retries_exact_unsent_stream_suffix_once(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        first = AsyncMock()
+        first.platform = Platform.TELEGRAM
+        first._transport_profile = None
+        first.send = AsyncMock(
+            return_value=SendResult(success=False, error="retired")
+        )
+        replacement = AsyncMock()
+        replacement.platform = Platform.TELEGRAM
+        replacement._transport_profile = None
+        replacement.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="ok")
+        )
+        runner.adapters = {Platform.TELEGRAM: first}
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="111",
+            chat_type="dm",
+        )
+        stamp_source_transport_owner(source, adapter=first)
+        marker = {
+            "platform": source.platform.value,
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+            "session_key": "agent:main:telegram:dm:111",
+            **session_source_to_trusted_marker(source),
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(marker))
+        (hermes_home / ".update_output.txt").write_text("exact-unsent-output\n")
+
+        async def replace_and_finish():
+            while first.send.await_count == 0:
+                await asyncio.sleep(0.005)
+            runner.adapters[Platform.TELEGRAM] = replacement
+            await asyncio.sleep(0.02)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            task = asyncio.create_task(replace_and_finish())
+            await runner._watch_update_progress(
+                poll_interval=0.01,
+                stream_interval=0.01,
+                timeout=2.0,
+            )
+            await task
+
+        first_payloads = [call.args[1] for call in first.send.await_args_list]
+        replacement_payloads = [call.args[1] for call in replacement.send.await_args_list]
+        assert sum("exact-unsent-output" in text for text in first_payloads) == 1
+        assert sum("exact-unsent-output" in text for text in replacement_payloads) == 1
+        assert sum("Hermes update finished" in text for text in replacement_payloads) == 1
 
     @pytest.mark.asyncio
     async def test_detects_and_forwards_prompt(self, tmp_path):
