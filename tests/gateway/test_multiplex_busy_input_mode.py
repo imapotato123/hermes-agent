@@ -17,6 +17,7 @@ from gateway.platforms.base import (
 )
 from gateway.profile_routing import ProfileRoute
 from gateway.run import GatewayRunner
+from gateway.session import stamp_source_transport_owner
 
 
 class _ProfileAdapter(BasePlatformAdapter):
@@ -53,17 +54,20 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     return runner
 
 
-def _event(*, profile: str | None) -> MessageEvent:
+def _event(*, profile: str | None, stamped: bool = True) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+        profile=profile,
+    )
+    if stamped:
+        stamp_source_transport_owner(source, profile=profile)
     return MessageEvent(
         text="follow up",
         message_type=MessageType.TEXT,
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="chat-1",
-            chat_type="dm",
-            user_id="user-1",
-            profile=profile,
-        ),
+        source=source,
         message_id="message-1",
     )
 
@@ -248,7 +252,7 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
         tmp_path / "research",
         "steer",
     )
-    event = _event(profile=None)
+    event = _event(profile=None, stamped=False)
     adapter_session_key = build_session_key(event.source)
     adapter._active_sessions[adapter_session_key] = asyncio.Event()
 

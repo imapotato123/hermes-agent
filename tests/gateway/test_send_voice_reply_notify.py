@@ -18,7 +18,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _make_event(thread_id=None):
@@ -29,6 +29,7 @@ def _make_event(thread_id=None):
         chat_type="dm",
         thread_id=thread_id,
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(
         text="hi",
         message_type=MessageType.TEXT,
@@ -40,10 +41,13 @@ def _make_event(thread_id=None):
 def _runner_with_adapter(send_voice_mock):
     runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(
+        platform=Platform.TELEGRAM,
         send_voice=send_voice_mock,
         is_in_voice_channel=lambda *_a, **_k: False,
     )
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
     return runner
 
 

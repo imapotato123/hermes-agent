@@ -9,7 +9,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class TestAutoVoiceReplyFormat:
@@ -109,14 +109,18 @@ def _make_adapter(platform: Platform) -> MagicMock:
 
 
 def _make_event(platform: Platform, chat_id: str = "123", message_type: MessageType = MessageType.TEXT) -> MessageEvent:
-    return MessageEvent(
-        text="trigger",
-        source=SessionSource(
+    source = stamp_source_transport_owner(
+        SessionSource(
             platform=platform,
             chat_id=chat_id,
             user_id="u1",
             user_name="User",
         ),
+        profile=None,
+    )
+    return MessageEvent(
+        text="trigger",
+        source=source,
         message_type=message_type,
         message_id="456",
     )

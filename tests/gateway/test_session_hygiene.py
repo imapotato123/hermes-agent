@@ -23,7 +23,7 @@ import pytest
 from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import SessionEntry, SessionSource, stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -589,16 +589,14 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         lambda *_args, **_kwargs: 100,
     )
 
-    event = MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id="12345",
-            chat_type="dm",
-            user_id="12345",
-        ),
-        message_id="1",
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="12345",
     )
+    stamp_source_transport_owner(source, profile=None)
+    event = MessageEvent(text="hello", source=source, message_id="1")
 
     started = time.monotonic()
     result = await runner._handle_message(event)

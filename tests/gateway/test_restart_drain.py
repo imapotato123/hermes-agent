@@ -10,7 +10,11 @@ import gateway.run as gateway_run
 from agent.i18n import t
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
-from gateway.session import SessionEntry, build_session_key
+from gateway.session import (
+    SessionEntry,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -316,8 +320,14 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
     """Shutdown notifications should route from persisted origin, not reparsed keys."""
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock()
+    adapter.platform = gateway_run.Platform.MATRIX
     source = make_restart_source(chat_id="!room123:example.org", chat_type="group")
     source.platform = gateway_run.Platform.MATRIX
+    stamp_source_transport_owner(
+        source,
+        adapter=adapter,
+        platform=gateway_run.Platform.MATRIX,
+    )
     session_key = build_session_key(source)
     runner._running_agents[session_key] = MagicMock()
     runner.session_store._entries = {

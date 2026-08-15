@@ -7,7 +7,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
 
 
@@ -59,6 +59,7 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
         thread_id="thread-123",
         user_id="user-1",
     )
+    stamp_source_transport_owner(source, profile=None)
 
     await runner._defer_goal_status_notice_after_delivery(source, "✓ Goal achieved: done")
 

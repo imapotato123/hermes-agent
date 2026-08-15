@@ -30,7 +30,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -196,6 +196,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
         chat_id="-1001",
         chat_type="group",
     )
+    stamp_source_transport_owner(source, profile=None)
     result = await runner._run_agent(
         message="describe this photo",
         context_prompt="",
@@ -324,6 +325,7 @@ async def test_payload_less_split_does_not_suppress_complete_response(
         chat_type="group",
         thread_id="1",
     )
+    stamp_source_transport_owner(source, profile=None)
     result = await runner._run_agent(
         message="describe this photo",
         context_prompt="",

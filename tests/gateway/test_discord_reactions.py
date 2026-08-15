@@ -9,7 +9,11 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome, SendResult
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 def _ensure_discord_mock():
@@ -69,16 +73,22 @@ def adapter():
 
 
 def _make_event(message_id: str, raw_message) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        chat_type="dm",
+        user_id="42",
+        user_name="Jezza",
+    )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.DISCORD,
+    )
     return MessageEvent(
         text="hello",
         message_type=MessageType.TEXT,
-        source=SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="123",
-            chat_type="dm",
-            user_id="42",
-            user_name="Jezza",
-        ),
+        source=source,
         raw_message=raw_message,
         message_id=message_id,
     )
@@ -103,6 +113,7 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
     adapter._keep_typing = hold_typing
 
     event = _make_event("1", raw_message)
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
@@ -132,6 +143,7 @@ async def test_reactions_disabled_via_env(adapter, monkeypatch):
     adapter._keep_typing = hold_typing
 
     event = _make_event("4", raw_message)
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     raw_message.add_reaction.assert_not_awaited()
