@@ -1072,6 +1072,8 @@ class EmailAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images as a single email with multiple MIME attachments.
 
@@ -1106,6 +1108,14 @@ class EmailAdapter(BasePlatformAdapter):
         body = "\n\n".join(body_parts)
 
         try:
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images,
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
@@ -1116,7 +1126,9 @@ class EmailAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(
+                chat_id, images, metadata, human_delay, source=source
+            )
 
     def _send_email_with_attachments(
         self,

@@ -20,7 +20,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _event():
@@ -30,6 +30,7 @@ def _event():
         chat_type="group",
         thread_id=None,
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(
         text="hi",
         message_type=MessageType.TEXT,
@@ -38,16 +39,20 @@ def _event():
     )
 
 
-def _fake_runner(thread_meta):
-    return SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
-        _reply_anchor_for_event=lambda event: None,
-    )
+def _fake_runner(thread_meta, adapter=None):
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: thread_meta
+    runner._reply_anchor_for_event = lambda event: None
+    runner.adapters = {Platform.SLACK: adapter} if adapter is not None else {}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
+    return runner
 
 
 def _adapter():
     return SimpleNamespace(
         name="test",
+        platform=Platform.SLACK,
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
@@ -79,7 +84,7 @@ async def test_bare_local_path_in_streamed_reply_is_not_uploaded(tmp_path, monke
     adapter = _adapter()
 
     await GatewayRunner._deliver_media_from_response(
-        _fake_runner({}),
+        _fake_runner({}, adapter),
         f"The design lives at {media_file} if you want to look later.",
         _event(),
         adapter,
@@ -99,7 +104,7 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     adapter = _adapter()
 
     await GatewayRunner._deliver_media_from_response(
-        _fake_runner({}),
+        _fake_runner({}, adapter),
         f"Here is the chart.\nMEDIA:{media_file}",
         _event(),
         adapter,

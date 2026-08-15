@@ -1071,6 +1071,55 @@ class TestSignalSendMultipleImages:
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
 
+    @pytest.mark.asyncio
+    async def test_reconnect_after_first_rpc_hands_off_exact_unsent_remainder(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.platforms.base import SendResult
+        from gateway.platforms.signal_rate_limit import (
+            SIGNAL_MAX_ATTACHMENTS_PER_MSG,
+        )
+        from gateway.session import SessionSource
+
+        stale = _make_signal_adapter(monkeypatch)
+        replacement = _make_signal_adapter(monkeypatch)
+        stale._stop_typing_indicator = AsyncMock()
+        replacement.send_multiple_images = AsyncMock(
+            return_value=SendResult(success=True)
+        )
+        source = SessionSource(platform=Platform.SIGNAL, chat_id="+155****4567")
+        setattr(source, "_transport_profile", "coder")
+        setattr(source, "_transport_platform", Platform.SIGNAL)
+        current = {"adapter": stale}
+        gateway_runner = MagicMock()
+        setattr(stale, "gateway_runner", gateway_runner)
+        gateway_runner._adapter_for_source.side_effect = (
+            lambda _source: current["adapter"]
+        )
+        valid_images = _make_image_files(
+            tmp_path, SIGNAL_MAX_ATTACHMENTS_PER_MSG + 2
+        )
+        images = [(f"file://{tmp_path}/missing.png", "skipped"), *valid_images]
+        first_rpc = AsyncMock(return_value={"timestamp": 1})
+
+        async def reconnecting_rpc(*args, **kwargs):
+            result = await first_rpc(*args, **kwargs)
+            current["adapter"] = replacement
+            return result
+
+        stale._rpc = reconnecting_rpc
+
+        await stale.send_multiple_images(
+            chat_id=source.chat_id,
+            images=images,
+            source=source,
+        )
+
+        first_rpc.assert_awaited_once()
+        replacement.send_multiple_images.assert_awaited_once()
+        handed_off = replacement.send_multiple_images.call_args.kwargs["images"]
+        assert handed_off == valid_images[SIGNAL_MAX_ATTACHMENTS_PER_MSG:]
+
 
     @pytest.mark.asyncio
     async def test_429_without_retry_after_uses_default_rate(

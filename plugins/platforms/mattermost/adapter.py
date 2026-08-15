@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -74,6 +74,7 @@ _MATTERMOST_DISABLE_MENTIONS_PROPS = {"disable_mentions": True}
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _RECONNECT_JITTER = 0.2
+_POST_OWNER_REPLACED = object()
 
 
 def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -233,7 +234,9 @@ class MattermostAdapter(BasePlatformAdapter):
         chat_id: str,
         payload: Dict[str, Any],
         metadata: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        *,
+        source: Optional[Any] = None,
+    ) -> Any:
         """Post once, optionally falling back flat for final notify content."""
         data = await self._api_post("posts", payload)
         if data or "root_id" not in payload:
@@ -242,6 +245,11 @@ class MattermostAdapter(BasePlatformAdapter):
             return data
         if not self._last_post_failure_is_broken_thread_root():
             return data
+        if source is not None and self._final_delivery_adapter(source) is not self:
+            # The first post failed definitively, so prepared file IDs are safe
+            # to transfer. The retired generation must not start the helper's
+            # second physical post.
+            return _POST_OWNER_REPLACED
 
         flat_payload = dict(payload)
         flat_payload.pop("root_id", None)
@@ -640,33 +648,74 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
+        _mattermost_resume: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send a batch of images as a single Mattermost post with multiple attachments.
+        """Send images in Mattermost posts containing at most five file IDs.
 
-        Mattermost supports up to 5 ``file_ids`` per post. Each image is
-        uploaded individually (Mattermost's file API is one-at-a-time),
-        then a single post is created referencing all uploaded file_ids
-        at once. Batches larger than 5 are chunked. Falls back to the
-        base per-image loop on total failure.
+        ``_mattermost_resume`` is private continuation state used when the
+        stamped transport owner changes after one or more files were uploaded
+        but before their post was created. The replacement reuses those file
+        IDs rather than losing the prefix or uploading it twice.
         """
         if not images:
             return
 
-        import mimetypes
         import aiohttp
+        import mimetypes
         from urllib.parse import unquote as _unquote
 
-        CHUNK = 5  # Mattermost post file_ids cap
-        chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        chunk_size = 5
+        chunks = [
+            images[i : i + chunk_size]
+            for i in range(0, len(images), chunk_size)
+        ]
 
         for chunk_idx, chunk in enumerate(chunks):
+            chunk_remainder = images[chunk_idx * chunk_size :]
+            resume = _mattermost_resume if chunk_idx == 0 else None
+            file_ids: List[str] = list((resume or {}).get("file_ids") or [])
+            caption_parts: List[str] = list(
+                (resume or {}).get("caption_parts") or []
+            )
+            start_item_idx = int((resume or {}).get("next_image_index") or 0)
+            start_item_idx = max(0, min(start_item_idx, len(chunk)))
+
+            if await self._handoff_mattermost_chunk_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=chunk_remainder,
+                next_image_index=start_item_idx,
+                file_ids=file_ids,
+                caption_parts=caption_parts,
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
+                if await self._handoff_mattermost_chunk_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=chunk_remainder,
+                    next_image_index=start_item_idx,
+                    file_ids=file_ids,
+                    caption_parts=caption_parts,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
 
-            file_ids: List[str] = []
-            caption_parts: List[str] = []
+            handoff_next_index = start_item_idx
+            handoff_captions = list(caption_parts)
+            post_started = False
             try:
-                for image_url, alt_text in chunk:
+                for item_idx in range(start_item_idx, len(chunk)):
+                    image_url, alt_text = chunk[item_idx]
+                    captions_before_item = list(caption_parts)
+                    handoff_next_index = item_idx
+                    handoff_captions = captions_before_item
                     if alt_text:
                         caption_parts.append(alt_text)
 
@@ -674,62 +723,291 @@ class MattermostAdapter(BasePlatformAdapter):
                         local_path = _unquote(image_url[7:])
                         p = Path(local_path)
                         if not p.exists():
-                            logger.warning("Mattermost: skipping missing image %s", local_path)
+                            logger.warning(
+                                "Mattermost: skipping missing image %s", local_path
+                            )
                             continue
                         fname = p.name
                         ct = mimetypes.guess_type(fname)[0] or "image/png"
                         file_data = p.read_bytes()
                     else:
                         from tools.url_safety import is_safe_url
+
                         if not is_safe_url(image_url):
-                            logger.warning("Mattermost: blocked unsafe image URL in batch")
+                            logger.warning(
+                                "Mattermost: blocked unsafe image URL in batch"
+                            )
                             continue
                         try:
                             async with self._session.get(
-                                image_url, timeout=aiohttp.ClientTimeout(total=30)
+                                image_url,
+                                timeout=aiohttp.ClientTimeout(total=30),
                             ) as resp:
                                 if resp.status >= 400:
+                                    if await self._handoff_mattermost_chunk_if_replaced(
+                                        source=source,
+                                        chat_id=chat_id,
+                                        images=chunk_remainder,
+                                        next_image_index=item_idx,
+                                        file_ids=file_ids,
+                                        caption_parts=captions_before_item,
+                                        metadata=metadata,
+                                        human_delay=human_delay,
+                                    ):
+                                        return
                                     logger.warning(
-                                        "Mattermost: failed to download image (HTTP %d): %s",
-                                        resp.status, image_url[:80],
+                                        "Mattermost: failed to download image "
+                                        "(HTTP %d): %s",
+                                        resp.status,
+                                        image_url[:80],
                                     )
                                     continue
                                 file_data = await resp.read()
                                 ct = resp.content_type or "image/png"
                         except Exception as dl_err:
-                            logger.warning("Mattermost: download failed for %s: %s", image_url[:80], dl_err)
+                            if await self._handoff_mattermost_chunk_if_replaced(
+                                source=source,
+                                chat_id=chat_id,
+                                images=chunk_remainder,
+                                next_image_index=item_idx,
+                                file_ids=file_ids,
+                                caption_parts=captions_before_item,
+                                metadata=metadata,
+                                human_delay=human_delay,
+                            ):
+                                return
+                            logger.warning(
+                                "Mattermost: download failed for %s: %s",
+                                image_url[:80],
+                                dl_err,
+                            )
                             continue
-                        fname = image_url.rsplit("/", 1)[-1].split("?")[0] or f"image_{len(file_ids)}.png"
+                        fname = (
+                            image_url.rsplit("/", 1)[-1].split("?")[0]
+                            or f"image_{len(file_ids)}.png"
+                        )
 
-                    fid = await self._upload_file(chat_id, file_data, fname, ct)
+                    if await self._handoff_mattermost_chunk_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=chunk_remainder,
+                        next_image_index=item_idx,
+                        file_ids=file_ids,
+                        caption_parts=captions_before_item,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
+                    fid = await self._upload_file(
+                        chat_id, file_data, fname, ct
+                    )
                     if fid:
                         file_ids.append(fid)
+                    handoff_next_index = item_idx + 1 if fid else item_idx
+                    handoff_captions = (
+                        caption_parts if fid else captions_before_item
+                    )
+                    if await self._handoff_mattermost_chunk_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=chunk_remainder,
+                        next_image_index=handoff_next_index,
+                        file_ids=file_ids,
+                        caption_parts=handoff_captions,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
 
                 if not file_ids:
                     continue
 
-                payload: Dict[str, Any] = _with_mentions_disabled({
-                    "channel_id": chat_id,
-                    "message": "\n".join(caption_parts),
-                    "file_ids": file_ids,
-                })
+                handoff_next_index = len(chunk)
+                handoff_captions = list(caption_parts)
+                payload: Dict[str, Any] = _with_mentions_disabled(
+                    {
+                        "channel_id": chat_id,
+                        "message": "\n".join(caption_parts),
+                        "file_ids": file_ids,
+                    }
+                )
                 resolved_root = await self._thread_root_for_send(None, metadata)
+                if await self._handoff_mattermost_chunk_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=chunk_remainder,
+                    next_image_index=handoff_next_index,
+                    file_ids=file_ids,
+                    caption_parts=handoff_captions,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
                 if resolved_root:
                     payload["root_id"] = resolved_root
                 logger.info(
-                    "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
-                    len(file_ids), chunk_idx + 1, len(chunks),
+                    "Mattermost: sending %d image(s) as single post "
+                    "(chunk %d/%d)",
+                    len(file_ids),
+                    chunk_idx + 1,
+                    len(chunks),
                 )
-                data = await self._post_preserving_thread(chat_id, payload, metadata)
+                post_started = True
+                data = await self._post_preserving_thread(
+                    chat_id,
+                    payload,
+                    metadata,
+                    source=source,
+                )
+                post_started = False
+                if data is _POST_OWNER_REPLACED:
+                    if await self._handoff_mattermost_chunk_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=chunk_remainder,
+                        next_image_index=handoff_next_index,
+                        file_ids=file_ids,
+                        caption_parts=handoff_captions,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
+                    return
                 if not data or "id" not in data:
-                    logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    if await self._handoff_mattermost_chunk_if_replaced(
+                        source=source,
+                        chat_id=chat_id,
+                        images=chunk_remainder,
+                        next_image_index=len(chunk),
+                        file_ids=file_ids,
+                        caption_parts=caption_parts,
+                        metadata=metadata,
+                        human_delay=human_delay,
+                    ):
+                        return
+                    logger.warning(
+                        "Mattermost: multi-image post failed, falling back"
+                    )
+                    await super().send_multiple_images(
+                        chat_id,
+                        chunk,
+                        metadata,
+                        human_delay=human_delay,
+                        source=source,
+                    )
             except Exception as e:
+                if post_started:
+                    logger.warning(
+                        "Mattermost: image post result is ambiguous after an "
+                        "exception; refusing fallback or owner handoff",
+                        exc_info=True,
+                    )
+                    return
+                if await self._handoff_mattermost_chunk_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=chunk_remainder,
+                    next_image_index=handoff_next_index,
+                    file_ids=file_ids,
+                    caption_parts=handoff_captions,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
                 logger.warning(
-                    "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
-                    chunk_idx + 1, len(chunks), e, exc_info=True,
+                    "Mattermost: multi-image send failed (chunk %d/%d), "
+                    "falling back: %s",
+                    chunk_idx + 1,
+                    len(chunks),
+                    e,
+                    exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await super().send_multiple_images(
+                    chat_id,
+                    chunk,
+                    metadata,
+                    human_delay=human_delay,
+                    source=source,
+                )
+
+    async def _handoff_mattermost_chunk_if_replaced(
+        self,
+        *,
+        source: Optional[Any],
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        next_image_index: int,
+        file_ids: List[str],
+        caption_parts: List[str],
+        metadata: Optional[Dict[str, Any]],
+        human_delay: float,
+    ) -> bool:
+        """Transfer an uploaded-but-unposted chunk to its current owner."""
+        if source is None:
+            return False
+        delivery_adapter = self._final_delivery_adapter(source)
+        if delivery_adapter is self:
+            return False
+        if delivery_adapter is None:
+            logger.warning(
+                "Mattermost: withholding prepared image chunk: no live owner"
+            )
+            return True
+        if not file_ids and next_image_index == 0:
+            return await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images,
+                metadata=metadata,
+                human_delay=human_delay,
+            )
+        send_images = getattr(delivery_adapter, "send_multiple_images", None)
+        if not callable(send_images):
+            logger.warning(
+                "Mattermost: withholding prepared image chunk: replacement "
+                "has no batch operation"
+            )
+            return True
+
+        import inspect
+
+        try:
+            parameters = inspect.signature(send_images).parameters
+            accepts_resume = "_mattermost_resume" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_resume = False
+        if not accepts_resume:
+            logger.warning(
+                "Mattermost: withholding prepared image chunk: replacement "
+                "cannot accept uploaded file state"
+            )
+            return True
+
+        try:
+            await cast(Callable[..., Awaitable[Any]], send_images)(
+                chat_id=chat_id,
+                images=images,
+                metadata=metadata,
+                human_delay=human_delay,
+                source=source,
+                _mattermost_resume={
+                    "next_image_index": next_image_index,
+                    "file_ids": list(file_ids),
+                    "caption_parts": list(caption_parts),
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Mattermost: replacement image-chunk delivery failed; retired "
+                "owner will not retry",
+                exc_info=True,
+            )
+        return True
 
     # ------------------------------------------------------------------
     # WebSocket
