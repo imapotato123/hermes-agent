@@ -90,6 +90,14 @@ def _coerce_allow_set(raw) -> set[str]:
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
+    @staticmethod
+    def _source_has_transport_provenance(source: SessionSource) -> bool:
+        """Whether *source* carries live, nonserialized transport ownership."""
+        return bool(
+            getattr(source, "_transport_adapter_ref", None) is not None
+            or getattr(source, "_transport_profile", None) is not None
+        )
+
     def _authorization_adapter(
         self,
         platform: Optional[Platform],
@@ -147,6 +155,16 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
+        # ``source.profile`` names the runtime selected by profile_routes, not
+        # necessarily the credential that received the message. build_source()
+        # stamps the transport owner's profile separately and does not serialize
+        # it. If the original weakref is stale after reconnect, resolve the new
+        # generation from that owner instead of an unrelated routed profile.
+        if self._source_has_transport_provenance(source):
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "_transport_profile", None),
+            )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
@@ -189,6 +207,16 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
+        if self._source_has_transport_provenance(source):
+            transport_profile = getattr(source, "_transport_profile", None)
+            transport_adapter = self._authorization_adapter(
+                platform, transport_profile
+            )
+            if transport_adapter is not None and transport_adapter is (
+                getattr(self, "adapters", None) or {}
+            ).get(platform):
+                return None
+            return transport_profile
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(

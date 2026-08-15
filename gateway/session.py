@@ -185,6 +185,13 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # In-process transport provenance. These fields deliberately participate in
+    # dataclasses.replace() (topic recovery and attribution middleware rewrite
+    # SessionSource that way) but remain absent from repr/equality/to_dict/from_dict.
+    # The weakref identifies one adapter generation; the profile survives that
+    # generation so the runner can resolve its replacement after reconnect.
+    _transport_adapter_ref: Any = field(default=None, repr=False, compare=False)
+    _transport_profile: Optional[str] = field(default=None, repr=False, compare=False)
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
