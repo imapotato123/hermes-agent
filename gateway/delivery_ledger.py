@@ -107,9 +107,27 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
+            transport_profile TEXT,
+            transport_profile_stamped INTEGER NOT NULL DEFAULT 0,
             last_error TEXT
         )"""
     )
+    # Existing state.db files predate transport-owner persistence. Additive
+    # migration keeps their rows explicitly legacy/unstamped, preserving their
+    # historical primary route without weakening newly stamped multiplex rows.
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(delivery_obligations)").fetchall()
+    }
+    if "transport_profile" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN transport_profile TEXT"
+        )
+    if "transport_profile_stamped" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN "
+            "transport_profile_stamped INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -176,12 +194,21 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return True
 
 
-def compute_obligation_id(session_key: str, message_ref: str, content: str) -> str:
-    """Stable id: same turn + same content re-records idempotently, while
-    distinct threads/topics on the same chat can never collide (the
-    session_key carries platform, chat and thread; ``message_ref`` is the
-    triggering inbound message id, distinguishing turns in one session)."""
+def compute_obligation_id(
+    session_key: str,
+    message_ref: str,
+    content: str,
+    *,
+    transport_profile: Optional[str] = None,
+    transport_profile_stamped: bool = False,
+) -> str:
+    """Stable id for one turn, payload, and transport credential owner."""
     payload = f"{session_key}|{message_ref}|{content}"
+    if transport_profile_stamped:
+        payload = (
+            f"{session_key}|{message_ref}|"
+            f"stamped:{transport_profile or ''}|{content}"
+        )
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
@@ -193,8 +220,10 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    transport_profile: Optional[str] = None,
+    transport_profile_stamped: bool = False,
 ) -> None:
-    """Record a final response as owed to the platform (state='pending')."""
+    """Record a final response as owed to one transport owner."""
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -202,11 +231,23 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id),
-             str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+                owner_pid, owner_started_at, transport_profile,
+                transport_profile_stamped)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+                now,
+                now,
+                pid,
+                started,
+                transport_profile,
+                1 if transport_profile_stamped else 0,
+            ),
         )
     _prune()
 
@@ -237,6 +278,7 @@ def sweep_recoverable(
     now: Optional[float] = None,
     *,
     deliverable_platforms: Optional[set] = None,
+    deliverable_routes: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
@@ -261,12 +303,26 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
+                      transport_profile, transport_profile_stamped,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+        for (
+            oid,
+            session_key,
+            platform,
+            chat_id,
+            thread_id,
+            content,
+            state,
+            attempts,
+            created_at,
+            transport_profile,
+            transport_profile_stamped,
+            owner_pid,
+            owner_started_at,
+        ) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -283,6 +339,15 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            route = (
+                platform,
+                bool(transport_profile_stamped),
+                transport_profile if transport_profile_stamped else None,
+            )
+            if deliverable_routes is not None and route not in deliverable_routes:
+                # A different profile on the same platform is not a valid
+                # credential route. Leave the row untouched for its owner.
+                continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
@@ -298,6 +363,10 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "content": content,
+                    "transport_profile": transport_profile,
+                    "transport_profile_stamped": bool(
+                        transport_profile_stamped
+                    ),
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",

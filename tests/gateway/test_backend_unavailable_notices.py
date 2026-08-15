@@ -1096,6 +1096,7 @@ async def test_reconnect_replacement_owns_auto_tts_and_text(monkeypatch, tmp_pat
     runner.adapters = {Platform.SLACK: primary_adapter}
     runner._profile_adapters = {"coder": {Platform.SLACK: replacement}}
     stale_adapter._should_auto_tts_for_chat = lambda chat_id: True
+    replacement._should_auto_tts_for_chat = lambda chat_id: True
     stale_adapter.play_tts = AsyncMock(
         return_value=SendResult(success=True, message_id="stale-tts")
     )
@@ -1162,6 +1163,8 @@ async def test_reconnect_during_tts_uses_latest_replacement(monkeypatch, tmp_pat
         "coder": {Platform.SLACK: initial_replacement}
     }
     stale_adapter._should_auto_tts_for_chat = lambda chat_id: True
+    initial_replacement._should_auto_tts_for_chat = lambda chat_id: True
+    latest_replacement._should_auto_tts_for_chat = lambda chat_id: True
     initial_replacement.play_tts = AsyncMock(
         return_value=SendResult(success=True, message_id="initial-tts")
     )
@@ -1198,6 +1201,55 @@ async def test_reconnect_during_tts_uses_latest_replacement(monkeypatch, tmp_pat
     assert [message["content"] for message in latest_replacement.sent] == [
         "latest reply"
     ]
+
+
+@pytest.mark.asyncio
+async def test_failed_auto_tts_result_cleans_all_reported_files(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    _wire_runner(
+        monkeypatch,
+        tmp_path,
+        adapter,
+        [_successful_result("text still delivers")],
+    )
+    source = adapter.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-failed-tts-cleanup",
+    )
+    adapter._should_auto_tts_for_chat = lambda chat_id: True
+    reported = tmp_path / "reported-failed.mp3"
+    requested = tmp_path / "requested-failed.mp3"
+
+    def failed_tts(*, text, output_path):
+        reported.write_bytes(b"failed audio")
+        return (
+            '{"success": false, "file_path": "%s", "error": "provider failed"}'
+            % reported
+        )
+
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", failed_tts)
+    monkeypatch.setattr(
+        "gateway.platforms.base.build_auto_tts_output_path",
+        lambda _platform: str(requested),
+    )
+
+    await adapter._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=source,
+            message_id="m-failed-tts-cleanup",
+            message_type=MessageType.VOICE,
+        ),
+        build_session_key(source),
+    )
+
+    assert not requested.exists()
+    assert not reported.exists()
+    assert adapter.sent[0]["content"] == "text still delivers"
 
 
 @pytest.mark.asyncio
