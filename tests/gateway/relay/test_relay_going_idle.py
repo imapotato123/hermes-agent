@@ -121,6 +121,9 @@ async def test_buffered_inbound_is_acked_after_handler(server):
 
     async def handler(ev):
         seen.append(ev.text)
+        handoff = getattr(ev, "_relay_durable_handoff", None)
+        if handoff is not None:
+            handoff.set()
 
     t = WebSocketRelayTransport(server.url, "discord", "appShared")
     t.set_inbound_handler(handler)
@@ -131,6 +134,92 @@ async def test_buffered_inbound_is_acked_after_handler(server):
         assert "buffered" in seen and "live" in seen
         # Only the buffered (bufferId) delivery was acked.
         assert server.inbound_acks == ["buf-42"]
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_buffered_inbound_ack_waits_for_durable_handoff(server):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "buffered",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "c1",
+                    "chat_type": "dm",
+                },
+            },
+            "bufferId": "buf-durable",
+        }
+    ]
+    release = asyncio.Event()
+
+    async def handler(event):
+        handoff = getattr(event, "_relay_durable_handoff", None)
+        assert handoff is not None
+
+        async def mark_later():
+            await release.wait()
+            handoff.set()
+
+        asyncio.create_task(mark_later())
+
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    t.set_inbound_handler(handler)
+    await t.connect()
+    try:
+        await t.handshake()
+        await asyncio.sleep(0.05)
+        assert server.inbound_acks == []
+        release.set()
+        for _ in range(20):
+            if server.inbound_acks:
+                break
+            await asyncio.sleep(0.01)
+        assert server.inbound_acks == ["buf-durable"]
+    finally:
+        await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_buffered_inbound_wait_does_not_block_reader(server):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "buffered",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "c1",
+                    "chat_type": "dm",
+                },
+            },
+            "bufferId": "buf-reader",
+        }
+    ]
+    release = asyncio.Event()
+
+    async def handler(event):
+        await release.wait()
+        event._relay_durable_handoff.set()
+
+    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    t.set_inbound_handler(handler)
+    await t.connect()
+    try:
+        await t.handshake()
+        assert await t.go_idle(timeout_s=0.5) is True
+        assert server.inbound_acks == []
+        release.set()
+        for _ in range(20):
+            if server.inbound_acks:
+                break
+            await asyncio.sleep(0.01)
+        assert server.inbound_acks == ["buf-reader"]
     finally:
         await t.disconnect()
 
@@ -196,6 +285,9 @@ async def test_go_dormant_redials_on_wake_and_drains(server):
 
     async def handler(ev):
         seen.append(ev.text)
+        handoff = getattr(ev, "_relay_durable_handoff", None)
+        if handoff is not None:
+            handoff.set()
 
     t = WebSocketRelayTransport(
         server.url, "discord", "appShared", reconnect=True, reconnect_backoff_s=5.0

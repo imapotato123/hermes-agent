@@ -58,6 +58,12 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
 
+    def fronts_platform(self, platform) -> bool:
+        return (
+            self.platform == Platform.RELAY
+            and getattr(platform, "value", platform) == Platform.DISCORD.value
+        )
+
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
     """Capture sends while exercising Discord's real preview formatter."""

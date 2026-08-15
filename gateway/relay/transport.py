@@ -70,6 +70,10 @@ class RelayTransport(Protocol):
         """
         ...
 
+    async def ack_buffered_inbound(self, buffer_id: str) -> None:
+        """Acknowledge one connector-buffered delivery after durable handoff."""
+        ...
+
     async def send_outbound(
         self, action: Dict[str, Any], *, platform: Optional[str] = None
     ) -> Dict[str, Any]:

@@ -21,6 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
+from gateway.delivery import relay_fronts_platform
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -146,6 +147,7 @@ class GatewayAuthorizationMixin:
             # register their own relay adapters, so profile-aware lookup would
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
+<<<<<<< ours
             return adapters.get(Platform.RELAY)
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
@@ -153,6 +155,100 @@ class GatewayAuthorizationMixin:
             getattr(source, "platform", None),
             getattr(source, "profile", None),
         )
+=======
+            adapter = adapters.get(Platform.RELAY)
+            source_attrs = getattr(source, "__dict__", {})
+            expected_identity = (
+                source_attrs.get("_transport_identity")
+                if isinstance(source_attrs, dict)
+                else None
+            )
+            if expected_identity is not None:
+                matches_identity = getattr(
+                    adapter, "matches_transport_identity", None
+                )
+                logical_platform = getattr(
+                    getattr(source, "platform", None),
+                    "value",
+                    getattr(source, "platform", None),
+                )
+                if (
+                    not str(expected_identity).startswith(
+                        f"{logical_platform}:"
+                    )
+                    or not callable(matches_identity)
+                    or not matches_identity(str(expected_identity))
+                ):
+                    return None
+            elif not relay_fronts_platform(
+                adapter, getattr(source, "platform", None)
+            ):
+                return None
+            prime = getattr(adapter, "prime_routing_source", None)
+            if callable(prime):
+                prime(source)
+            return adapter
+        # ``source.profile`` names the runtime selected by profile_routes, not
+        # necessarily the credential that received the message. Resolve the
+        # durable physical platform/profile pair instead; relay sources retain
+        # their underlying logical platform for session identity.
+        source_attrs = getattr(source, "__dict__", {})
+        if (
+            isinstance(source_attrs, dict)
+            and "_transport_profile" in source_attrs
+        ):
+            transport_platform = source_attrs.get(
+                "_transport_platform", getattr(source, "platform", None)
+            )
+            adapter = self._authorization_adapter(
+                transport_platform,
+                source_attrs.get("_transport_profile"),
+            )
+            if transport_platform == Platform.RELAY and adapter is not None:
+                expected_identity = source_attrs.get("_transport_identity")
+                matches_identity = getattr(
+                    adapter, "matches_transport_identity", None
+                )
+                if expected_identity is not None:
+                    logical_platform = getattr(
+                        getattr(source, "platform", None),
+                        "value",
+                        getattr(source, "platform", None),
+                    )
+                    if (
+                        not str(expected_identity).startswith(
+                            f"{logical_platform}:"
+                        )
+                        or not callable(matches_identity)
+                        or not matches_identity(str(expected_identity))
+                    ):
+                        return None
+                elif getattr(source, "delivered_via_upstream_relay", False) is not True:
+                    # Restored relay owners without an account fingerprint are
+                    # ambiguous and must not degrade to platform-only routing.
+                    return None
+                if (
+                    getattr(source, "platform", None) != Platform.RELAY
+                    and expected_identity is None
+                    and not relay_fronts_platform(
+                        adapter, getattr(source, "platform", None)
+                    )
+                ):
+                    return None
+                prime = getattr(adapter, "prime_routing_source", None)
+                if callable(prime):
+                    prime(source)
+            return adapter
+        # Only an explicit deserialization marker proves this is a genuinely
+        # historical unstamped record. Fresh hand-built sources have no
+        # physical-owner authority and fail closed.
+        if getattr(source, "_legacy_transport_owner_unstamped", False) is True:
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "profile", None),
+            )
+        return None
+>>>>>>> theirs
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -169,6 +265,27 @@ class GatewayAuthorizationMixin:
         platform = getattr(source, "platform", None)
         if adapter is None or platform is None:
             return None
+<<<<<<< ours
+=======
+        expected_identity = (
+            source_attrs.get("_transport_identity")
+            if isinstance(source_attrs, dict)
+            else None
+        )
+        if platform == Platform.RELAY and expected_identity is not None:
+            matches_identity = getattr(adapter, "matches_transport_identity", None)
+            logical_platform = getattr(
+                getattr(source, "platform", None),
+                "value",
+                getattr(source, "platform", None),
+            )
+            if (
+                not str(expected_identity).startswith(f"{logical_platform}:")
+                or not callable(matches_identity)
+                or not matches_identity(str(expected_identity))
+            ):
+                return None
+>>>>>>> theirs
         if adapter is (getattr(self, "adapters", None) or {}).get(platform):
             return adapter
         profile_maps = getattr(self, "_profile_adapters", None) or {}
@@ -426,15 +543,24 @@ class GatewayAuthorizationMixin:
         # need — so keying authz off ``source.platform`` would miss (the relay
         # adapter is registered under ``Platform.RELAY``) and default-deny the
         # user ("Unauthorized user <id> on discord"). The adapter-flag check is
-        # retained for events whose ``source.platform`` IS ``Platform.RELAY``
-        # (e.g. the interaction-passthrough path).
+        # Never infer durable auth trust from ``source.platform == RELAY``:
+        # SessionSource intentionally omits the process-local delivery marker
+        # when serialized.  Accepting the relay adapter flag here would silently
+        # restore that trust after deserialization.
         # ``is True`` (not just truthiness): the marker is a real bool on a
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
-            source.platform,
-            profile=adapter_profile,
+        adapter_upstream_authorized = (
+            source.platform != Platform.RELAY
+            and self._adapter_authorization_is_upstream(
+                source.platform,
+                profile=adapter_profile,
+            )
+        )
+        if (
+            source.delivered_via_upstream_relay is True
+            or adapter_upstream_authorized
         ):
             return True
 

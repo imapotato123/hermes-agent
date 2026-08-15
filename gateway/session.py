@@ -19,6 +19,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -1127,6 +1128,19 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    source_attrs = getattr(source, "__dict__", {})
+    relay_transport_identity = None
+    if (
+        isinstance(source_attrs, dict)
+        and source_attrs.get("_transport_platform") == Platform.RELAY
+        and source_attrs.get("_transport_identity") is not None
+    ):
+        relay_transport_identity = str(source_attrs["_transport_identity"])
+
+    def _with_transport_identity(key: str) -> str:
+        if relay_transport_identity is None:
+            return key
+        return f"{key}:transport={quote(relay_transport_identity, safe='')}"
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1144,7 +1158,9 @@ def build_session_key(
             dm_parts.append(dm_chat_id)
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return _with_transport_identity(
+                ":".join(str(part) for part in dm_parts)
+            )
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -1161,10 +1177,14 @@ def build_session_key(
             dm_parts.append(str(dm_participant_id))
             if source.thread_id:
                 dm_parts.append(source.thread_id)
-            return ":".join(str(part) for part in dm_parts)
+            return _with_transport_identity(
+                ":".join(str(part) for part in dm_parts)
+            )
         if source.thread_id:
             dm_parts.append(source.thread_id)
-        return ":".join(str(part) for part in dm_parts)
+        return _with_transport_identity(
+            ":".join(str(part) for part in dm_parts)
+        )
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -1208,7 +1228,9 @@ def build_session_key(
     if isolate_user and participant_id:
         key_parts.append(str(participant_id))
 
-    return ":".join(str(part) for part in key_parts)
+    return _with_transport_identity(
+        ":".join(str(part) for part in key_parts)
+    )
 
 
 class _SessionFlight:
@@ -1828,6 +1850,15 @@ class SessionStore:
             profile=self._resolve_profile_for_key(source),
         )
 
+    @staticmethod
+    def _has_stamped_relay_identity(source: SessionSource) -> bool:
+        attrs = getattr(source, "__dict__", {})
+        return bool(
+            isinstance(attrs, dict)
+            and attrs.get("_transport_platform") == Platform.RELAY
+            and attrs.get("_transport_identity") is not None
+        )
+
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
         """Return the pre-workspace Slack key for an explicitly scoped source.
 
@@ -1848,6 +1879,77 @@ class SessionStore:
                 self.config, "thread_sessions_per_user", False
             ),
             profile=self._resolve_profile_for_key(source),
+        )
+
+    def _legacy_relay_session_key(self, source: SessionSource) -> Optional[str]:
+        """Return the pre-identity key for an exactly stamped relay source."""
+        if not self._has_stamped_relay_identity(source):
+            return None
+        current_key = self._generate_session_key(source)
+        marker = ":transport="
+        if marker not in current_key:
+            return None
+        return current_key.rsplit(marker, 1)[0]
+
+    def _legacy_recovery_session_keys(
+        self, source: SessionSource
+    ) -> List[tuple[str, bool]]:
+        """Return safe exact-key migration candidates and Slack-claim flags."""
+        slack_key = self._legacy_slack_session_key(source)
+        relay_key = self._legacy_relay_session_key(source)
+        candidates: List[tuple[str, bool]] = []
+
+        def _append(key: Optional[str], claim_slack: bool) -> None:
+            if key and all(existing != key for existing, _ in candidates):
+                candidates.append((key, claim_slack))
+
+        # Prefer retaining the workspace discriminator while dropping only the
+        # newly added relay-identity suffix. Then try the pre-workspace key that
+        # still retains identity, and finally the doubly historical form.
+        _append(relay_key, False)
+        _append(slack_key, True)
+        if slack_key and ":transport=" in slack_key:
+            _append(slack_key.rsplit(":transport=", 1)[0], True)
+        return candidates
+
+    @staticmethod
+    def _recovered_row_matches_relay_identity(
+        recovered: Dict[str, Any], source: SessionSource
+    ) -> bool:
+        """Authorize a pre-key-migration row using its durable exact owner."""
+        if not SessionStore._has_stamped_relay_identity(source):
+            return True
+        source_identity = getattr(source, "__dict__", {}).get(
+            "_transport_identity"
+        )
+        try:
+            origin = json.loads(recovered.get("origin_json") or "")
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            isinstance(origin, dict)
+            and origin.get("transport_owner_stamped") is True
+            and origin.get("transport_platform") == Platform.RELAY.value
+            and origin.get("transport_identity") == source_identity
+        )
+
+    @staticmethod
+    def _session_entry_matches_relay_identity(
+        entry: SessionEntry, source: SessionSource
+    ) -> bool:
+        """Validate an in-memory routing-index entry against the exact owner."""
+        if not SessionStore._has_stamped_relay_identity(source):
+            return True
+        origin = entry.origin
+        if origin is None or not SessionStore._has_stamped_relay_identity(origin):
+            return False
+        source_attrs = getattr(source, "__dict__", {})
+        origin_attrs = getattr(origin, "__dict__", {})
+        return bool(
+            origin_attrs.get("_transport_identity")
+            == source_attrs.get("_transport_identity")
+            and origin.platform == source.platform
+            and origin.scope_id == source.scope_id
         )
 
     def _claim_legacy_slack_key(self, legacy_key: Optional[str]) -> bool:
@@ -1993,27 +2095,44 @@ class SessionStore:
         row is then durably promoted to a reset boundary instead of being
         resurrected as freshly active.
         """
-        legacy_key = self._legacy_slack_session_key(source)
+        legacy_candidates = self._legacy_recovery_session_keys(source)
+        allow_peer_fallback = (
+            not legacy_candidates
+            and not self._has_stamped_relay_identity(source)
+        )
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            allow_peer_fallback=allow_peer_fallback,
             raise_on_lookup_error=raise_on_lookup_error,
         )
         migrated_legacy = False
-        if (
-            not recovered
-            and legacy_key
-            and self._claim_legacy_slack_key(legacy_key)
-        ):
-            recovered = self._find_gateway_session_row(
-                session_key=legacy_key,
-                source=source,
-                allow_peer_fallback=False,
-                raise_on_lookup_error=raise_on_lookup_error,
-            )
-            migrated_legacy = bool(recovered)
         if not recovered:
+            for legacy_key, claim_slack in legacy_candidates:
+                candidate = self._find_gateway_session_row(
+                    session_key=legacy_key,
+                    source=source,
+                    allow_peer_fallback=False,
+                    raise_on_lookup_error=raise_on_lookup_error,
+                )
+                if not candidate:
+                    continue
+                if not self._recovered_row_matches_relay_identity(
+                    candidate, source
+                ):
+                    continue
+                if not self._recovered_row_matches_source_scope(
+                    candidate, source
+                ):
+                    continue
+                if claim_slack and not self._claim_legacy_slack_key(legacy_key):
+                    continue
+                recovered = candidate
+                migrated_legacy = True
+                break
+        if not recovered:
+            return None
+        if not self._recovered_row_matches_relay_identity(recovered, source):
             return None
         if not self._recovered_row_matches_source_scope(recovered, source):
             return None
@@ -2072,25 +2191,42 @@ class SessionStore:
         The returned entry's session row is NOT reopened here: the caller
         evaluates the reset policy first and decides reset vs resume.
         """
-        legacy_key = self._legacy_slack_session_key(source)
+        legacy_candidates = self._legacy_recovery_session_keys(source)
+        allow_peer_fallback = (
+            not legacy_candidates
+            and not self._has_stamped_relay_identity(source)
+        )
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            allow_peer_fallback=allow_peer_fallback,
         )
         migrated_legacy = False
-        if (
-            not recovered
-            and legacy_key
-            and self._claim_legacy_slack_key(legacy_key)
-        ):
-            recovered = self._find_gateway_session_row(
-                session_key=legacy_key,
-                source=source,
-                allow_peer_fallback=False,
-            )
-            migrated_legacy = bool(recovered)
+        if not recovered:
+            for legacy_key, claim_slack in legacy_candidates:
+                candidate = self._find_gateway_session_row(
+                    session_key=legacy_key,
+                    source=source,
+                    allow_peer_fallback=False,
+                )
+                if not candidate:
+                    continue
+                if not self._recovered_row_matches_relay_identity(
+                    candidate, source
+                ):
+                    continue
+                if not self._recovered_row_matches_source_scope(
+                    candidate, source
+                ):
+                    continue
+                if claim_slack and not self._claim_legacy_slack_key(legacy_key):
+                    continue
+                recovered = candidate
+                migrated_legacy = True
+                break
         if not isinstance(recovered, dict):
+            return None
+        if not self._recovered_row_matches_relay_identity(recovered, source):
             return None
         if not self._recovered_row_matches_source_scope(recovered, source):
             return None
@@ -2485,6 +2621,50 @@ class SessionStore:
         session_key = self._generate_session_key(source)
         now = _now()
 
+        # One-time routing-index migration for relay sessions created before
+        # exact bot identity became part of the key. The old entry is adopted
+        # only when its durable origin carries the same stamped identity and
+        # tenant scope; ambiguous or contradictory entries remain quarantined.
+        migrated_relay_entry: Optional[SessionEntry] = None
+        relay_legacy_candidates = self._legacy_recovery_session_keys(source)
+        if self._has_stamped_relay_identity(source) and not force_new:
+            with self._lock:
+                self._ensure_loaded_locked()
+                current_entry = self._entries.get(session_key)
+                if current_entry is not None and not self._session_entry_matches_relay_identity(
+                    current_entry, source
+                ):
+                    self._entries.pop(session_key, None)
+                if session_key not in self._entries:
+                    for legacy_candidate, claim_slack in relay_legacy_candidates:
+                        legacy_entry = self._entries.get(legacy_candidate)
+                        if legacy_entry is None:
+                            continue
+                        if not self._session_entry_matches_relay_identity(
+                            legacy_entry, source
+                        ):
+                            continue
+                        if claim_slack and not self._claim_legacy_slack_key(
+                            legacy_candidate
+                        ):
+                            continue
+                        migrated_relay_entry = self._entries.pop(legacy_candidate)
+                        migrated_relay_entry.session_key = session_key
+                        migrated_relay_entry.origin = source
+                        migrated_relay_entry.platform = source.platform
+                        migrated_relay_entry.chat_type = source.chat_type
+                        self._entries[session_key] = migrated_relay_entry
+                        break
+            if migrated_relay_entry is not None or current_entry is not None:
+                self._save_entries()
+            if migrated_relay_entry is not None:
+                self._record_gateway_session_peer(
+                    migrated_relay_entry.session_id,
+                    session_key,
+                    source,
+                    display_name=migrated_relay_entry.display_name,
+                )
+
         # One-time routing-index migration for Slack sessions created before
         # workspace scope was part of the key. Move (rather than copy) the
         # legacy entry so a second workspace with identical Slack ids cannot
@@ -2515,6 +2695,9 @@ class SessionStore:
                         adopt = origin_scope == source.scope_id
                     else:
                         adopt = source.chat_type == "dm"
+                    adopt = adopt and self._session_entry_matches_relay_identity(
+                        legacy_entry, source
+                    )
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
                         migrated_legacy_entry.session_key = session_key

@@ -129,25 +129,43 @@ async def test_adapter_stamps_per_frame_platform_from_inbound(monkeypatch):
     await adapter.connect()
 
     # A telegram inbound for chat "tg-1".
-    await stub.push_inbound(
-        MessageEvent(
-            text="hi",
-            message_type=MessageType.TEXT,
-            source=SessionSource(platform=Platform.TELEGRAM, chat_id="tg-1", chat_type="dm", user_id="u-1"),
-        )
+    telegram_event = MessageEvent(
+        text="hi",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="tg-1",
+            chat_type="dm",
+            user_id="u-1",
+        ),
     )
+    setattr(
+        telegram_event.source,
+        "_relay_ingress_transport_identity",
+        "telegram:bot-9",
+    )
+    await stub.push_inbound(telegram_event)
     await adapter.send("tg-1", "a telegram reply")
     # The reply was tagged for telegram (per-frame egress).
     assert stub.sent_platforms[-1] == "telegram"
 
     # A discord inbound for chat "dc-1".
-    await stub.push_inbound(
-        MessageEvent(
-            text="yo",
-            message_type=MessageType.TEXT,
-            source=SessionSource(platform=Platform.DISCORD, chat_id="dc-1", chat_type="channel", scope_id="g-1"),
-        )
+    discord_event = MessageEvent(
+        text="yo",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="dc-1",
+            chat_type="channel",
+            scope_id="g-1",
+        ),
     )
+    setattr(
+        discord_event.source,
+        "_relay_ingress_transport_identity",
+        "discord:app-1",
+    )
+    await stub.push_inbound(discord_event)
     await adapter.send("dc-1", "a discord reply")
     assert stub.sent_platforms[-1] == "discord"
 

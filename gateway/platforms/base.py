@@ -8,6 +8,7 @@ and implement the required methods.
 import asyncio
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -104,6 +105,26 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+<<<<<<< ours
+=======
+    source_attrs = getattr(source, "__dict__", {})
+    if (
+        isinstance(source_attrs, dict)
+        and source_attrs.get("_transport_platform") == Platform.RELAY
+    ):
+        logical_platform = _platform_name(getattr(source, "platform", None))
+        if logical_platform and logical_platform != Platform.RELAY.value:
+            metadata["_relay_logical_platform"] = logical_platform
+        identity = source_attrs.get("_transport_identity")
+        if identity:
+            metadata["_relay_transport_identity"] = str(identity)
+        scope_id = getattr(source, "scope_id", None)
+        user_id = getattr(source, "user_id", None)
+        if scope_id:
+            metadata["scope_id"] = str(scope_id)
+        if user_id:
+            metadata["user_id"] = str(user_id)
+>>>>>>> theirs
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -2482,8 +2503,6 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
-
-
 # Machine-readable send-failure categories.  Kept platform-neutral so every
 # adapter can populate ``SendResult.error_kind`` from the same vocabulary and
 # the gateway can decide — once, in one place — whether a failure is worth
@@ -4031,6 +4050,28 @@ class BasePlatformAdapter(ABC):
             # about it never being awaited, then drop silently.
             coro.close()
 
+    def _schedule_ephemeral_delete_for_result(
+        self,
+        *,
+        result: SendResult,
+        chat_id: str,
+        ttl_seconds: int,
+        fallback_adapter: Optional[Any] = None,
+    ) -> None:
+        """Delete through the exact adapter generation that created the ID."""
+        if not result.success or not result.message_id or ttl_seconds <= 0:
+            return
+        sending_adapter = getattr(result, "_sending_adapter", None)
+        if sending_adapter is None:
+            sending_adapter = fallback_adapter if fallback_adapter is not None else self
+        schedule_delete = getattr(sending_adapter, "_schedule_ephemeral_delete", None)
+        if callable(schedule_delete):
+            schedule_delete(
+                chat_id=chat_id,
+                message_id=result.message_id,
+                ttl_seconds=ttl_seconds,
+            )
+
     # ── Shared interactive-prompt formatting cores ─────────────────────────
     # Template attrs for ``_format_exec_approval``. Adapters override these to
     # keep their historical, platform-specific wording byte-identical while
@@ -5383,8 +5424,11 @@ class BasePlatformAdapter(ABC):
                     ttl = int(self._get_ephemeral_system_ttl_default())
                 except Exception:
                     ttl = 0
+<<<<<<< ours
             if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
                 ttl = 0
+=======
+>>>>>>> theirs
             return response.text, int(ttl or 0)
         return response, 0
 
@@ -5440,6 +5484,7 @@ class BasePlatformAdapter(ABC):
             reply_to=reply_to,
             metadata=metadata,
         )
+        result._sending_adapter = send_adapter
 
         if result.success:
             return result
@@ -5474,6 +5519,7 @@ class BasePlatformAdapter(ABC):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
+                result._sending_adapter = send_adapter
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
@@ -5503,6 +5549,7 @@ class BasePlatformAdapter(ABC):
             reply_to=reply_to,
             metadata=metadata,
         )
+        fallback_result._sending_adapter = send_adapter
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -5903,12 +5950,11 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
-                if _eph_ttl > 0 and _r.success and _r.message_id:
-                    self._schedule_ephemeral_delete(
-                        chat_id=event.source.chat_id,
-                        message_id=_r.message_id,
-                        ttl_seconds=_eph_ttl,
-                    )
+                self._schedule_ephemeral_delete_for_result(
+                    result=_r,
+                    chat_id=event.source.chat_id,
+                    ttl_seconds=_eph_ttl,
+                )
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
             await self.cancel_session_processing(
@@ -6019,12 +6065,11 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
-                                chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
-                            )
+                        self._schedule_ephemeral_delete_for_result(
+                            result=_r,
+                            chat_id=event.source.chat_id,
+                            ttl_seconds=_eph_ttl,
+                        )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -6072,12 +6117,11 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
-                                self._schedule_ephemeral_delete(
-                                    chat_id=event.source.chat_id,
-                                    message_id=_r.message_id,
-                                    ttl_seconds=_eph_ttl,
-                                )
+                            self._schedule_ephemeral_delete_for_result(
+                                result=_r,
+                                chat_id=event.source.chat_id,
+                                ttl_seconds=_eph_ttl,
+                            )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
@@ -6132,6 +6176,12 @@ class BasePlatformAdapter(ABC):
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
         self._start_session_processing(event, session_key)
+
+    @staticmethod
+    def _complete_relay_durable_handoff(event: MessageEvent) -> None:
+        handoff = getattr(event, "_relay_durable_handoff", None)
+        if handoff is not None and not handoff.is_set():
+            handoff.set()
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -6165,14 +6215,79 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        _bundle_obligation_id = None
+        _bundle_attempt_started = False
+        _bundle_delivery_failed = False
+        _bundle_delivery_progress = False
+        _bundle_checkpoint_failed = False
+        _bundle_recorded = False
+        _bundle_recording_failed = False
+        _bundle_auto_tts_requested = False
+        _bundle_auto_tts_caption_text = False
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, _bundle_delivery_failed
+            nonlocal _bundle_delivery_progress
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                if _bundle_attempt_started:
+                    _bundle_delivery_progress = True
+            else:
+                _bundle_delivery_failed = True
+
+        async def _begin_bundle_operation(operation_key: str) -> bool:
+            nonlocal _bundle_attempt_started, _bundle_delivery_failed
+            if not _bundle_recorded:
+                return True
+            try:
+                from gateway.delivery_ledger import (
+                    mark_bundle_operation_attempting,
+                )
+
+                transitioned = await asyncio.to_thread(
+                    mark_bundle_operation_attempting,
+                    _bundle_obligation_id,
+                    operation_key,
+                )
+                if not transitioned:
+                    raise RuntimeError("bundle operation row is not claimable")
+                _bundle_attempt_started = True
+                return True
+            except Exception:
+                _bundle_delivery_failed = True
+                logger.debug(
+                    "delivery bundle operation-attempt update failed",
+                    exc_info=True,
+                )
+                return False
+
+        async def _checkpoint_bundle_operation(
+            operation_key: str, *fulfilled_operation_keys: str
+        ) -> None:
+            nonlocal _bundle_delivery_progress, _bundle_delivery_failed
+            nonlocal _bundle_checkpoint_failed
+            if not _bundle_recorded or _bundle_obligation_id is None:
+                return
+            try:
+                from gateway.delivery_ledger import mark_bundle_operations_completed
+
+                if not await asyncio.to_thread(
+                    mark_bundle_operations_completed,
+                    _bundle_obligation_id,
+                    [operation_key, *fulfilled_operation_keys],
+                ):
+                    raise RuntimeError("bundle operation checkpoint rejected")
+                _bundle_delivery_progress = True
+            except Exception:
+                _bundle_delivery_failed = True
+                _bundle_checkpoint_failed = True
+                logger.debug(
+                    "delivery bundle operation checkpoint failed",
+                    exc_info=True,
+                )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6213,6 +6328,16 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+<<<<<<< ours
+=======
+            # Buffered relay ingress is safe to ACK once the runner either
+            # persisted the active-turn marker (normal path) or synchronously
+            # consumed/rejected the event and returned without raising.
+            self._complete_relay_durable_handoff(event)
+            is_backend_unavailable_response = isinstance(
+                response, BackendUnavailableReply
+            )
+>>>>>>> theirs
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6330,6 +6455,175 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+<<<<<<< ours
+=======
+                # Persist the complete physical-output plan before any send.
+                # Legacy text-only rows remain readable; new response_bundle
+                # rows retain native images and local/media attachments so an
+                # unavailable exact owner does not turn them into a black hole.
+                if (
+                    not is_ephemeral_response
+                    and not is_backend_unavailable_response
+                    and not str(event.text or "").lstrip().startswith(
+                        ("/", self.typed_command_prefix or "!")
+                    )
+                    and (text_content or images or local_files or media_files)
+                ):
+                    try:
+                        from gateway.delivery_ledger import (
+                            compute_obligation_id,
+                            ledger_enabled,
+                            record_obligation,
+                        )
+
+                        if await asyncio.to_thread(ledger_enabled):
+                            _source_attrs = getattr(event.source, "__dict__", {})
+                            _transport_profile_stamped = (
+                                isinstance(_source_attrs, dict)
+                                and "_transport_profile" in _source_attrs
+                            )
+                            _transport_profile = (
+                                _source_attrs.get("_transport_profile")
+                                if _transport_profile_stamped
+                                else None
+                            )
+                            _transport_identity = (
+                                _source_attrs.get("_transport_identity")
+                                if _transport_profile_stamped
+                                else None
+                            )
+                            _transport_platform = (
+                                _source_attrs.get("_transport_platform")
+                                if _transport_profile_stamped
+                                else None
+                            )
+                            _transport_platform_value = getattr(
+                                _transport_platform,
+                                "value",
+                                _transport_platform,
+                            )
+                            _bundle_auto_tts_requested = bool(
+                                event.message_type == MessageType.VOICE
+                                and not media_files
+                                and text_content
+                                and self._should_auto_tts_for_chat(
+                                    event.source.chat_id
+                                )
+                                and not self._streaming_tts_turn_completed(
+                                    session_key,
+                                    getattr(
+                                        interrupt_event,
+                                        "_hermes_run_generation",
+                                        None,
+                                    ),
+                                    event=event,
+                                )
+                            )
+                            _bundle_auto_tts_caption_text = bool(
+                                _bundle_auto_tts_requested
+                                and event.source.platform == Platform.TELEGRAM
+                                and text_content[:1024] == text_content
+                            )
+                            _bundle_payload_data = {
+                                "version": 1,
+                                "text": text_content,
+                                "images": images,
+                                "media_files": media_files,
+                                "local_files": local_files,
+                                "force_document_attachments": bool(
+                                    force_document_attachments
+                                ),
+                                "auto_tts": _bundle_auto_tts_requested,
+                                "auto_tts_caption_text": (
+                                    _bundle_auto_tts_caption_text
+                                ),
+                                "completed_operations": [],
+                            }
+                            from gateway.delivery_ledger import (
+                                response_bundle_operation_keys,
+                            )
+
+                            _bundle_payload_data["operation_keys"] = (
+                                response_bundle_operation_keys(
+                                    _bundle_payload_data
+                                )
+                            )
+                            _bundle_payload = json.dumps(
+                                _bundle_payload_data,
+                                sort_keys=True,
+                            )
+                            _bundle_obligation_id = compute_obligation_id(
+                                session_key,
+                                str(getattr(event, "message_id", "") or ""),
+                                text_content,
+                                transport_platform=_transport_platform_value,
+                                transport_profile=_transport_profile,
+                                transport_profile_stamped=(
+                                    _transport_profile_stamped
+                                ),
+                                transport_identity=_transport_identity,
+                                route_scope_id=getattr(event.source, "scope_id", None),
+                                route_user_id=getattr(event.source, "user_id", None),
+                                operation="response_bundle",
+                                payload_json=_bundle_payload,
+                            )
+                            await asyncio.to_thread(
+                                record_obligation,
+                                obligation_id=_bundle_obligation_id,
+                                session_key=session_key,
+                                platform=str(
+                                    getattr(
+                                        event.source.platform,
+                                        "value",
+                                        event.source.platform,
+                                    )
+                                ),
+                                chat_id=event.source.chat_id,
+                                thread_id=getattr(event.source, "thread_id", None),
+                                content=text_content,
+                                transport_platform=_transport_platform_value,
+                                transport_profile=_transport_profile,
+                                transport_profile_stamped=(
+                                    _transport_profile_stamped
+                                ),
+                                transport_identity=_transport_identity,
+                                route_scope_id=getattr(event.source, "scope_id", None),
+                                route_user_id=getattr(event.source, "user_id", None),
+                                route_chat_type=getattr(event.source, "chat_type", None),
+                                operation="response_bundle",
+                                payload_json=_bundle_payload,
+                            )
+                            _bundle_recorded = True
+                    except Exception:
+                        _bundle_recording_failed = True
+                        _bundle_delivery_failed = True
+                        logger.debug(
+                            "delivery bundle ledger record failed",
+                            exc_info=True,
+                        )
+                        _bundle_obligation_id = None
+
+                if _bundle_recording_failed:
+                    logger.error(
+                        "[%s] Withholding final response: durable delivery "
+                        "bundle could not be recorded",
+                        self.name,
+                    )
+                    return
+
+                # Resolve before TTS synthesis so a missing explicitly stamped
+                # owner cannot trigger stale-generation side effects. Preserve
+                # the payload, though: every actual send re-resolves below, so
+                # an owner registered meanwhile can still receive it safely.
+                delivery_adapter = self._final_delivery_adapter(event.source)
+                if delivery_adapter is None:
+                    logger.warning(
+                        "[%s] No live adapter at final-output start; each send "
+                        "will re-resolve the stamped transport owner",
+                        self.name,
+                    )
+
+>>>>>>> theirs
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -6379,14 +6673,110 @@ class BasePlatformAdapter(ABC):
                                     if path and Path(path).exists()
                                 ]
                                 _tts_path = _tts_paths[0] if _tts_paths else None
+                                if _bundle_recorded and _bundle_obligation_id is not None:
+                                    try:
+                                        from gateway.delivery_ledger import (
+                                            update_bundle_payload,
+                                        )
+
+                                        payload_updated = await asyncio.to_thread(
+                                            update_bundle_payload,
+                                            _bundle_obligation_id,
+                                            {"auto_tts_segment_count": len(_tts_paths)},
+                                        )
+                                        if not payload_updated:
+                                            raise RuntimeError(
+                                                "TTS bundle metadata update rejected"
+                                            )
+                                    except Exception:
+                                        _bundle_checkpoint_failed = True
+                                        _bundle_delivery_failed = True
+                                        _tts_paths = []
+                                        _tts_path = None
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
+                if _bundle_auto_tts_requested and not _tts_paths:
+                    # Synthesis never reached a physical send. Preserve the
+                    # historical text fallback only after durably replacing
+                    # the unsent TTS prefix with a text-only plan.
+                    if _bundle_recorded and _bundle_obligation_id is not None:
+                        try:
+                            from gateway.delivery_ledger import (
+                                update_bundle_payload,
+                            )
+
+                            fallback_updated = await asyncio.to_thread(
+                                update_bundle_payload,
+                                _bundle_obligation_id,
+                                {
+                                    "auto_tts": False,
+                                    "auto_tts_caption_text": False,
+                                    "auto_tts_segment_count": 0,
+                                },
+                            )
+                            if not fallback_updated:
+                                raise RuntimeError(
+                                    "TTS fallback bundle update rejected"
+                                )
+                            _bundle_payload_data.update(
+                                {
+                                    "auto_tts": False,
+                                    "auto_tts_caption_text": False,
+                                    "auto_tts_segment_count": 0,
+                                }
+                            )
+                            _bundle_auto_tts_requested = False
+                            _bundle_auto_tts_caption_text = False
+                            _bundle_delivery_failed = False
+                            _bundle_checkpoint_failed = False
+                        except Exception:
+                            _bundle_delivery_failed = True
+                            logger.debug(
+                                "delivery bundle TTS fallback update failed",
+                                exc_info=True,
+                            )
+                    else:
+                        _bundle_auto_tts_requested = False
+
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
+<<<<<<< ours
                 _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
+=======
+                _tts_cleanup_paths = {
+                    _tts_requested_path,
+                    *_tts_generated_paths,
+                    *_tts_paths,
+                } - {None}
+                try:
+                    for _tts_index, _tts_path in enumerate(_tts_paths):
+                        # TTS synthesis runs off-thread and may outlive another
+                        # reconnect. Resolve again at the actual send boundary.
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        tts_send = (
+                            getattr(delivery_adapter, "play_tts", None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(tts_send):
+                            _bundle_delivery_failed = True
+                            logger.warning(
+                                "[%s] Withholding auto-TTS: current transport "
+                                "owner is unavailable or has no TTS operation",
+                                self.name,
+                            )
+                            # Preserve the response body for the ordinary text
+                            # outbox; missing voice delivery must not become a
+                            # durable-output black hole.
+                            continue
+                        if not await _begin_bundle_operation(
+                            f"auto_tts:{_tts_index}"
+                        ):
+                            continue
+>>>>>>> theirs
                         # Caption eligibility and payload stay on the ORIGINAL
                         # reply text. The spoken script is for synthesis only:
                         # normalization can shrink a long reply below the
@@ -6397,9 +6787,22 @@ class BasePlatformAdapter(ABC):
                         telegram_tts_caption = None
                         if (
                             _tts_index == 0
+<<<<<<< ours
                             and self.platform == Platform.TELEGRAM
                             and text_content
                             and text_content[:1024] == text_content
+=======
+                            and (
+                                _bundle_auto_tts_caption_text
+                                or (
+                                    not _bundle_recorded
+                                    and delivery_adapter.platform
+                                    == Platform.TELEGRAM
+                                    and text_content
+                                    and text_content[:1024] == text_content
+                                )
+                            )
+>>>>>>> theirs
                         ):
                             telegram_tts_caption = text_content
                         tts_result = await self.play_tts(
@@ -6409,6 +6812,20 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                         )
                         _record_delivery(tts_result)
+                        if getattr(tts_result, "success", False):
+                            await _checkpoint_bundle_operation(
+                                f"auto_tts:{_tts_index}",
+                                *(
+                                    ("text",)
+                                    if telegram_tts_caption is not None
+                                    else ()
+                                ),
+                            )
+                        else:
+                            # Preserve prefix ordering: a failed earlier TTS
+                            # operation must not be overtaken by later segments
+                            # or the text/media that follow it in the bundle.
+                            break
                         _tts_caption_delivered = bool(
                             _tts_caption_delivered
                             or (
@@ -6432,8 +6849,74 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
+<<<<<<< ours
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
+=======
+                backend_notice_claimed = False
+                backend_notice_suppressed = False
+                backend_notice_session_key = session_key
+                if (
+                    text_content
+                    and not _tts_caption_delivered
+                    and not _bundle_delivery_failed
+                    and is_backend_unavailable_response
+                ):
+                    # Resolve and retain the exact adapter that will send the
+                    # notice. A reconnect can replace the transport between
+                    # handler completion and final delivery; checking an old
+                    # adapter's tracker and then sending through a new one
+                    # would bypass the replacement's live cooldown.
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Withholding backend-unavailable notice: "
+                            "no live adapter for the stamped transport owner",
+                            self.name,
+                        )
+                        backend_notice_suppressed = True
+                        text_content = ""
+                    else:
+                        backend_notice_session_key = (
+                            self._backend_notice_session_key(
+                                session_key, event.source
+                            )
+                        )
+                        backend_notice_claimed = (
+                            await self._backend_notice_state.claim(
+                                backend_notice_session_key,
+                                "backend_unavailable",
+                            )
+                        )
+                        if not backend_notice_claimed:
+                            backend_notice_suppressed = True
+                            logger.info(
+                                "[%s] Suppressing duplicate backend-unavailable "
+                                "notice for session %s",
+                                getattr(delivery_adapter, "name", self.name),
+                                session_key,
+                            )
+                            text_content = ""
+                if (
+                    text_content
+                    and not _tts_caption_delivered
+                    and not _bundle_delivery_failed
+                    and not backend_notice_claimed
+                ):
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    if delivery_adapter is None:
+                        logger.warning(
+                            "[%s] Deferring final response: no live adapter "
+                            "for the stamped transport owner; the delivery "
+                            "ledger will retain it",
+                            self.name,
+                        )
+                if (
+                    text_content
+                    and not _tts_caption_delivered
+                    and not _bundle_delivery_failed
+                ):
+>>>>>>> theirs
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -6450,9 +6933,21 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+<<<<<<< ours
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+=======
+                    _obligation_attempt_started = False
+                    if (
+                        not _bundle_recorded
+                        and not is_ephemeral_response
+                        and not is_backend_unavailable_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
+>>>>>>> theirs
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6479,37 +6974,132 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
+<<<<<<< ours
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
+=======
+                    if backend_notice_claimed:
+                        async def _send_and_finish_backend_notice_claim():
+                            nonlocal delivery_adapter
+                            delivered = False
+                            try:
+                                current_adapter = self._final_delivery_adapter(
+                                    event.source
+                                )
+                                if current_adapter is None:
+                                    return SendResult(
+                                        success=False,
+                                        error="transport owner unavailable",
+                                    )
+                                delivery_adapter = current_adapter
+                                send_result = await current_adapter._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_final_thread_metadata,
+                                    source=event.source,
+                                )
+                                delivered = bool(
+                                    getattr(send_result, "success", False)
+                                )
+                                return send_result
+                            finally:
+                                self._backend_notice_state.finish_claim(
+                                    backend_notice_session_key,
+                                    "backend_unavailable",
+                                    time.monotonic(),
+                                    delivered=delivered,
+                                )
+
+                        send_task = asyncio.create_task(
+                            _send_and_finish_backend_notice_claim()
+                        )
+                        try:
+                            result = await asyncio.shield(send_task)
+                        except asyncio.CancelledError:
+                            # Once platform delivery has started, cancellation
+                            # is acknowledgement-ambiguous. Runner-scoped state
+                            # holds the send task across adapter replacement and
+                            # resolves contenders only when the platform result
+                            # is known, while this processor unwinds promptly.
+                            self._backend_notice_state.track_delivery_task(
+                                send_task
+                            )
+                            raise
+                    else:
+                        delivery_adapter = self._final_delivery_adapter(event.source)
+                        if delivery_adapter is None:
+                            result = SendResult(
+                                success=False,
+                                error="transport owner unavailable",
+                            )
+                        else:
+                            if not await _begin_bundle_operation("text"):
+                                result = SendResult(
+                                    success=False,
+                                    error="delivery ledger unavailable",
+                                )
+                            else:
+                                if _obligation_id is not None:
+                                    try:
+                                        from gateway.delivery_ledger import mark_attempting
+
+                                        await asyncio.to_thread(
+                                            mark_attempting, _obligation_id
+                                        )
+                                        _obligation_attempt_started = True
+                                    except Exception:
+                                        logger.debug(
+                                            "delivery ledger attempting update failed",
+                                            exc_info=True,
+                                        )
+                                result = await delivery_adapter._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_final_thread_metadata,
+                                    source=event.source,
+                                )
+>>>>>>> theirs
                     _record_delivery(result)
+                    if (
+                        _bundle_recorded
+                        and getattr(result, "success", False)
+                    ):
+                        await _checkpoint_bundle_operation("text")
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
+                                release_claim,
                             )
 
                             if getattr(result, "success", False):
                                 await asyncio.to_thread(mark_delivered, _obligation_id)
-                            else:
+                            elif _obligation_attempt_started:
                                 await asyncio.to_thread(
                                     mark_failed,
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    release_claim, _obligation_id
                                 )
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
                             )
 
+<<<<<<< ours
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.
                     if (
@@ -6523,10 +7113,19 @@ class BasePlatformAdapter(ABC):
                             message_id=result.message_id,
                             ttl_seconds=_ephemeral_ttl,
                         )
+=======
+                    self._schedule_ephemeral_delete_for_result(
+                        result=result,
+                        chat_id=event.source.chat_id,
+                        ttl_seconds=_ephemeral_ttl,
+                        fallback_adapter=delivery_adapter,
+                    )
+>>>>>>> theirs
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
 
+<<<<<<< ours
                 # Send extracted images as native attachments
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
@@ -6539,6 +7138,91 @@ class BasePlatformAdapter(ABC):
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+=======
+                async def _send_bundle_image(
+                    operation_key: str,
+                    image: Tuple[str, str],
+                    *,
+                    label: str,
+                ) -> bool:
+                    """Send and checkpoint exactly one physical image post."""
+                    nonlocal _bundle_delivery_failed
+                    if human_delay > 0:
+                        await asyncio.sleep(human_delay)
+                    delivery_adapter = self._final_delivery_adapter(event.source)
+                    image_send = (
+                        getattr(delivery_adapter, "send_multiple_images", None)
+                        if delivery_adapter is not None
+                        else None
+                    )
+                    if not callable(image_send):
+                        _bundle_delivery_failed = True
+                        logger.warning(
+                            "[%s] Withholding %s: current transport owner has "
+                            "no live image delivery operation",
+                            self.name,
+                            label,
+                        )
+                        return False
+                    try:
+                        if not await _begin_bundle_operation(operation_key):
+                            raise RuntimeError("delivery ledger unavailable")
+                        image_kwargs: Dict[str, Any] = {
+                            "chat_id": event.source.chat_id,
+                            "images": [image],
+                            "metadata": _final_thread_metadata,
+                            "human_delay": 0.0,
+                        }
+                        try:
+                            source_attrs = getattr(event.source, "__dict__", {})
+                            if (
+                                isinstance(source_attrs, dict)
+                                and "_transport_profile" in source_attrs
+                            ):
+                                signature = inspect.signature(image_send)
+                                if "source" in signature.parameters or any(
+                                    parameter.kind
+                                    is inspect.Parameter.VAR_KEYWORD
+                                    for parameter in signature.parameters.values()
+                                ):
+                                    image_kwargs["source"] = event.source
+                        except (TypeError, ValueError):
+                            pass
+                        image_result = await cast(
+                            Callable[..., Awaitable[Any]], image_send
+                        )(**image_kwargs)
+                        if getattr(image_result, "success", True) is False:
+                            raise RuntimeError(
+                                str(
+                                    getattr(image_result, "error", "")
+                                    or f"{label} failed"
+                                )
+                            )
+                        await _checkpoint_bundle_operation(operation_key)
+                        return not _bundle_delivery_failed
+                    except Exception as image_err:
+                        _bundle_delivery_failed = True
+                        logger.warning(
+                            "[%s] Error sending %s: %s",
+                            self.name,
+                            label,
+                            image_err,
+                            exc_info=True,
+                        )
+                        return False
+
+                # Send extracted images as native attachments only after the
+                # earlier text/TTS prefix is durably complete.
+                if images and not _bundle_delivery_failed:
+                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
+                    for image_index, image in enumerate(images):
+                        if not await _send_bundle_image(
+                            f"images:{image_index}",
+                            image,
+                            label=f"image {image_index + 1}",
+                        ):
+                            break
+>>>>>>> theirs
 
 
                 # Send extracted media files — route by file type
@@ -6570,6 +7254,7 @@ class BasePlatformAdapter(ABC):
                     else:
                         _non_image_local.append(file_path)
 
+<<<<<<< ours
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
@@ -6581,6 +7266,16 @@ class BasePlatformAdapter(ABC):
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+=======
+                if _image_paths and not _bundle_delivery_failed:
+                    for image_file_index, image_path in enumerate(_image_paths):
+                        if not await _send_bundle_image(
+                            f"image_files:{image_file_index}",
+                            (f"file://{_quote(image_path)}", ""),
+                            label=f"image file {image_file_index + 1}",
+                        ):
+                            break
+>>>>>>> theirs
 
                 if _non_image_media:
                     logger.info(
@@ -6588,7 +7283,11 @@ class BasePlatformAdapter(ABC):
                         self.name,
                         len(_non_image_media),
                     )
-                for media_path, is_voice in _non_image_media:
+                for _media_index, (media_path, is_voice) in enumerate(
+                    _non_image_media
+                ):
+                    if _bundle_delivery_failed:
+                        break
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
@@ -6606,6 +7305,7 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 event.source.chat_id,
                             )
+<<<<<<< ours
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
@@ -6617,8 +7317,36 @@ class BasePlatformAdapter(ABC):
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
+=======
+                        media_send = (
+                            getattr(delivery_adapter, method_name, None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(media_send):
+                            _bundle_delivery_failed = True
+                            logger.warning(
+                                "[%s] Withholding media: current transport owner "
+                                "has no live %s operation",
+                                self.name,
+                                method_name,
+                            )
+                            continue
+                        if not await _begin_bundle_operation(
+                            f"media:{_media_index}"
+                        ):
+                            continue
+                        media_result = await cast(
+                            Callable[..., Awaitable[Any]], media_send
+                        )(
+                            chat_id=event.source.chat_id,
+                            **{path_arg: media_path},
+                            metadata=_final_thread_metadata,
+                        )
+>>>>>>> theirs
 
                         if not media_result.success:
+                            _bundle_delivery_failed = True
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
                                 event.source.chat_id,
@@ -6626,15 +7354,35 @@ class BasePlatformAdapter(ABC):
                                 is_voice=is_voice,
                                 metadata=_final_thread_metadata,
                             )
+<<<<<<< ours
+=======
+                            if callable(notify_failure):
+                                await cast(
+                                    Callable[..., Awaitable[Any]], notify_failure
+                                )(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
+                        else:
+                            await _checkpoint_bundle_operation(
+                                f"media:{_media_index}"
+                            )
+>>>>>>> theirs
                     except Exception as media_err:
+                        _bundle_delivery_failed = True
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
-                for file_path in _non_image_local:
+                for _local_index, file_path in enumerate(_non_image_local):
+                    if _bundle_delivery_failed:
+                        break
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
+<<<<<<< ours
                         if ext in _VIDEO_EXTS:
                             file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
@@ -6647,7 +7395,37 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+=======
+                        method_name = "send_video" if ext in _VIDEO_EXTS else "send_document"
+                        path_arg = "video_path" if ext in _VIDEO_EXTS else "file_path"
+                        file_send = (
+                            getattr(delivery_adapter, method_name, None)
+                            if delivery_adapter is not None
+                            else None
+                        )
+                        if not callable(file_send):
+                            _bundle_delivery_failed = True
+                            logger.warning(
+                                "[%s] Withholding local file: current transport "
+                                "owner has no live %s operation",
+                                self.name,
+                                method_name,
+                            )
+                            continue
+                        if not await _begin_bundle_operation(
+                            f"local:{_local_index}"
+                        ):
+                            continue
+                        file_result = await cast(
+                            Callable[..., Awaitable[Any]], file_send
+                        )(
+                            chat_id=event.source.chat_id,
+                            **{path_arg: file_path},
+                            metadata=_final_thread_metadata,
+                        )
+>>>>>>> theirs
                         if not file_result.success:
+                            _bundle_delivery_failed = True
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
                                 self.name,
@@ -6659,8 +7437,58 @@ class BasePlatformAdapter(ABC):
                                 file_path,
                                 metadata=_final_thread_metadata,
                             )
+<<<<<<< ours
+=======
+                            if callable(notify_failure):
+                                await cast(
+                                    Callable[..., Awaitable[Any]], notify_failure
+                                )(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
+                        else:
+                            await _checkpoint_bundle_operation(
+                                f"local:{_local_index}"
+                            )
+>>>>>>> theirs
                     except Exception as file_err:
+                        _bundle_delivery_failed = True
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+                if _bundle_recorded and _bundle_obligation_id is not None:
+                    try:
+                        from gateway.delivery_ledger import (
+                            mark_delivered,
+                            mark_failed,
+                            mark_partial_failed,
+                            release_claim,
+                        )
+
+                        if _bundle_attempt_started and not _bundle_delivery_failed:
+                            await asyncio.to_thread(
+                                mark_delivered, _bundle_obligation_id
+                            )
+                        elif _bundle_attempt_started:
+                            marker = (
+                                mark_partial_failed
+                                if _bundle_checkpoint_failed
+                                else mark_failed
+                            )
+                            await asyncio.to_thread(
+                                marker,
+                                _bundle_obligation_id,
+                                "one or more response bundle operations failed",
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                release_claim, _bundle_obligation_id
+                            )
+                    except Exception:
+                        logger.debug(
+                            "delivery bundle ledger update failed",
+                            exc_info=True,
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.

@@ -1412,16 +1412,25 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _send_with_dm_topic_reply_anchor_retry(
         self,
-        send_fn: Any,
+        bot_method: str,
         send_kwargs: Dict[str, Any],
         metadata: Optional[Dict[str, Any]],
         reply_to_message_id: Optional[int],
         media_label: str,
         reset_media: Optional[Any] = None,
     ) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor."""
+        """Retry stale private-topic media replies on the current bot connector."""
+        def _current_send_fn() -> Any:
+            bot = self._bot
+            send_fn = getattr(bot, bot_method, None) if bot is not None else None
+            if not callable(send_fn):
+                raise RuntimeError(
+                    f"Telegram bot connector unavailable for {bot_method}"
+                )
+            return send_fn
+
         try:
-            return await send_fn(**send_kwargs)
+            return await _current_send_fn()(**send_kwargs)
         except Exception as send_err:
             if not self._should_retry_without_dm_topic_reply_anchor(
                 send_err,
@@ -1442,7 +1451,9 @@ class TelegramAdapter(BasePlatformAdapter):
             retry_kwargs["reply_to_message_id"] = None
             retry_kwargs.pop("message_thread_id", None)
             retry_kwargs.pop("direct_messages_topic_id", None)
-            return await send_fn(**retry_kwargs)
+            # The first await may span a reconnect. Reacquire from ``self._bot``
+            # so the retry cannot physically send through the retired connector.
+            return await _current_send_fn()(**retry_kwargs)
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -7016,7 +7027,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     for _cap_text, _cap_parse_mode in _caption_variants:
                         try:
                             msg = await self._send_with_dm_topic_reply_anchor_retry(
-                                self._bot.send_voice,
+                                "send_voice",
                                 {
                                     "chat_id": normalize_telegram_chat_id(chat_id),
                                     "voice": audio_file,
@@ -7067,7 +7078,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to_mode=self._reply_to_mode
                     )
                     msg = await self._send_with_dm_topic_reply_anchor_retry(
-                        self._bot.send_audio,
+                        "send_audio",
                         {
                             "chat_id": normalize_telegram_chat_id(chat_id),
                             "audio": audio_file,
@@ -7208,7 +7219,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             pass
 
                 await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_media_group,
+                    "send_media_group",
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "media": media,
@@ -7267,7 +7278,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             with open(image_path, "rb") as image_file:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_photo,
+                    "send_photo",
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "photo": image_file,
@@ -7364,7 +7375,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             with open(file_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_document,
+                    "send_document",
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "document": f,
@@ -7416,7 +7427,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             with open(video_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_video,
+                    "send_video",
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "video": f,
@@ -7472,7 +7483,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
             msg = await self._send_with_dm_topic_reply_anchor_retry(
-                self._bot.send_photo,
+                "send_photo",
                 {
                     "chat_id": normalize_telegram_chat_id(chat_id),
                     "photo": image_url,
@@ -7515,7 +7526,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_mode=self._reply_to_mode
                 )
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_photo,
+                    "send_photo",
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "photo": image_data,
@@ -7563,7 +7574,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
             msg = await self._send_with_dm_topic_reply_anchor_retry(
-                self._bot.send_animation,
+                "send_animation",
                 {
                     "chat_id": normalize_telegram_chat_id(chat_id),
                     "animation": animation_url,

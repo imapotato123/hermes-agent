@@ -147,6 +147,23 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
     assert runner._is_user_authorized(src) is True
 
 
+def test_persisted_logical_relay_source_does_not_regain_upstream_authz(monkeypatch):
+    """A live ingress decision must not become durable adapter trust."""
+    _clear_auth_env(monkeypatch)
+    runner, _ = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
+    live = _relay_source(delivered_via_upstream_relay=True)
+    setattr(live, "_transport_platform", Platform.RELAY)
+    setattr(live, "_transport_profile", None)
+
+    restored = SessionSource.from_dict(live.to_dict())
+
+    assert restored.delivered_via_upstream_relay is False
+    assert runner._is_user_authorized(restored) is False
+
+
 def test_event_from_wire_stamps_routed_profile():
     """A connector-routed profile on the wire source lands on SessionSource.
 
