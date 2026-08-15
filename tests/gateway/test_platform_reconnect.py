@@ -263,6 +263,7 @@ class TestPlatformReconnectWatcher:
         runner._schedule_resume_pending_sessions.assert_called_once_with(
             platform=Platform.TELEGRAM
         )
+        runner._redeliver_pending_obligations.assert_awaited_once()
 
 
     @pytest.mark.asyncio

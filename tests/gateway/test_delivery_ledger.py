@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import json
 import sqlite3
 import time
 import threading
@@ -128,7 +129,8 @@ class TestStateMachine:
             owner = migrated.execute(
                 "SELECT transport_platform, transport_profile, "
                 "transport_profile_stamped, transport_identity, route_scope_id, "
-                "route_user_id, route_chat_type, recovery_claim "
+                "route_user_id, route_chat_type, recovery_claim, "
+                "recovery_attempt_charged, operation, payload_json, sequence_no "
                 "FROM delivery_obligations WHERE obligation_id='ob-1'"
             ).fetchone()
         assert {
@@ -140,13 +142,142 @@ class TestStateMachine:
             "route_user_id",
             "route_chat_type",
             "recovery_claim",
+            "recovery_attempt_charged",
+            "operation",
+            "payload_json",
+            "sequence_no",
         } <= columns
-        assert owner == (None, None, 0, None, None, None, None, None)
+        assert owner == (
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            "text",
+            None,
+            0,
+        )
+
+    def test_typed_bundle_payload_round_trips_through_claim(self):
+        payload = json.dumps(
+            {
+                "version": 1,
+                "text": "answer",
+                "images": [["https://example.test/a.png", "a"]],
+                "media_files": [["/tmp/report.pdf", False]],
+            },
+            sort_keys=True,
+        )
+        oid = dl.compute_obligation_id(
+            "sk-bundle",
+            "msg-bundle",
+            "answer",
+            operation="response_bundle",
+            payload_json=payload,
+        )
+        dl.record_obligation(
+            obligation_id=oid,
+            session_key="sk-bundle",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="answer",
+            operation="response_bundle",
+            payload_json=payload,
+            sequence_no=7,
+        )
+        _orphan(oid)
+
+        claimed = dl.sweep_recoverable()
+
+        assert claimed[0]["operation"] == "response_bundle"
+        assert claimed[0]["payload_json"] == payload
+        assert claimed[0]["sequence_no"] == 7
+
+    def test_bundle_checkpoint_rejects_forged_cached_operation_key(self):
+        payload = {
+            "version": 1,
+            "text": "answer",
+            "operation_keys": ["text", "forged"],
+            "completed_operations": [],
+        }
+        dl.record_obligation(
+            obligation_id="forged-bundle",
+            session_key="sk-bundle",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="answer",
+            operation="response_bundle",
+            payload_json=json.dumps(payload, sort_keys=True),
+        )
+
+        assert not dl.mark_bundle_operation_attempting(
+            "forged-bundle", "forged"
+        )
+        assert not dl.mark_bundle_operation_completed(
+            "forged-bundle", "forged"
+        )
+
+    def test_bundle_checkpoints_reject_stale_recovery_claim(self):
+        payload = json.dumps(
+            {
+                "version": 1,
+                "text": "answer",
+                "operation_keys": ["text"],
+                "completed_operations": [],
+            },
+            sort_keys=True,
+        )
+        dl.record_obligation(
+            obligation_id="claimed-bundle",
+            session_key="sk-bundle",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="answer",
+            operation="response_bundle",
+            payload_json=payload,
+        )
+        _orphan("claimed-bundle")
+        claim = dl.sweep_recoverable()[0]["recovery_claim"]
+
+        assert not dl.mark_bundle_operation_attempting(
+            "claimed-bundle", "text", recovery_claim="stale"
+        )
+        assert not dl.mark_bundle_operation_completed(
+            "claimed-bundle", "text", recovery_claim="stale"
+        )
+        assert not dl.update_bundle_payload(
+            "claimed-bundle", {"auto_tts": True}, recovery_claim="stale"
+        )
+
+        with dl._connect() as conn:
+            state, stored_payload = conn.execute(
+                "SELECT state, payload_json FROM delivery_obligations "
+                "WHERE obligation_id='claimed-bundle'"
+            ).fetchone()
+        assert state == "pending"
+        assert json.loads(stored_payload) == json.loads(payload)
+        assert dl.mark_bundle_operation_attempting(
+            "claimed-bundle", "text", recovery_claim=claim
+        )
+        assert dl.mark_bundle_operation_completed(
+            "claimed-bundle", "text", recovery_claim=claim
+        )
 
 
 class TestObligationId:
     def test_stable_and_distinct(self):
         a = dl.compute_obligation_id("sk1", "msg1", "hello")
+        legacy_expected = __import__("hashlib").sha256(
+            b"sk1|msg1|hello"
+        ).hexdigest()[:24]
+        assert a == legacy_expected
         assert a == dl.compute_obligation_id("sk1", "msg1", "hello")
         # Different thread (baked into session_key) → different id. This is
         # the cron-topic collision class from the earlier outbox attempt.

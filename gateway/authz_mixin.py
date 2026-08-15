@@ -21,6 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
+from gateway.delivery import relay_fronts_platform
 from gateway.session import (
     SessionSource,
     source_has_transport_owner,
@@ -204,20 +205,29 @@ class GatewayAuthorizationMixin:
                     adapter, "matches_transport_identity", None
                 )
                 if expected_identity is not None:
-                    if not callable(matches_identity) or not matches_identity(
-                        str(expected_identity)
+                    logical_platform = getattr(
+                        getattr(source, "platform", None),
+                        "value",
+                        getattr(source, "platform", None),
+                    )
+                    if (
+                        not str(expected_identity).startswith(
+                            f"{logical_platform}:"
+                        )
+                        or not callable(matches_identity)
+                        or not matches_identity(str(expected_identity))
                     ):
                         return None
                 elif getattr(source, "delivered_via_upstream_relay", False) is not True:
                     # Restored relay owners without an account fingerprint are
                     # ambiguous and must not degrade to platform-only routing.
                     return None
-                fronts = getattr(adapter, "fronts_platform", None)
                 if (
                     getattr(source, "platform", None) != Platform.RELAY
-                    and (not callable(fronts) or not fronts(
-                    getattr(source, "platform", None)
-                    ))
+                    and expected_identity is None
+                    and not relay_fronts_platform(
+                        adapter, getattr(source, "platform", None)
+                    )
                 ):
                     return None
                 prime = getattr(adapter, "prime_routing_source", None)
@@ -259,8 +269,15 @@ class GatewayAuthorizationMixin:
         )
         if platform == Platform.RELAY and expected_identity is not None:
             matches_identity = getattr(adapter, "matches_transport_identity", None)
-            if not callable(matches_identity) or not matches_identity(
-                str(expected_identity)
+            logical_platform = getattr(
+                getattr(source, "platform", None),
+                "value",
+                getattr(source, "platform", None),
+            )
+            if (
+                not str(expected_identity).startswith(f"{logical_platform}:")
+                or not callable(matches_identity)
+                or not matches_identity(str(expected_identity))
             ):
                 return None
         if adapter is (getattr(self, "adapters", None) or {}).get(platform):

@@ -179,7 +179,7 @@ async def test_inbound_same_platform_identity_requires_exact_bot_id():
     )
 
     assert len(received) == 1
-    assert received[0].source._relay_transport_identity == "discord:appB"
+    assert received[0].source._relay_ingress_transport_identity == "discord:appB"
 
 
 @pytest.mark.asyncio

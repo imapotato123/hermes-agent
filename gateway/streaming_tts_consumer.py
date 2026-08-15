@@ -440,14 +440,29 @@ class StreamingTTSConsumer:
                     break
         else:
             logger.debug("streaming TTS _ABORT sentinel could not be enqueued")
+        try:
+            self._loop.call_soon_threadsafe(
+                self._cancel_drain_task,
+                reason,
+            )
+        except Exception:
+            pass
+
+    def _cancel_drain_task(self, reason: str) -> None:
+        """Abort the adapter handle and terminate a blocked provider drain."""
         if self._handle is not None and not self._handle.aborted:
-            try:
-                self._loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self._safe_abort(reason),
-                )
-            except Exception:
-                pass
+            asyncio.create_task(self._safe_abort(reason))
+        task = self._task
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
+            # Provider iteration runs through to_thread(). Cancelling the
+            # asyncio wrapper cannot stop a vendor thread already inside
+            # next(), but it releases this per-turn task and prevents late
+            # chunks from touching the retired handle.
+            task.cancel()
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""

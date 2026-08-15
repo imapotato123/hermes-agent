@@ -25,7 +25,7 @@ import time
 import weakref
 from collections import OrderedDict
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Optional, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
@@ -195,6 +195,16 @@ class RelayAdapter(BasePlatformAdapter):
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         return _LEN_FNS.get(self.descriptor.len_unit, len)
+
+    def set_descriptor_handler(
+        self, handler: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Forward late platform-availability notifications from the transport."""
+        if self._transport is None:
+            return
+        setter = getattr(self._transport, "set_descriptor_handler", None)
+        if callable(setter):
+            setter(handler)
 
     @property
     def supports_status_text(self) -> bool:  # type: ignore[override]
@@ -372,7 +382,11 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
-        self._stamp_transport_owner(event)
+        if not self._stamp_transport_owner(event):
+            logger.warning(
+                "relay inbound dropped: physical transport identity is ambiguous"
+            )
+            return
         self._capture_scope(event)
         self._stamp_slack_session_thread(event)
         # Phase 3: a structured prompt answer resolves its waiting primitive
@@ -380,20 +394,53 @@ class RelayAdapter(BasePlatformAdapter):
         # dispatch as a chat message. Unknown/expired prompt ids fall through
         # (the command-shaped text then behaves like a typed reply).
         if await self._consume_prompt_response(event):
+            handoff = getattr(event, "_relay_durable_handoff", None)
+            if handoff is not None and not handoff.is_set():
+                handoff.set()
             return
         await self._localize_inbound_media(event)
         await self.handle_message(event)
 
-    def _stamp_transport_owner(self, event: Any) -> None:
-        """Record Relay plus its exact authenticated account as physical owner."""
+    def _stamp_transport_owner(
+        self, event: Any, *, identity: Optional[str] = None
+    ) -> bool:
+        """Capability-stamp one validated, exact Relay account as owner."""
         source = getattr(event, "source", None)
         if source is None:
-            return
-        exact_identity = getattr(source, "_relay_transport_identity", None)
-        try:
-            delattr(source, "_relay_transport_identity")
-        except AttributeError:
-            pass
+            return False
+        platform = getattr(source, "platform", None)
+        ingress_identity = getattr(
+            source, "_relay_ingress_transport_identity", None
+        )
+        legacy_identity = getattr(source, "_relay_transport_identity", None)
+        selectors = [
+            str(value)
+            for value in (identity, ingress_identity, legacy_identity)
+            if value is not None
+        ]
+        for attribute in (
+            "_relay_ingress_transport_identity",
+            "_relay_transport_identity",
+        ):
+            try:
+                delattr(source, attribute)
+            except AttributeError:
+                pass
+        if len(set(selectors)) > 1:
+            return False
+        resolved_identity = (
+            selectors[0]
+            if selectors
+            else self.transport_identity_for_platform(platform)
+        )
+        if (
+            resolved_identity is None
+            or not relay_transport_identity_matches_platform(
+                resolved_identity, platform
+            )
+            or not self.matches_transport_identity(str(resolved_identity))
+        ):
+            return False
         # The process-level relay socket is deliberately profile-independent.
         stamp_source_transport_owner(
             source,
@@ -401,15 +448,8 @@ class RelayAdapter(BasePlatformAdapter):
             profile=None,
             platform=Platform.RELAY,
         )
-        if (
-            exact_identity is not None
-            and relay_transport_identity_matches_platform(
-                exact_identity,
-                getattr(source, "platform", None),
-            )
-            and self.matches_transport_identity(str(exact_identity))
-        ):
-            source._transport_identity = str(exact_identity)
+        source._transport_identity = str(resolved_identity)
+        return True
 
     def _relay_slack_extra(self) -> Dict[str, Any]:
         """The Slack-behavior subset of the RELAY platform config.
@@ -794,11 +834,8 @@ class RelayAdapter(BasePlatformAdapter):
                 error="relay source identity is unavailable or contradictory",
             )
         route_metadata = dict(metadata or {})
-        route_metadata["_relay_logical_platform"] = str(logical_platform)
-        if source.scope_id:
-            route_metadata["scope_id"] = str(source.scope_id)
-        if source.user_id:
-            route_metadata["user_id"] = str(source.user_id)
+        # Authenticated source-owned routing wins over caller-supplied metadata.
+        route_metadata.update(self._source_route_metadata(source))
         return await self.send_for_platform(
             logical_platform,
             str(source.chat_id),
@@ -808,6 +845,78 @@ class RelayAdapter(BasePlatformAdapter):
             identity=str(exact_identity),
         )
 
+    def _delivery_route_for_source(
+        self,
+        source: SessionSource,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+        """Validate one source-owned Relay route and build private metadata."""
+        logical_platform = str(
+            getattr(source.platform, "value", source.platform) or ""
+        )
+        exact_identity = getattr(source, "_transport_identity", None)
+        if exact_identity is None:
+            exact_identity = self.transport_identity_for_platform(logical_platform)
+        if (
+            exact_identity is None
+            or not relay_transport_identity_matches_platform(
+                exact_identity, logical_platform
+            )
+            or not self.matches_transport_identity(str(exact_identity))
+        ):
+            return None
+        route_metadata = dict(metadata or {})
+        # Authenticated source-owned routing wins over caller/cache metadata.
+        route_metadata.update(self._source_route_metadata(source))
+        return logical_platform, str(exact_identity), route_metadata
+
+    def resolve_delivery_operation_for_source(
+        self,
+        source: SessionSource,
+        operation: str,
+    ) -> Optional[Callable[..., Awaitable[Any]]]:
+        """Resolve a typed operation through this source's exact Relay account."""
+        method = getattr(self, operation, None)
+        if not callable(method) or self._delivery_route_for_source(source) is None:
+            return None
+
+        async def _owned_operation(**kwargs: Any) -> Any:
+            requested_chat_id = kwargs.get("chat_id")
+            if (
+                requested_chat_id is not None
+                and str(requested_chat_id) != str(source.chat_id)
+            ):
+                return SendResult(
+                    success=False,
+                    error="relay source/chat identity mismatch",
+                )
+            route = self._delivery_route_for_source(
+                source,
+                cast(Optional[Dict[str, Any]], kwargs.get("metadata")),
+            )
+            if route is None:
+                return SendResult(
+                    success=False,
+                    error="relay source identity is unavailable or contradictory",
+                )
+            _logical_platform, _exact_identity, route_metadata = route
+            if operation == "send":
+                return await self.send_for_source(
+                    source,
+                    str(kwargs.get("content") or ""),
+                    reply_to=kwargs.get("reply_to"),
+                    metadata=route_metadata,
+                )
+            operation_kwargs = dict(kwargs)
+            operation_kwargs["metadata"] = route_metadata
+            if operation == "send_multiple_images":
+                operation_kwargs["source"] = source
+            return await cast(Callable[..., Awaitable[Any]], method)(
+                **operation_kwargs
+            )
+
+        return _owned_operation
+
     @staticmethod
     def _source_route_metadata(source: SessionSource) -> Dict[str, Any]:
         """Build immutable relay routing metadata from one authenticated source."""
@@ -816,6 +925,14 @@ class RelayAdapter(BasePlatformAdapter):
                 getattr(source.platform, "value", source.platform)
             )
         }
+        source_attrs = getattr(source, "__dict__", {})
+        identity = (
+            source_attrs.get("_transport_identity")
+            if isinstance(source_attrs, dict)
+            else None
+        )
+        if identity:
+            metadata["_relay_transport_identity"] = str(identity)
         if source.scope_id:
             metadata["scope_id"] = str(source.scope_id)
         if source.user_id:
@@ -935,14 +1052,39 @@ class RelayAdapter(BasePlatformAdapter):
             if platform == "discord":
                 event = self._discord_interaction_to_event(forward)
                 if event is not None:
-                    self._stamp_transport_owner(event)
+                    handoff = None
+                    if buffer_id:
+                        handoff = asyncio.Event()
+                        setattr(event, "_relay_durable_handoff", handoff)
+                    identity = self._transport_identity_value(
+                        str(platform), str(getattr(forward, "bot_id", "") or "")
+                    )
+                    if not self._stamp_transport_owner(event, identity=identity):
+                        logger.warning(
+                            "relay passthrough_forward dropped: unacknowledged "
+                            "transport identity %s",
+                            identity,
+                        )
+                        return
                     self._capture_scope(event)
                     # Phase 3: a component press carrying a Hermes prompt token
                     # resolves its waiting primitive and is consumed (same
                     # gate as _on_inbound's prompt_response arm).
                     if await self._consume_prompt_response(event):
+                        if handoff is not None:
+                            handoff.set()
+                            assert self._transport is not None
+                            await self._transport.ack_buffered_inbound(
+                                str(buffer_id)
+                            )
                         return
                     await self.handle_message(event)
+                    if handoff is not None:
+                        await handoff.wait()
+                        assert self._transport is not None
+                        await self._transport.ack_buffered_inbound(
+                            str(buffer_id)
+                        )
                     return
             logger.info(
                 "relay passthrough_forward dropped (no handler): platform=%s method=%s path=%s",
@@ -1005,9 +1147,31 @@ class RelayAdapter(BasePlatformAdapter):
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
         source = SessionSource(
+            # The LOGICAL platform, not Platform.RELAY. This lane parses a
+            # Discord interaction wire payload, so the underlying platform is
+            # known statically — and it must be stamped for three consumers:
+            #   1. Session keys: the connector binds the interaction's
+            #      follow-up capability under buildSessionKey with
+            #      platform="discord" (interactionSessionSource); the relay
+            #      TEXT lane (ws_transport._event_from_wire) also maps to the
+            #      logical platform. RELAY here forked interaction sessions
+            #      away from both.
+            #   2. /sethome: with platform=RELAY the handler filed the home
+            #      channel under platforms.relay.home_channel (invisible to
+            #      cron delivery, which looks up the logical platform) and
+            #      mirrored it into the dead RELAY_HOME_CHANNEL env var.
+            #   3. Egress: _capture_scope records _platform_by_chat from this
+            #      value and deliberately skips the generic "relay".
             platform=Platform.DISCORD,
             chat_id=channel_id,
-            chat_type="channel" if guild_id else "dm",
+            # "group", not "channel": the session key embeds chat_type, and
+            # BOTH the connector's capability binding (interactionSessionSource
+            # → buildSessionKey, chat_type "group") and the native Discord
+            # adapter's channel events key guild channels as "group". A
+            # "channel" slot here forked the interaction session from the
+            # chat's message session AND from the vault key the connector
+            # bound the follow-up capability under.
+            chat_type="group" if guild_id else "dm",
             user_id=str(user.get("id"))
             if isinstance(user, dict) and user.get("id")
             else None,
@@ -1018,6 +1182,15 @@ class RelayAdapter(BasePlatformAdapter):
             if guild_id
             else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+            # Same upstream-trust marker the relay text lane stamps
+            # (ws_transport._event_from_wire): this interaction arrived over
+            # the per-instance-authenticated relay WS after the connector
+            # verified Discord's edge signature and resolved the tenant.
+            # Without it, authz treated the event as unauthenticated relay
+            # traffic — and /sethome's via_relay guard never engaged, which is
+            # how platform=RELAY home channels slipped through in the first
+            # place. Set locally, never read off the wire.
+            delivered_via_upstream_relay=True,
         )
         source._relay_transport_identity = (
             f"discord:{getattr(forward, 'bot_id', '')}"
@@ -1214,8 +1387,17 @@ class RelayAdapter(BasePlatformAdapter):
         method only after ``fronts_platform`` succeeds, and this method repeats
         that check fail-closed before stamping the outbound frame.
         """
-        platform_value = getattr(logical_platform, "value", logical_platform)
-        if not self.fronts_platform(platform_value):
+        platform_value = str(
+            getattr(logical_platform, "value", logical_platform) or ""
+        )
+        send_metadata = dict(metadata or {})
+        exact_identity = send_metadata.get("_relay_transport_identity")
+        exact_match = bool(
+            exact_identity
+            and str(exact_identity).startswith(f"{platform_value}:")
+            and self.matches_transport_identity(str(exact_identity))
+        )
+        if not exact_match and not self.fronts_platform(platform_value):
             return SendResult(
                 success=False,
                 error=f"relay does not front platform {platform_value}",
@@ -1231,7 +1413,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "chat_id": chat_id,
                 "content": content,
                 "reply_to": reply_to,
-                "metadata": self._with_scope(chat_id, metadata),
+                "metadata": self._with_scope(chat_id, send_metadata),
             },
             **send_kwargs,
         )

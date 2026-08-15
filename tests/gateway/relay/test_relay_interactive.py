@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
@@ -61,6 +61,8 @@ def make_desc(**kw) -> CapabilityDescriptor:
 
 def _adapter(**desc_kw) -> tuple[RelayAdapter, StubConnector]:
     stub = StubConnector(make_desc(**desc_kw))
+    platform = str(desc_kw.get("platform", "telegram"))
+    stub._identities = [(platform, f"{platform}-test-bot")]
     adapter = RelayAdapter(PlatformConfig(), make_desc(**desc_kw), transport=stub)
     return adapter, stub
 
@@ -200,12 +202,13 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
 
 
 def test_discord_component_interaction_decodes_prompt_token():
-    adapter, _stub = _adapter()
+    adapter, _stub = _adapter(platform="discord", label="Discord")
 
     class Forward:
         platform = "discord"
         method = "POST"
         path = "/interactions/bot1"
+        bot_id = "discord-test-bot"
         body = (
             b'{"type": 3, "id": "i1", "channel_id": "ch1", "guild_id": "g1",'
             b' "message": {"id": "pm55"},'
@@ -222,6 +225,21 @@ def test_discord_component_interaction_decodes_prompt_token():
     }
     assert event.text == "/deny"
     assert event.message_type == MessageType.COMMAND
+    assert event.source.platform == Platform.DISCORD
+    assert event.source.chat_type == "group"
+    assert event.source.delivered_via_upstream_relay is True
+    adapter._stamp_transport_owner(event)
+    assert event.source._transport_platform == Platform.RELAY
+    assert event.source._transport_profile is None
+    assert event.source._transport_identity == "discord:discord-test-bot"
+    restored = SessionSource.from_dict(event.source.to_dict())
+    assert restored.platform == Platform.DISCORD
+    assert restored.chat_type == "group"
+    # Generic serialization is authority-free by design: exact-account
+    # provenance is process-local and must never persist or forge.
+    assert restored._transport_platform is None
+    assert getattr(restored, "_transport_identity") is None
+    assert restored.delivered_via_upstream_relay is False
 
 
 # ── react ack lifecycle ──────────────────────────────────────────────────
@@ -244,7 +262,7 @@ def _reactable_event() -> MessageEvent:
 
 @pytest.mark.asyncio
 async def test_processing_lifecycle_reacts_eyes_then_check():
-    adapter, stub = _adapter()
+    adapter, stub = _adapter(platform="discord", label="Discord")
     event = _reactable_event()
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
