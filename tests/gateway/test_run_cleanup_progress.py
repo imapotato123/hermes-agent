@@ -33,7 +33,7 @@ async def _fire_post_delivery_cb(cb):
     if _inspect.isawaitable(result):
         await result
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +236,7 @@ async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path)
     )
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    stamp_source_transport_owner(source, profile=None)
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
@@ -262,6 +263,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    stamp_source_transport_owner(source, profile=None)
     session_key = "agent:main:telegram:group:-1001"
 
     pre_existing_fired = []

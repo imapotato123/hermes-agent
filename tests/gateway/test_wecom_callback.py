@@ -10,6 +10,14 @@ from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt
 
 
+@pytest.fixture(autouse=True)
+def _safe_xml_parser(monkeypatch):
+    """Unit tests inject stdlib ET; production still requires defusedxml."""
+    import plugins.platforms.wecom.callback_adapter as callback_module
+
+    monkeypatch.setattr(callback_module, "ET", ET)
+
+
 def _app(name="test-app", corp_id="ww1234567890", agent_id="1000002"):
     return {
         "name": name,

@@ -15,12 +15,19 @@ import os
 import json
 import threading
 import uuid
+import weakref
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+
+# Opaque process-local capabilities. Private field names and booleans are data;
+# only possession of these exact objects grants owner or legacy provenance.
+_TRANSPORT_OWNER_CAPABILITY = object()
+_LEGACY_TRANSPORT_OWNER_CAPABILITY = object()
 
 
 def _now() -> datetime:
@@ -219,6 +226,76 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Runtime-only physical transport provenance. Keep these keyword-only so
+    # historical positional constructor mappings remain unchanged. Generic
+    # source dictionaries deliberately omit them: only trusted ingress or
+    # recovery code may stamp an owner, never a hook, wire payload, branch
+    # record, or voice metadata cache.
+    _transport_adapter_ref: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+    _transport_profile: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+    _transport_platform: Optional[Platform] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+    _transport_identity: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+    _transport_profile_stamped: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+
+    # Internal compatibility provenance. Only an explicitly trusted historical
+    # deserializer may set this for a record that predates durable owner stamps.
+    # A fresh hand-built or generic deserialized source is never legacy.
+    _legacy_transport_owner_unstamped: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+
+    # Generic constructors cannot set these capabilities. dataclasses.replace()
+    # preserves them, allowing trusted same-process synthetic copies without
+    # making private-looking data fields equivalent to authority.
+    _transport_owner_capability: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+    _legacy_transport_owner_capability: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+        metadata={"serialize": False},
+    )
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -288,8 +365,13 @@ class SessionSource:
         return d
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
-        return cls(
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        allow_legacy_unstamped: bool = False,
+    ) -> "SessionSource":
+        source = cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
             chat_name=data.get("chat_name"),
@@ -310,7 +392,278 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
-    
+        if allow_legacy_unstamped:
+            source._legacy_transport_owner_unstamped = True
+            source._legacy_transport_owner_capability = (
+                _LEGACY_TRANSPORT_OWNER_CAPABILITY
+            )
+        return source
+
+
+def source_is_legacy_unstamped(source: Any) -> bool:
+    """Whether *source* is a trusted pre-owner compatibility record."""
+    return (
+        getattr(source, "_legacy_transport_owner_unstamped", False) is True
+        and getattr(source, "_legacy_transport_owner_capability", None)
+        is _LEGACY_TRANSPORT_OWNER_CAPABILITY
+    )
+
+
+def source_has_transport_owner(source: Any) -> bool:
+    """Whether *source* carries trusted physical transport-owner provenance."""
+    return (
+        getattr(source, "_transport_profile_stamped", False) is True
+        and getattr(source, "_transport_owner_capability", None)
+        is _TRANSPORT_OWNER_CAPABILITY
+    )
+
+
+_TRANSPORT_PROFILE_UNSET = object()
+
+
+def stamp_source_transport_owner(
+    source: Any,
+    *,
+    adapter: Any = None,
+    profile: Any = _TRANSPORT_PROFILE_UNSET,
+    platform: Optional[Platform] = None,
+) -> Any:
+    """Attach explicit transport provenance to a trusted synthetic source.
+
+    Production ingress should pass ``adapter`` so exact generation provenance
+    is retained. Tests and trusted runner-only synthetic paths may pass an
+    explicit ``profile``/``platform`` pair; the call itself is the authority.
+    No source is stamped merely because it has a runtime profile.
+    """
+    source._legacy_transport_owner_unstamped = False
+    source._legacy_transport_owner_capability = None
+    source._transport_owner_capability = _TRANSPORT_OWNER_CAPABILITY
+    source._transport_adapter_ref = None
+    source._transport_identity = None
+    if adapter is not None:
+        try:
+            source._transport_adapter_ref = weakref.ref(adapter)
+        except TypeError:
+            # Minimal plugin/test adapters may not expose a weakref slot. Keep
+            # the callable provenance contract for duck-typed owners.
+            source._transport_adapter_ref = lambda adapter=adapter: adapter
+    physical_platform = (
+        platform
+        or getattr(adapter, "platform", None)
+        or getattr(source, "platform", None)
+    )
+    source._transport_platform = physical_platform
+    resolved_profile = (
+        getattr(adapter, "_transport_profile", None)
+        if profile is _TRANSPORT_PROFILE_UNSET
+        else profile
+    )
+    source._transport_profile = (
+        resolved_profile.strip()
+        if isinstance(resolved_profile, str) and resolved_profile.strip()
+        else None
+    )
+    source._transport_profile_stamped = True
+    if physical_platform == Platform.RELAY:
+        identity_for = getattr(adapter, "transport_identity_for_platform", None)
+        if callable(identity_for):
+            identity = identity_for(getattr(source, "platform", None))
+            if identity is not None:
+                source._transport_identity = str(identity)
+    return source
+
+
+def copy_session_source(source: SessionSource, **changes: Any) -> SessionSource:
+    """Clone *source* while preserving declared capability-backed state.
+
+    Runtime owner fields are keyword-only, non-comparing dataclass fields, so
+    :func:`dataclasses.replace` carries their exact process-local capability
+    objects through trusted in-process rewrites. Arbitrary dynamic attributes
+    are deliberately not copied.
+    """
+    return replace(source, **changes)
+
+
+def backend_notice_session_key(
+    session_key: str,
+    source: Optional[SessionSource] = None,
+    *,
+    fallback_profile: Optional[str] = None,
+) -> str:
+    """Return one reconnect-stable namespace for backend notice claims.
+
+    Capability-backed physical owner provenance wins over the logical runtime
+    route. The adapter profile is only a fallback for legacy/adapter-local
+    callers. Relay account identity further qualifies the key so separate
+    connector credentials cannot suppress one another's notices.
+    """
+    stamped = source_has_transport_owner(source)
+    transport_profile = (
+        getattr(source, "_transport_profile", None) if stamped else None
+    )
+    logical_profile = getattr(source, "profile", None) if source is not None else None
+    profile_candidate = (
+        transport_profile or fallback_profile or "default"
+        if stamped
+        else logical_profile or fallback_profile or "default"
+    )
+    profile = str(profile_candidate).strip() or "default"
+    qualified = f"profile:{len(profile)}:{profile}:{session_key}"
+    transport_identity = (
+        getattr(source, "_transport_identity", None) if stamped else None
+    )
+    if transport_identity is None:
+        return qualified
+    identity = str(transport_identity)
+    return f"transport:{len(identity)}:{identity}:{qualified}"
+
+
+def session_source_to_trusted_marker(source: SessionSource) -> Dict[str, Any]:
+    """Encode routing plus a separate owner envelope for a lifecycle marker.
+
+    Generic ``SessionSource.to_dict()`` output remains authority-free. Only
+    restart/update marker writers use this envelope, and only the paired trusted
+    decoder may restore it.
+    """
+    marker: Dict[str, Any] = {"source": source.to_dict()}
+
+    def _ownerless() -> Dict[str, Any]:
+        marker.update(
+            transport_owner_stamped=False,
+            transport_platform=None,
+            transport_profile=None,
+            transport_identity=None,
+        )
+        return marker
+
+    if not source_has_transport_owner(source):
+        return _ownerless()
+
+    platform_value = getattr(
+        getattr(source, "_transport_platform", None),
+        "value",
+        getattr(source, "_transport_platform", None),
+    )
+    try:
+        physical_platform = Platform(platform_value)
+    except (TypeError, ValueError):
+        return _ownerless()
+
+    profile = getattr(source, "_transport_profile", None)
+    if profile is not None and not isinstance(profile, str):
+        return _ownerless()
+    normalized_profile = profile.strip() or None if isinstance(profile, str) else None
+
+    identity = getattr(source, "_transport_identity", None)
+    if identity is not None and not isinstance(identity, str):
+        return _ownerless()
+    normalized_identity = identity.strip() or None if isinstance(identity, str) else None
+    if physical_platform == Platform.RELAY and normalized_identity is None:
+        return _ownerless()
+
+    marker.update(
+        transport_owner_stamped=True,
+        transport_platform=physical_platform.value,
+        transport_profile=normalized_profile,
+        transport_identity=normalized_identity,
+    )
+    if (
+        physical_platform == Platform.RELAY
+        and source.delivered_via_upstream_relay is True
+    ):
+        marker["delivered_via_upstream_relay"] = True
+    return marker
+
+
+def session_source_from_trusted_marker(
+    data: Dict[str, Any],
+) -> Optional[SessionSource]:
+    """Restore a local lifecycle marker without trusting generic source data.
+
+    A new nested marker mints physical-owner provenance only from a sibling
+    envelope whose stamp is literal ``True`` and whose fields validate. A
+    missing or malformed envelope stays modern and ownerless. Flat markers are
+    the narrowly scoped historical format and receive only legacy capability.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    source_present = "source" in data
+    source_data = data.get("source")
+    if source_present:
+        if not isinstance(source_data, dict):
+            return None
+        try:
+            source = SessionSource.from_dict(source_data)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if data.get("transport_owner_stamped") is not True:
+            return source
+
+        try:
+            physical_platform = Platform(data.get("transport_platform"))
+        except (TypeError, ValueError):
+            return source
+
+        profile = data.get("transport_profile")
+        if profile is not None:
+            if not isinstance(profile, str):
+                return source
+            profile = profile.strip() or None
+
+        identity = data.get("transport_identity")
+        if identity is not None:
+            if not isinstance(identity, str):
+                return source
+            identity = identity.strip() or None
+        if physical_platform == Platform.RELAY and identity is None:
+            return source
+
+        stamp_source_transport_owner(
+            source,
+            profile=profile,
+            platform=physical_platform,
+        )
+        source._transport_identity = identity
+        if (
+            physical_platform == Platform.RELAY
+            and data.get("delivered_via_upstream_relay") is True
+        ):
+            source.delivered_via_upstream_relay = True
+        return source
+
+    modern_owner_keys = {
+        "transport_owner_stamped",
+        "transport_platform",
+        "transport_profile",
+        "transport_identity",
+    }
+    if modern_owner_keys.intersection(data):
+        return None
+    if not data.get("platform") or not data.get("chat_id"):
+        return None
+    try:
+        legacy_source = SessionSource.from_dict(
+            {
+                "platform": data.get("platform"),
+                "chat_id": data.get("chat_id"),
+                "chat_type": data.get("chat_type") or "dm",
+                "thread_id": data.get("thread_id"),
+                "message_id": data.get("message_id"),
+                "user_id": data.get("user_id"),
+                "scope_id": data.get("scope_id"),
+            },
+            allow_legacy_unstamped=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    # Historical flat markers may retain this outbound routing hint only inside
+    # this trusted compatibility boundary; generic deserialization never does.
+    legacy_source.delivered_via_upstream_relay = (
+        data.get("delivered_via_upstream_relay") is True
+    )
+    return legacy_source
 
 
 @dataclass
@@ -862,6 +1215,18 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
+    # Private durable transport ownership for restart recovery. This envelope
+    # is intentionally separate from ``origin``: SessionSource dictionaries are
+    # reused by hooks, wire payloads, branching, and voice caches and therefore
+    # cannot carry authority. ``transport_owner_stamped`` is a presence-bearing
+    # tri-state on disk: key absent means a genuinely historical compatibility
+    # row, explicit False means a modern ownerless row, and True requires a
+    # valid physical platform/profile (plus relay identity when applicable).
+    transport_owner_stamped: bool = False
+    transport_platform: Optional[str] = None
+    transport_profile: Optional[str] = None
+    transport_identity: Optional[str] = None
+
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -916,13 +1281,33 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        if self.transport_owner_stamped:
+            result["transport_owner_stamped"] = True
+            result["transport_platform"] = self.transport_platform
+            result["transport_profile"] = self.transport_profile
+            result["transport_identity"] = self.transport_identity
+        elif not source_is_legacy_unstamped(self.origin):
+            # Preserve an explicit modern-ownerless state. Historical rows omit
+            # the entire envelope so a routine rewrite does not silently erase
+            # their narrowly-scoped compatibility marker.
+            result["transport_owner_stamped"] = False
+            result["transport_platform"] = None
+            result["transport_profile"] = None
+            result["transport_identity"] = None
         return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionEntry":
         origin = None
+        owner_envelope_present = "transport_owner_stamped" in data
         if "origin" in data and isinstance(data["origin"], dict):
-            origin = SessionSource.from_dict(data["origin"])
+            # Routing entries are the one trusted migration boundary for
+            # pre-owner records. Generic/wire deserialization remains modern
+            # and fail-closed when the durable stamp is absent.
+            origin = SessionSource.from_dict(
+                data["origin"],
+                allow_legacy_unstamped=not owner_envelope_present,
+            )
         
         platform = None
         if data.get("platform"):
@@ -952,6 +1337,36 @@ class SessionEntry:
             # malformed pair is not trustworthy enough to auto-resume.
             active_turn_token = None
             active_turn_started_at = None
+
+        transport_owner_stamped = data.get("transport_owner_stamped") is True
+        transport_platform = data.get("transport_platform")
+        transport_profile = data.get("transport_profile")
+        transport_identity = data.get("transport_identity")
+        if transport_owner_stamped:
+            if not isinstance(transport_platform, str) or not transport_platform.strip():
+                transport_owner_stamped = False
+            else:
+                transport_platform = transport_platform.strip()
+                try:
+                    Platform(transport_platform)
+                except ValueError:
+                    transport_owner_stamped = False
+            if transport_profile is None:
+                pass
+            elif isinstance(transport_profile, str):
+                transport_profile = transport_profile.strip() or None
+            else:
+                transport_owner_stamped = False
+            if transport_identity is None:
+                pass
+            elif isinstance(transport_identity, str):
+                transport_identity = transport_identity.strip() or None
+            else:
+                transport_owner_stamped = False
+        if not transport_owner_stamped:
+            transport_platform = None
+            transport_profile = None
+            transport_identity = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -997,6 +1412,10 @@ class SessionEntry:
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
+            transport_owner_stamped=transport_owner_stamped,
+            transport_platform=transport_platform,
+            transport_profile=transport_profile,
+            transport_identity=transport_identity,
             is_fresh_reset=data.get("is_fresh_reset", False),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
@@ -2928,7 +3347,12 @@ class SessionStore:
                 return True
         return False
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(
+        self,
+        session_key: str,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> Optional[str]:
         """Persist exact ownership of the agent turn running for *session_key*.
 
         The opaque token is returned to the caller and must be supplied to
@@ -2945,6 +3369,75 @@ class SessionStore:
             candidate = entry.to_dict()
             candidate["active_turn_token"] = token
             candidate["active_turn_started_at"] = now.isoformat()
+            durable_origin: Optional[SessionSource] = None
+            owner_stamped = entry.transport_owner_stamped
+            transport_platform = entry.transport_platform
+            transport_profile = entry.transport_profile
+            transport_identity = entry.transport_identity
+            if source is not None:
+                # Persist only public origin metadata. Physical owner authority
+                # lives in the private SessionEntry envelope below.
+                is_legacy = source_is_legacy_unstamped(source)
+                durable_origin = SessionSource.from_dict(
+                    source.to_dict(),
+                    allow_legacy_unstamped=is_legacy,
+                )
+                candidate["origin"] = durable_origin.to_dict()
+                if source_has_transport_owner(source):
+                    physical_platform = (
+                        getattr(source, "_transport_platform", None)
+                        or getattr(source, "platform", None)
+                    )
+                    platform_value = getattr(
+                        physical_platform,
+                        "value",
+                        physical_platform,
+                    )
+                    normalized_platform = (
+                        platform_value.strip()
+                        if isinstance(platform_value, str)
+                        else ""
+                    )
+                    owner_stamped = bool(normalized_platform)
+                    transport_platform = normalized_platform or None
+                    transport_profile = getattr(
+                        source, "_transport_profile", None
+                    )
+                    transport_identity = getattr(
+                        source, "_transport_identity", None
+                    )
+                    if transport_identity is not None:
+                        transport_identity = str(transport_identity).strip() or None
+                elif is_legacy:
+                    # Preserve genuinely historical compatibility by omitting
+                    # the envelope entirely.
+                    owner_stamped = False
+                    transport_platform = None
+                    transport_profile = None
+                    transport_identity = None
+                else:
+                    # A modern ownerless source is durably explicit and can
+                    # never become legacy merely because it crossed a restart.
+                    owner_stamped = False
+                    transport_platform = None
+                    transport_profile = None
+                    transport_identity = None
+
+                if owner_stamped:
+                    candidate["transport_owner_stamped"] = True
+                    candidate["transport_platform"] = transport_platform
+                    candidate["transport_profile"] = transport_profile
+                    candidate["transport_identity"] = transport_identity
+                elif is_legacy:
+                    candidate.pop("transport_owner_stamped", None)
+                    candidate.pop("transport_platform", None)
+                    candidate.pop("transport_profile", None)
+                    candidate.pop("transport_identity", None)
+                else:
+                    candidate["transport_owner_stamped"] = False
+                    candidate["transport_platform"] = None
+                    candidate["transport_profile"] = None
+                    candidate["transport_identity"] = None
             # Keep the legacy 120-second startup heuristic effective during a
             # rolling downgrade/upgrade window where an older binary cannot
             # understand the exact marker fields.
@@ -2960,6 +3453,12 @@ class SessionStore:
             entry.active_turn_token = token
             entry.active_turn_started_at = now
             entry.updated_at = now
+            if durable_origin is not None:
+                entry.origin = durable_origin
+                entry.transport_owner_stamped = owner_stamped
+                entry.transport_platform = transport_platform
+                entry.transport_profile = transport_profile
+                entry.transport_identity = transport_identity
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:

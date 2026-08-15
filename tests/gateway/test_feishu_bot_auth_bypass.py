@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session import Platform, SessionSource
+from gateway.session import Platform, SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -37,24 +37,30 @@ def _make_bare_runner():
 
 
 def _make_feishu_bot_source(open_id: str = "ou_peer"):
-    return SessionSource(
-        platform=Platform.FEISHU,
-        chat_id="oc_1",
-        chat_type="group",
-        user_id=open_id,
-        user_name="PeerBot",
-        is_bot=True,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_1",
+            chat_type="group",
+            user_id=open_id,
+            user_name="PeerBot",
+            is_bot=True,
+        ),
+        profile=None,
     )
 
 
 def _make_feishu_human_source(open_id: str = "ou_human"):
-    return SessionSource(
-        platform=Platform.FEISHU,
-        chat_id="oc_1",
-        chat_type="group",
-        user_id=open_id,
-        user_name="Human",
-        is_bot=False,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_1",
+            chat_type="group",
+            user_id=open_id,
+            user_name="Human",
+            is_bot=False,
+        ),
+        profile=None,
     )
 
 

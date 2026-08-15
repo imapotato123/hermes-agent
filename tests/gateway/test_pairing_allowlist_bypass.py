@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session import Platform, SessionSource
+from gateway.session import Platform, SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -49,13 +49,16 @@ def _make_runner(*, paired: bool):
 
 
 def _make_source(user_id: str = "pairme", chat_type: str = "dm"):
-    return SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="123",
-        chat_type=chat_type,
-        user_id=user_id,
-        user_name="SomeHuman",
-        is_bot=False,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name="SomeHuman",
+            is_bot=False,
+        ),
+        profile=None,
     )
 
 
@@ -276,14 +279,18 @@ def test_revoke_whatsapp_sole_entry_denies_live_adapter_without_restart(
     store._approve_user("whatsapp", "15551234567@s.whatsapp.net", "")
     sender = "15551234567:47@s.whatsapp.net"
     assert adapter._is_dm_intake_allowed(sender) is True
-    assert runner._is_user_authorized(
+    approved_source = stamp_source_transport_owner(
         SessionSource(
             platform=Platform.WHATSAPP,
             user_id=sender,
             chat_id=sender,
             user_name="revoked",
             chat_type="dm",
-        )
+        ),
+        profile=None,
+    )
+    assert runner._is_user_authorized(
+        approved_source
     ) is True
 
     assert store.revoke("whatsapp", sender) is True
@@ -293,13 +300,7 @@ def test_revoke_whatsapp_sole_entry_denies_live_adapter_without_restart(
     assert adapter._is_dm_intake_allowed(sender) is False
     assert adapter._is_dm_allowed(sender) is False
     assert runner._is_user_authorized(
-        SessionSource(
-            platform=Platform.WHATSAPP,
-            user_id=sender,
-            chat_id=sender,
-            user_name="revoked",
-            chat_type="dm",
-        )
+        approved_source
     ) is False
 
 

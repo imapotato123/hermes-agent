@@ -15,7 +15,12 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    stamp_source_transport_owner,
+)
 
 
 ACTIVE_TURN_MAX_AGE_SECONDS = 60 * 60
@@ -90,6 +95,84 @@ def test_active_turn_fields_round_trip_and_legacy_payload_defaults(tmp_path):
     corrupt = SessionEntry.from_dict(payload)
     assert corrupt.active_turn_token is None
     assert corrupt.active_turn_started_at is None
+
+
+def test_active_turn_transport_owner_round_trips_through_routing_json(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("owner-json")
+    stamp_source_transport_owner(source, profile="alpha")
+    entry = store.get_or_create_session(source)
+
+    token = store.mark_turn_active(entry.session_key, source=source)
+    assert token is not None
+
+    payload = _entry_for(store, source).to_dict()
+    assert payload["transport_owner_stamped"] is True
+    assert payload["transport_platform"] == Platform.DISCORD.value
+    assert payload["transport_profile"] == "alpha"
+    assert payload["transport_identity"] is None
+    assert "transport_owner_stamped" not in payload["origin"]
+
+    restored = SessionEntry.from_dict(payload)
+    assert restored.origin is not None
+    assert restored.transport_owner_stamped is True
+    assert restored.transport_platform == Platform.DISCORD.value
+    assert restored.transport_profile == "alpha"
+    assert restored.transport_identity is None
+    assert restored.origin._legacy_transport_owner_unstamped is False
+    assert restored.origin._transport_profile_stamped is False
+
+    reloaded = _make_store(tmp_path)
+    persisted = _entry_for(reloaded, source)
+    assert persisted.origin is not None
+    assert persisted.transport_owner_stamped is True
+    assert persisted.transport_platform == Platform.DISCORD.value
+    assert persisted.transport_profile == "alpha"
+    assert persisted.transport_identity is None
+    assert persisted.origin._legacy_transport_owner_unstamped is False
+    assert persisted.origin._transport_profile_stamped is False
+
+    legacy_payload = dict(payload)
+    legacy_payload.pop("transport_owner_stamped")
+    legacy_payload.pop("transport_platform")
+    legacy_payload.pop("transport_profile")
+    legacy_payload.pop("transport_identity")
+    legacy = SessionEntry.from_dict(legacy_payload)
+    assert legacy.origin is not None
+    assert legacy.transport_owner_stamped is False
+    assert legacy.origin._legacy_transport_owner_unstamped is True
+
+    modern_ownerless_payload = dict(payload)
+    modern_ownerless_payload["transport_owner_stamped"] = False
+    modern_ownerless_payload["transport_platform"] = None
+    modern_ownerless_payload["transport_profile"] = None
+    modern_ownerless_payload["transport_identity"] = None
+    modern_ownerless = SessionEntry.from_dict(modern_ownerless_payload)
+    assert modern_ownerless.origin is not None
+    assert modern_ownerless.transport_owner_stamped is False
+    assert modern_ownerless.origin._legacy_transport_owner_unstamped is False
+
+
+def test_active_turn_transport_owner_round_trips_through_state_db(tmp_path):
+    store = _make_db_store(tmp_path)
+    source = _make_source("owner-state-db")
+    stamp_source_transport_owner(source, profile=None)
+    entry = store.get_or_create_session(source)
+
+    token = store.mark_turn_active(entry.session_key, source=source)
+    assert token is not None
+    _close_store_db(store)
+
+    reloaded = _make_db_store(tmp_path)
+    persisted = _entry_for(reloaded, source)
+    assert persisted.origin is not None
+    assert persisted.transport_owner_stamped is True
+    assert persisted.transport_platform == Platform.DISCORD.value
+    assert persisted.transport_profile is None
+    assert persisted.transport_identity is None
+    assert persisted.origin._legacy_transport_owner_unstamped is False
+    assert persisted.origin._transport_profile_stamped is False
+    _close_store_db(reloaded)
 
 
 def test_mark_refreshes_updated_at_for_legacy_upgrade_fallback(tmp_path):

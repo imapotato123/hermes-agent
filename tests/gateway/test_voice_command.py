@@ -53,6 +53,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.session import stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,14 @@ def _make_runner(tmp_path):
     runner.session_store = MagicMock()
     runner._is_user_authorized = lambda source: True
     return runner
+
+
+def _register_adapter(runner, event, adapter):
+    adapter.platform = event.source.platform
+    adapter._transport_profile = None
+    runner.adapters[event.source.platform] = adapter
+    stamp_source_transport_owner(event.source, adapter=adapter)
+    return adapter
 
 
 # =====================================================================
@@ -222,7 +231,7 @@ class TestAutoVoiceReply:
             mock_adapter = MagicMock()
             mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
             event.raw_message = SimpleNamespace(guild_id=111, guild=None)
-            runner.adapters[event.source.platform] = mock_adapter
+            _register_adapter(runner, event, mock_adapter)
 
         return runner._should_send_voice_reply(
             event, response, agent_messages or []
@@ -303,7 +312,7 @@ class TestSendVoiceReply:
         mock_adapter.send_voice = AsyncMock()
         event = _make_event()
         event.source.platform = Platform.TELEGRAM
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -331,7 +340,7 @@ class TestSendVoiceReply:
         event.source.chat_type = "dm"
         event.source.thread_id = "20197"
         event.message_id = "462"
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
@@ -564,7 +573,7 @@ class TestVoiceChannelCommands:
         event = self._make_discord_event()
         event.source.chat_type = "group"
         event.source.chat_name = "Hermes Server / #general"
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
         result = await runner._handle_voice_channel_join(event)
         assert "joined" in result.lower()
         assert "General" in result
@@ -584,7 +593,7 @@ class TestVoiceChannelCommands:
         )
         mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
         event = self._make_discord_event()
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
 
         result = await runner._handle_voice_channel_join(event)
 
@@ -601,7 +610,7 @@ class TestVoiceChannelCommands:
         mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
         mock_adapter.leave_voice_channel = AsyncMock()
         event = self._make_discord_event("/voice leave")
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
         runner._voice_mode["discord:123"] = "all"
         result = await runner._handle_voice_channel_leave(event)
         assert "left" in result.lower()
@@ -622,6 +631,8 @@ class TestVoiceChannelCommands:
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
         mock_adapter.handle_message = AsyncMock()
+        mock_adapter.platform = Platform.DISCORD
+        mock_adapter._transport_profile = None
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
         mock_adapter.handle_message.assert_called_once()
@@ -630,6 +641,8 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+        assert event.source._transport_adapter_ref() is mock_adapter
+        assert event.source._transport_platform == Platform.DISCORD
 
     @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):
@@ -642,6 +655,8 @@ class TestVoiceChannelCommands:
         mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
         mock_adapter.handle_message = AsyncMock()
         mock_adapter._resolve_channel_prompt = MagicMock(return_value="Be terse in #dev.")
+        mock_adapter.platform = Platform.DISCORD
+        mock_adapter._transport_profile = None
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
         mock_adapter._resolve_channel_prompt.assert_called_once_with("123")
@@ -670,6 +685,8 @@ class TestVoiceChannelCommands:
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
         mock_adapter.handle_message = AsyncMock()
+        mock_adapter.platform = Platform.DISCORD
+        mock_adapter._transport_profile = None
         runner.adapters[Platform.DISCORD] = mock_adapter
 
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
@@ -680,6 +697,8 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "group"
         assert event.source.chat_name == "Hermes Server / #general"
         assert event.source.user_id == "42"
+        assert event.source._transport_adapter_ref() is mock_adapter
+        assert event.source._transport_platform == Platform.DISCORD
 
 
     # -- _get_guild_id --
@@ -991,7 +1010,7 @@ class TestCallbackWiringOrder:
 
         event = _make_event("/voice channel")
         event.raw_message = SimpleNamespace(guild_id=111, guild=None)
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
 
         result = await runner._handle_voice_channel_join(event)
         assert "failed" in result.lower()
@@ -1021,7 +1040,7 @@ class TestLeaveExceptionHandling:
 
         event = _make_event("/voice leave")
         event.raw_message = SimpleNamespace(guild_id=111, guild=None)
-        runner.adapters[event.source.platform] = mock_adapter
+        _register_adapter(runner, event, mock_adapter)
         runner._voice_mode["telegram:123"] = "all"
 
         result = await runner._handle_voice_channel_leave(event)
@@ -1230,15 +1249,19 @@ class TestSendVoiceReplyFilename:
         (gateway/platforms/base.py) when the path became platform-aware;
         the uniqueness contract lives there now.
         """
-        import inspect
-        from gateway.platforms.base import build_auto_tts_output_path
-        from gateway.run import GatewayRunner
-        source = inspect.getsource(build_auto_tts_output_path)
+        from pathlib import Path
+
+        repo_root = Path(__file__).parents[2]
+        source = (repo_root / "gateway" / "platforms" / "base.py").read_text(
+            encoding="utf-8"
+        )
         assert "uuid" in source, \
             "build_auto_tts_output_path should use uuid for unique filenames"
         assert "int(time.time())" not in source, \
             "build_auto_tts_output_path should not use int(time.time()) — collision risk"
-        runner_source = inspect.getsource(GatewayRunner._send_voice_reply)
+        runner_source = (repo_root / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
         assert "build_auto_tts_output_path" in runner_source, \
             "_send_voice_reply should build its path via build_auto_tts_output_path"
 
@@ -1385,11 +1408,19 @@ class TestSendVoiceReplyCleanup:
 
     def test_cleanup_in_finally(self):
         """The method has cleanup in a finally block, not inside try."""
-        import inspect, textwrap, ast
-        from gateway.run import GatewayRunner
-        source = textwrap.dedent(inspect.getsource(GatewayRunner._send_voice_reply))
+        import ast
+        from pathlib import Path
+
+        source = (Path(__file__).parents[2] / "gateway" / "run.py").read_text(
+            encoding="utf-8"
+        )
         tree = ast.parse(source)
-        func = tree.body[0]
+        func = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_send_voice_reply"
+        )
 
         has_finally_unlink = False
         for node in ast.walk(func):
@@ -1412,9 +1443,11 @@ class TestAutoTtsTempFileCleanup:
 
     def test_source_has_finally_remove(self):
         """play_tts call is wrapped in try/finally with os.remove."""
-        import inspect
-        from gateway.platforms.base import BasePlatformAdapter
-        source = inspect.getsource(BasePlatformAdapter._process_message_background)
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parents[2] / "gateway" / "platforms" / "base.py"
+        ).read_text(encoding="utf-8")
         # Find the play_tts section and verify cleanup
         play_tts_idx = source.find("play_tts")
         assert play_tts_idx > 0

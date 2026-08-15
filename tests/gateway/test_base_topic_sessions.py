@@ -9,7 +9,11 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 class DummyTelegramAdapter(BasePlatformAdapter):
@@ -54,15 +58,27 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         self.processing_hooks.append(("complete", event.message_id, outcome))
 
 
-def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageEvent:
+def _make_event(
+    chat_id: str,
+    thread_id: str,
+    message_id: str = "1",
+    message_type: MessageType = MessageType.TEXT,
+) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id=chat_id,
+        chat_type="group",
+        thread_id=thread_id,
+    )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.TELEGRAM,
+    )
     return MessageEvent(
         text="hello",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
-            chat_id=chat_id,
-            chat_type="group",
-            thread_id=thread_id,
-        ),
+        message_type=message_type,
+        source=source,
         message_id=message_id,
     )
 
@@ -109,6 +125,7 @@ class TestBasePlatformTopicSessions:
         adapter._keep_typing = hold_typing
 
         event = _make_event("-1001", "17585")
+        stamp_source_transport_owner(event.source, adapter=adapter)
         await adapter._process_message_background(event, build_session_key(event.source))
 
         assert adapter.sent == [
@@ -139,16 +156,11 @@ class TestBasePlatformTopicSessions:
 class TestTelegramAutoTtsCaptionDelivery:
     @staticmethod
     def _make_voice_event(chat_id: str = "-1001", thread_id: str = "17585") -> MessageEvent:
-        return MessageEvent(
-            text="hello",
-            message_type=MessageType.VOICE,
-            source=SessionSource(
-                platform=Platform.TELEGRAM,
-                chat_id=chat_id,
-                chat_type="group",
-                thread_id=thread_id,
-            ),
+        return _make_event(
+            chat_id,
+            thread_id,
             message_id="voice-1",
+            message_type=MessageType.VOICE,
         )
 
     @staticmethod
@@ -181,6 +193,7 @@ class TestTelegramAutoTtsCaptionDelivery:
         tts_path = tmp_path / "reply.ogg"
         tts_path.write_text("audio", encoding="utf-8")
         event = self._make_voice_event()
+        stamp_source_transport_owner(event.source, adapter=adapter)
 
         with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
             "tools.tts_tool.text_to_speech_tool",

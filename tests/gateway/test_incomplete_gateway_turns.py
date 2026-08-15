@@ -10,7 +10,7 @@ import pytest
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, build_session_key, stamp_source_transport_owner
 
 
 class CaptureSlackAdapter(BasePlatformAdapter):
@@ -108,17 +108,19 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
 
 
 def _make_event() -> MessageEvent:
-    return MessageEvent(
-        text="hello",
-        source=SessionSource(
-            platform=Platform.SLACK,
-            chat_id="C123",
-            chat_type="channel",
-            thread_id="171717",
-            user_id="U123",
-        ),
-        message_id="m-1",
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
     )
+    stamp_source_transport_owner(
+        source,
+        profile=None,
+        platform=Platform.SLACK,
+    )
+    return MessageEvent(text="hello", source=source, message_id="m-1")
 
 
 @pytest.mark.asyncio
