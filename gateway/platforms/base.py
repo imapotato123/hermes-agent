@@ -4207,7 +4207,12 @@ class BasePlatformAdapter(ABC):
         fallback_adapter: Optional[Any] = None,
     ) -> None:
         """Delete through the exact adapter generation that created the ID."""
-        if not result.success or not result.message_id or ttl_seconds <= 0:
+        if (
+            result is None
+            or not result.success
+            or not result.message_id
+            or ttl_seconds <= 0
+        ):
             return
         sending_adapter = getattr(result, "_sending_adapter", None)
         if sending_adapter is None:

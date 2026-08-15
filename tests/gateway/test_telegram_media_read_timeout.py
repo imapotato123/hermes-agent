@@ -61,8 +61,11 @@ def adapter():
     a._notification_kwargs = lambda metadata: {}
     a._reply_to_message_id_for_send = lambda *args, **kwargs: None
 
-    async def _direct(fn, payload, *args, **kwargs):
-        return await fn(**payload)
+    async def _direct(
+        bot_method, send_kwargs, metadata, reply_to_message_id, media_label, reset_media=None
+    ):
+        send_fn = getattr(a._bot, bot_method)
+        return await send_fn(**send_kwargs)
 
     a._send_with_dm_topic_reply_anchor_retry = _direct
     return a
