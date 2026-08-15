@@ -1,10 +1,11 @@
 """Producer-hook tests: _process_message_background records delivery
 obligations around the final send (gateway/platforms/base.py).
 
-Contract: obligation recorded (pending→attempting) BEFORE the send await,
-delivered/failed by SendResult afterward; slash commands, ephemeral
-replies, and empty responses are never recorded; ledger failures never
-block the send.
+Contract: the complete response bundle is recorded before the send await;
+each physical operation is marked attempting, then checkpointed after ACK.
+Slash commands, ephemeral replies, and empty responses are never recorded.
+Pre-send durability failure blocks the physical send; all SQLite work runs
+off the event loop.
 """
 
 import asyncio
@@ -15,7 +16,13 @@ import pytest
 
 from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BackendUnavailableReply,
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
 from gateway.session import SessionSource
 
 
@@ -122,6 +129,18 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "failed"
 
+    @pytest.mark.asyncio
+    async def test_backend_notice_is_not_durably_replayed_as_plain_text(self):
+        adapter = _Adapter()
+        await _run(
+            adapter,
+            _event(),
+            BackendUnavailableReply("backend unavailable"),
+        )
+
+        assert adapter.sent == ["backend unavailable"]
+        assert _rows() == []
+
 
     @pytest.mark.asyncio
     async def test_slow_ledger_record_does_not_block_event_loop(self):
@@ -131,22 +150,33 @@ class TestProducerHook:
         with patch(
             "gateway.delivery_ledger.record_obligation",
             side_effect=slow_record,
-        ), patch("gateway.delivery_ledger.mark_attempting"):
+        ):
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())
 
         assert blocked_event_loop == []
-        assert adapter.sent == ["final answer"]
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_ledger_record_failure_blocks_untracked_physical_send(self):
+        adapter = _Adapter()
+
+        with patch(
+            "gateway.delivery_ledger.record_obligation",
+            side_effect=RuntimeError("state.db unavailable"),
+        ):
+            await _run(adapter, _event())
+
+        assert adapter.sent == []
+        assert _rows() == []
 
     @pytest.mark.asyncio
     async def test_slow_ledger_update_does_not_block_event_loop(self):
         adapter = _Adapter()
-        slow_delivered, event_loop_witness, blocked_event_loop = _blocking_probe()
+        slow_checkpoint, event_loop_witness, blocked_event_loop = _blocking_probe()
 
-        with patch("gateway.delivery_ledger.record_obligation"), patch(
-            "gateway.delivery_ledger.mark_attempting"
-        ), patch(
-            "gateway.delivery_ledger.mark_delivered",
-            side_effect=slow_delivered,
+        with patch(
+            "gateway.delivery_ledger.mark_bundle_operations_completed",
+            side_effect=slow_checkpoint,
         ):
             await asyncio.gather(_run(adapter, _event()), event_loop_witness())
 

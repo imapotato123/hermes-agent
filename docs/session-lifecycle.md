@@ -179,6 +179,26 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 | `load_transcript(session_id)` | Load all messages from a session's SQLite transcript. |
 | `rewind_session(session_id, n=1)` | Back up `n` user turns via soft-delete (keeps audit trail). Returns `{rewound_count, turns_undone, target_text}`. |
 
+### Durable final-output obligations
+
+Completed turns use `gateway/delivery_ledger.py` to separate **turn recovery**
+from **physical output recovery**. Before the first physical send, the gateway
+records a `response_bundle` in `state.db` containing the ordered final text,
+native image URLs, local/media attachment paths, auto-TTS intent, and the exact
+transport-owner stamp (platform/profile plus relay bot identity where present).
+Legacy text-only rows remain readable as `operation=text`; their obligation IDs
+are byte-for-byte unchanged.
+
+Every successful physical operation is checkpointed in `completed_operations`
+before the next operation begins. Restart/reconnect recovery resolves the exact
+live owner again, skips checkpointed operations, and resumes at the first owed
+one. A failed operation blocks later bundles for that session during the sweep,
+preserving order. If the platform ACK succeeds but the checkpoint write itself
+fails, the row becomes `partial`: it continues fencing `resume_pending` turn
+regeneration but is not automatically replayed, because that one operation is
+acknowledgement-ambiguous. Unresolved rows are never deleted merely to satisfy
+the ledger row cap.
+
 ### Internal Helpers
 
 - `_ensure_loaded()` / `_ensure_loaded_locked()` — Load `sessions.json` into `_entries` dict.

@@ -9,6 +9,8 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import json
+import sqlite3
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -93,10 +95,126 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_existing_schema_migrates_transport_owner_columns(self):
+        path = dl._db_path()
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                content TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                last_error TEXT
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        _record()
+        with dl._connect() as migrated:
+            columns = {
+                row[1]
+                for row in migrated.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                ).fetchall()
+            }
+            owner = migrated.execute(
+                "SELECT transport_platform, transport_profile, "
+                "transport_profile_stamped, transport_identity, route_scope_id, "
+                "route_user_id, route_chat_type, operation, payload_json, sequence_no "
+                "FROM delivery_obligations WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert {
+            "transport_platform",
+            "transport_profile",
+            "transport_profile_stamped",
+            "transport_identity",
+            "route_scope_id",
+            "route_user_id",
+            "route_chat_type",
+            "operation",
+            "payload_json",
+            "sequence_no",
+        } <= columns
+        assert owner == (None, None, 0, None, None, None, None, "text", None, 0)
+
+    def test_typed_bundle_payload_round_trips_through_claim(self):
+        payload = json.dumps(
+            {
+                "version": 1,
+                "text": "answer",
+                "images": [["https://example.test/a.png", "a"]],
+                "media_files": [["/tmp/report.pdf", False]],
+            },
+            sort_keys=True,
+        )
+        oid = dl.compute_obligation_id(
+            "sk-bundle",
+            "msg-bundle",
+            "answer",
+            operation="response_bundle",
+            payload_json=payload,
+        )
+        dl.record_obligation(
+            obligation_id=oid,
+            session_key="sk-bundle",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="answer",
+            operation="response_bundle",
+            payload_json=payload,
+            sequence_no=7,
+        )
+        _orphan(oid)
+
+        claimed = dl.sweep_recoverable()
+
+        assert claimed[0]["operation"] == "response_bundle"
+        assert claimed[0]["payload_json"] == payload
+        assert claimed[0]["sequence_no"] == 7
+
+    def test_bundle_checkpoint_rejects_forged_cached_operation_key(self):
+        payload = {
+            "version": 1,
+            "text": "answer",
+            "operation_keys": ["text", "forged"],
+            "completed_operations": [],
+        }
+        dl.record_obligation(
+            obligation_id="forged-bundle",
+            session_key="sk-bundle",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="answer",
+            operation="response_bundle",
+            payload_json=json.dumps(payload, sort_keys=True),
+        )
+
+        assert not dl.mark_bundle_operation_attempting(
+            "forged-bundle", "forged"
+        )
+        assert not dl.mark_bundle_operation_completed(
+            "forged-bundle", "forged"
+        )
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):
         a = dl.compute_obligation_id("sk1", "msg1", "hello")
+        legacy_expected = __import__("hashlib").sha256(
+            b"sk1|msg1|hello"
+        ).hexdigest()[:24]
+        assert a == legacy_expected
         assert a == dl.compute_obligation_id("sk1", "msg1", "hello")
         # Different thread (baked into session_key) → different id. This is
         # the cron-topic collision class from the earlier outbox attempt.
@@ -104,6 +222,72 @@ class TestObligationId:
         assert a != dl.compute_obligation_id("sk1", "msg2", "hello")
         assert a != dl.compute_obligation_id("sk1", "msg1", "other")
         assert len(a) == 24
+
+    def test_stamped_physical_platform_is_part_of_identity(self):
+        native = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="discord",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+        relay = dl.compute_obligation_id(
+            "sk1",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+        )
+
+        assert native != relay
+
+    def test_transport_identity_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            transport_identity="discord:app-2",
+        )
+
+        assert first != second
+
+    def test_relay_tenant_discriminator_is_part_of_identity(self):
+        first = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-1",
+            route_user_id="user-1",
+        )
+        second = dl.compute_obligation_id(
+            "shared-session",
+            "msg1",
+            "hello",
+            transport_platform="relay",
+            transport_profile=None,
+            transport_profile_stamped=True,
+            route_scope_id="guild-2",
+            route_user_id="user-2",
+        )
+
+        assert first != second
 
 
 class TestSweep:
@@ -122,6 +306,47 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
+    def test_claim_cas_includes_observed_process_start_time(self, monkeypatch):
+        """PID reuse between liveness check and UPDATE cannot steal a live claim."""
+        _record()
+        _orphan("ob-1")
+
+        class _RacingConnection:
+            def __init__(self, conn):
+                self._conn = conn
+                self._raced = False
+
+            def execute(self, sql, params=()):
+                if "SET owner_pid=?" in sql and not self._raced:
+                    self._raced = True
+                    self._conn.execute(
+                        "UPDATE delivery_obligations "
+                        "SET owner_pid=?, owner_started_at=? WHERE obligation_id=?",
+                        (999999999, 2, "ob-1"),
+                    )
+                return self._conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        real_transaction = dl._transaction
+
+        @dl.contextmanager
+        def racing_transaction():
+            with real_transaction() as conn:
+                yield _RacingConnection(conn)
+
+        monkeypatch.setattr(dl, "_transaction", racing_transaction)
+
+        assert dl.sweep_recoverable() == []
+        with dl._connect() as conn:
+            owner_pid, owner_started_at, attempts = conn.execute(
+                "SELECT owner_pid, owner_started_at, attempts "
+                "FROM delivery_obligations WHERE obligation_id=?",
+                ("ob-1",),
+            ).fetchone()
+        assert (owner_pid, owner_started_at, attempts) == (999999999, 2, 0)
+
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
@@ -134,6 +359,17 @@ class TestPrune:
             )
         dl._prune()
         assert _row("ob-1") is None
+
+    def test_row_cap_never_deletes_unresolved_obligations(self, monkeypatch):
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+        for index in range(4):
+            _record(oid=f"pending-{index}")
+
+        dl._prune()
+
+        assert all(
+            _row(f"pending-{index}") is not None for index in range(4)
+        )
 
 
 class TestLedgerEnabled:
@@ -184,6 +420,45 @@ class TestGatewayRedeliverySweep:
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.asyncio
+    async def test_failed_resume_clear_still_fences_auto_resume(self):
+        from datetime import datetime
+
+        from gateway.config import Platform
+        from gateway.session import SessionEntry, SessionSource
+
+        _record()
+        _orphan("ob-1")
+        runner = self._runner()
+        setattr(
+            runner._async_session_store,
+            "clear_resume_pending",
+            AsyncMock(side_effect=OSError("disk")),
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="channel",
+        )
+        entry = SessionEntry(
+            session_key="agent:main:slack:channel:C1",
+            session_id="sid",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+        )
+        store = MagicMock()
+        store._lock = threading.Lock()
+        store._entries = {entry.session_key: entry}
+        store._ensure_loaded_locked = MagicMock()
+        runner.session_store = store
+        runner._AUTO_RESUME_REASONS = frozenset({"restart_interrupted"})
+
+        assert await runner._redeliver_pending_obligations() == 0
+        assert runner._schedule_resume_pending_sessions() == 0
 
     @pytest.mark.asyncio
     async def test_attempting_redelivers_with_marker(self):

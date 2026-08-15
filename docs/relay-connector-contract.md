@@ -93,9 +93,17 @@ HTTP call.
 
 Frames (connector → gateway, over the WS):
 
-- `{"type":"inbound", "event": <MessageEvent>, "bufferId"?}`
+- `{"type":"inbound", "botId"?, "event": <MessageEvent>, "bufferId"?}`
 - `{"type":"interrupt_inbound", "session_key", "chat_id"}` (§5)
 - `{"type":"passthrough_forward", "forward": <PassthroughForward>, "bufferId"?}` (§5.1)
+
+`botId` is REQUIRED on `inbound` whenever the authenticated relay session
+advertised more than one bot identity for the event's `source.platform`. The
+gateway combines `source.platform` + `botId` into the durable physical-owner
+identity and uses that exact pair on every later egress. Omitting `botId` in an
+ambiguous same-platform session, or naming a pair that was not acknowledged at
+handshake, fails closed. Single-identity-per-platform sessions retain the
+platform's unique advertised identity when `botId` is absent.
 
 **Channel context on inbound (design relay-channel-context).** When the source
 platform's descriptor advertised `supports_context` (§2) and the chat is
@@ -277,9 +285,18 @@ read off the stored secret record at the WS upgrade, never asserted in a frame):
   ordering discipline as the bus). Only after the ack is it safe to close.
 - `{"type":"inbound_ack", "bufferId"}` (gateway → connector) — durable receipt of
   a buffered `inbound` delivery (which carries its `bufferId`) replayed on
-  reconnect. The connector acks the buffer entry only after this, giving
+  reconnect. The gateway emits this only after the runner has committed the
+  active-turn marker to its durable session store (or, for a synchronously
+  consumed/rejected non-turn frame, after that handler returns successfully).
+  Merely invoking or scheduling the inbound callback is not an acknowledgement.
+  The connector acks the buffer entry only after this, giving
   drain-without-dup on the **delivery leg**: an instance that dies mid-drain
   redelivers exactly the unacked tail; an acked entry never redelivers.
+
+The WebSocket reader dispatches buffered handlers as tracked tasks. Waiting for
+durable handoff therefore does not block unrelated `outbound_result`, interrupt,
+or idle-control frames. Disconnect cancels and joins those tracked tasks before
+closing the socket; an uncommitted task sends no `inbound_ack` and is replayed.
 
 **Buffer + drain.** While flipped, the connector appends inbound to a durable
 per-instance delivery-leg buffer (`delivery:<instanceId>`) instead of pushing it

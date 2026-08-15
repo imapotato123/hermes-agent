@@ -12,10 +12,12 @@ connector->gateway handlers on the transport).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 
 import pytest
+from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.relay.adapter import RelayAdapter
@@ -41,14 +43,18 @@ def _desc() -> CapabilityDescriptor:
 
 @pytest.fixture
 def adapter():
-    return RelayAdapter(PlatformConfig(), _desc(), transport=StubConnector(_desc()))
+    stub = StubConnector(_desc())
+    stub._identities = [("discord", "appShared")]
+    return RelayAdapter(PlatformConfig(), _desc(), transport=stub)
 
 
-def _interaction_forward(payload: dict) -> PassthroughForward:
+def _interaction_forward(
+    payload: dict, *, bot_id: str = "appShared"
+) -> PassthroughForward:
     body = json.dumps(payload).encode("utf-8")
     return PassthroughForward(
         platform="discord",
-        bot_id="appShared",
+        bot_id=bot_id,
         method="POST",
         path="/interactions/discord/appShared",
         headers=[("content-type", "application/json")],
@@ -135,6 +141,106 @@ async def test_discord_interaction_routes_through_handle_message(adapter, monkey
     # The logical platform is now recorded for egress sender selection too
     # (_capture_scope skips only the generic "relay").
     assert adapter._platform_by_chat.get("chan-9") == "discord"
+
+
+@pytest.mark.asyncio
+async def test_buffered_passthrough_acks_after_consumption(adapter, monkeypatch):
+    await adapter.connect()
+    stub = adapter._transport
+    acked = []
+    stub.ack_buffered_inbound = AsyncMock(
+        side_effect=lambda value: acked.append(value)
+    )
+
+    async def fake_handle(event):
+        handoff = getattr(event, "_relay_durable_handoff", None)
+        assert handoff is not None
+        handoff.set()
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await stub.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-buffered",
+                "type": 2,
+                "channel_id": "chan-9",
+                "guild_id": "guild-7",
+                "data": {"name": "summarize"},
+                "member": {"user": {"id": "user-3"}},
+            }
+        ),
+        buffer_id="buf-pass-1",
+    )
+    await asyncio.sleep(0)
+
+    assert acked == ["buf-pass-1"]
+
+
+@pytest.mark.asyncio
+async def test_passthrough_exact_bot_identity_survives_roundtrip_and_egress(
+    monkeypatch,
+):
+    stub = StubConnector(_desc())
+    stub._identities = [("discord", "appA"), ("discord", "appB")]
+    adapter = RelayAdapter(PlatformConfig(), _desc(), transport=stub)
+    await adapter.connect()
+    seen = []
+
+    async def fake_handle(event):
+        seen.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await stub.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-b",
+                "type": 2,
+                "channel_id": "chan-shared",
+                "guild_id": "guild-b",
+                "data": {"name": "summarize"},
+                "member": {"user": {"id": "user-b"}},
+            },
+            bot_id="appB",
+        )
+    )
+
+    assert len(seen) == 1
+    source = seen[0].source
+    assert source._transport_identity == "discord:appB"
+    restored = type(source).from_dict(source.to_dict())
+    assert restored._transport_identity == "discord:appB"
+
+    result = await adapter.send_for_source(restored, "reply from app B")
+
+    assert result.success is True
+    assert stub.sent_bot_ids[-1] == "appB"
+    assert "_relay_transport_identity" not in stub.sent[-1]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_passthrough_unknown_bot_identity_is_dropped(monkeypatch):
+    stub = StubConnector(_desc())
+    stub._identities = [("discord", "appA")]
+    adapter = RelayAdapter(PlatformConfig(), _desc(), transport=stub)
+    await adapter.connect()
+    seen = []
+    monkeypatch.setattr(adapter, "handle_message", lambda event: seen.append(event))
+
+    await stub.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-unknown",
+                "type": 2,
+                "channel_id": "chan-shared",
+                "guild_id": "guild-b",
+                "data": {"name": "summarize"},
+                "member": {"user": {"id": "user-b"}},
+            },
+            bot_id="appB",
+        )
+    )
+
+    assert seen == []
 
 
 @pytest.mark.asyncio

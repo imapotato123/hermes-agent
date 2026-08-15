@@ -12,7 +12,7 @@ import pytest
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -57,6 +57,12 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+    def fronts_platform(self, platform) -> bool:
+        return (
+            self.platform == Platform.RELAY
+            and getattr(platform, "value", platform) == Platform.DISCORD.value
+        )
 
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -398,6 +404,22 @@ def _make_runner(adapter):
         group_sessions_per_user=False,
         stt_enabled=False,
     )
+    original_run_agent = runner._run_agent
+
+    async def _run_agent_with_owner(*args, **kwargs):
+        source = kwargs.get("source")
+        if (
+            source is not None
+            and getattr(source, "delivered_via_upstream_relay", False) is not True
+        ):
+            stamp_source_transport_owner(
+                source,
+                profile=None,
+                adapter=adapter,
+            )
+        return await original_run_agent(*args, **kwargs)
+
+    runner._run_agent = _run_agent_with_owner
     return runner
 
 

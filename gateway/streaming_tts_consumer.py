@@ -42,7 +42,7 @@ import asyncio
 import logging
 import queue
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
 
@@ -64,10 +64,12 @@ class StreamingTTSConsumer:
         *,
         metadata: Optional[Dict[str, Any]] = None,
         audio_format: Optional[AudioFormat] = None,
+        adapter_resolver: Optional[Callable[[], Any]] = None,
     ) -> None:
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
 
         self._adapter = adapter
+        self._adapter_resolver = adapter_resolver
         self._chat_id = chat_id
         self._tts_config = tts_config
         self._loop = loop
@@ -104,6 +106,23 @@ class StreamingTTSConsumer:
 
         # Pre-allocate the strip-markdown helper lazily to avoid import cycles.
         self._strip_markdown = None
+
+    def _current_adapter(self) -> Any:
+        """Resolve the stamped owner; never fall back if the resolver says missing."""
+        if self._adapter_resolver is None:
+            return self._adapter
+        try:
+            return self._adapter_resolver()
+        except Exception:
+            logger.debug("streaming TTS adapter resolution failed", exc_info=True)
+            return None
+
+    def _adapter_for_handle(self) -> Any:
+        """A stream handle remains owned by its creating adapter generation."""
+        adapter = self._current_adapter()
+        if adapter is not self._adapter:
+            return None
+        return adapter
 
     # ------------------------------------------------------------------
     # Public properties
@@ -220,12 +239,16 @@ class StreamingTTSConsumer:
         if not self.active:
             return
 
-        if not self._adapter.supports_streaming_tts(self._chat_id, self._audio_format):
-            logger.debug("adapter %s does not support streaming TTS", getattr(self._adapter, "name", "?"))
+        adapter = self._current_adapter()
+        if adapter is None:
+            return
+        self._adapter = adapter
+        if not adapter.supports_streaming_tts(self._chat_id, self._audio_format):
+            logger.debug("adapter %s does not support streaming TTS", getattr(adapter, "name", "?"))
             return
 
         try:
-            self._handle = await self._adapter.begin_streaming_tts(
+            self._handle = await adapter.begin_streaming_tts(
                 self._chat_id,
                 self._audio_format,
                 metadata=self._metadata,
@@ -273,9 +296,15 @@ class StreamingTTSConsumer:
                     return
 
             if not self._aborted and self._handle is not None:
+                if self._adapter_for_handle() is None:
+                    self._partial = bool(self._handle.audible)
+                    self._completed = False
+                    self._suppress_whole_file = bool(self._handle.audible)
+                    self._handle.aborted = True
+                    return
                 _finish_failed = False
                 try:
-                    await self._adapter.finish_streaming_tts(self._handle, interrupted=self._aborted)
+                    await adapter.finish_streaming_tts(self._handle, interrupted=self._aborted)
                 except Exception as exc:
                     logger.debug("finish_streaming_tts error: %s", exc)
                     _finish_failed = True
@@ -331,8 +360,14 @@ class StreamingTTSConsumer:
                 return
             if not chunk:
                 continue
+            adapter = self._adapter_for_handle()
+            if adapter is None:
+                self._partial = bool(self._handle.audible)
+                self._suppress_whole_file = bool(self._handle.audible)
+                self._handle.aborted = True
+                raise RuntimeError("streaming TTS transport owner replaced")
             was_audible = self._handle.audible
-            await self._adapter.write_streaming_tts(self._handle, chunk)
+            await adapter.write_streaming_tts(self._handle, chunk)
             if not was_audible:
                 self._handle.audible = True
                 self._suppress_whole_file = True
@@ -369,8 +404,12 @@ class StreamingTTSConsumer:
         """Abort the adapter stream, swallowing errors (idempotent)."""
         if self._handle is None:
             return
+        adapter = self._adapter_for_handle()
+        if adapter is None:
+            self._handle.aborted = True
+            return
         try:
-            await self._adapter.abort_streaming_tts(self._handle, error=reason)
+            await adapter.abort_streaming_tts(self._handle, error=reason)
         except Exception:
             pass
         finally:
@@ -401,14 +440,29 @@ class StreamingTTSConsumer:
                     break
         else:
             logger.debug("streaming TTS _ABORT sentinel could not be enqueued")
+        try:
+            self._loop.call_soon_threadsafe(
+                self._cancel_drain_task,
+                reason,
+            )
+        except Exception:
+            pass
+
+    def _cancel_drain_task(self, reason: str) -> None:
+        """Abort the adapter handle and terminate a blocked provider drain."""
         if self._handle is not None and not self._handle.aborted:
-            try:
-                self._loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self._safe_abort(reason),
-                )
-            except Exception:
-                pass
+            asyncio.create_task(self._safe_abort(reason))
+        task = self._task
+        if (
+            task is not None
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
+            # Provider iteration runs through to_thread(). Cancelling the
+            # asyncio wrapper cannot stop a vendor thread already inside
+            # next(), but it releases this per-turn task and prevents late
+            # chunks from touching the retired handle.
+            task.cancel()
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
