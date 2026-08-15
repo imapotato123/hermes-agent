@@ -5689,6 +5689,7 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
                     }
 
                 if retry_count >= max_retries:

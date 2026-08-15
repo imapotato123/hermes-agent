@@ -70,6 +70,7 @@ class TurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
+    error_code: Optional[str] = None  # Structured provider/Responses error code
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -741,6 +742,13 @@ class CodexAppServerSession:
                         (note.get("params") or {}).get("turn") or {}
                     ).get("error")
                     if err_obj:
+                        raw_error_code = (
+                            err_obj.get("code")
+                            if isinstance(err_obj, dict)
+                            else getattr(err_obj, "code", None)
+                        )
+                        if raw_error_code:
+                            result.error_code = str(raw_error_code).strip() or None
                         err_msg = _format_responses_error(err_obj, str(turn_status))
                         # If the turn failed for an auth/refresh reason,
                         # rewrite the error into a re-auth hint AND mark
