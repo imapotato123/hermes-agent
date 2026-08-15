@@ -222,6 +222,95 @@ def test_codex_protocol_connection_error_preserves_excluded_http_status():
     )
 
     assert result["failed"] is True
+    assert result["failure_reason"] == "auth"
+
+
+def test_codex_protocol_401_overrides_timeout_prose():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "request timed out while authenticating"
+    turn.final_text = ""
+    turn.codex_error_info = {
+        "httpConnectionFailed": {"httpStatusCode": 401},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "auth"
+
+
+def test_codex_protocol_429_overrides_overload_prose():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "provider is temporarily overloaded"
+    turn.final_text = ""
+    turn.codex_error_info = {
+        "responseStreamConnectionFailed": {"httpStatusCode": 429},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "rate_limit"
+
+
+def test_codex_protocol_402_overrides_server_error_prose():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "provider returned an internal server error"
+    turn.final_text = ""
+    turn.codex_error_info = {
+        "httpConnectionFailed": {"httpStatusCode": 402},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "billing"
+
+
+def test_codex_protocol_nontransient_status_survives_retired_transport_prose():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.error = "codex app-server subprocess exited unexpectedly"
+    turn.final_text = ""
+    turn.should_retire = True
+    turn.codex_error_info = {
+        "responseStreamConnectionFailed": {"httpStatusCode": 400},
+    }
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["failed"] is True
     assert result["failure_reason"] == "unknown"
 
 
