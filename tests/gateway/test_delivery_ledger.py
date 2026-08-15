@@ -128,7 +128,7 @@ class TestStateMachine:
             owner = migrated.execute(
                 "SELECT transport_platform, transport_profile, "
                 "transport_profile_stamped, transport_identity, route_scope_id, "
-                "route_user_id, route_chat_type "
+                "route_user_id, route_chat_type, recovery_claim "
                 "FROM delivery_obligations WHERE obligation_id='ob-1'"
             ).fetchone()
         assert {
@@ -139,8 +139,9 @@ class TestStateMachine:
             "route_scope_id",
             "route_user_id",
             "route_chat_type",
+            "recovery_claim",
         } <= columns
-        assert owner == (None, None, 0, None, None, None, None)
+        assert owner == (None, None, 0, None, None, None, None, None)
 
 
 class TestObligationId:
@@ -277,6 +278,37 @@ class TestSweep:
                 ("ob-1",),
             ).fetchone()
         assert (owner_pid, owner_started_at, attempts) == (999999999, 2, 0)
+
+    def test_stale_same_process_generation_cannot_release_or_settle_new_claim(self):
+        _record()
+        _orphan("ob-1")
+
+        first = dl.sweep_recoverable()[0]
+        assert first["attempts"] == 1
+        first_claim = first["recovery_claim"]
+        assert dl.mark_attempting("ob-1", recovery_claim=first_claim) is True
+        assert dl.release_claim(
+            "ob-1", consume_attempt=True, recovery_claim=first_claim
+        ) is True
+
+        second = dl.sweep_recoverable()[0]
+        assert second["attempts"] == 2
+        second_claim = second["recovery_claim"]
+        assert second_claim != first_claim
+
+        assert dl.release_claim(
+            "ob-1", consume_attempt=True, recovery_claim=first_claim
+        ) is False
+        assert dl.mark_delivered("ob-1", recovery_claim=first_claim) is False
+
+        with dl._connect() as conn:
+            state, attempts, owner_pid = conn.execute(
+                "SELECT state, attempts, owner_pid FROM delivery_obligations "
+                "WHERE obligation_id='ob-1'"
+            ).fetchone()
+        assert state == "attempting"
+        assert attempts == 2
+        assert owner_pid == dl._owner_stamp()[0]
 
 
 class TestPrune:
