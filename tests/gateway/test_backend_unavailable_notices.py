@@ -162,15 +162,17 @@ def _make_runner(adapter: CaptureSlackAdapter, results: list[dict]) -> gateway_r
 
 
 def _make_event(message_id: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+    )
+    stamp_source_transport_owner(source, profile="default")
     return MessageEvent(
         text="hello",
-        source=SessionSource(
-            platform=Platform.SLACK,
-            chat_id="C123",
-            chat_type="channel",
-            thread_id="171717",
-            user_id="U123",
-        ),
+        source=source,
         message_id=message_id,
     )
 
@@ -814,6 +816,57 @@ async def test_routed_runtime_reconnect_uses_secondary_transport_replacement(
         time.monotonic(),
         source=source,
     )
+
+
+@pytest.mark.asyncio
+async def test_restored_routed_source_withholds_final_from_runtime_adapter(
+    monkeypatch,
+    tmp_path,
+):
+    """Serialization loss cannot redirect an alpha-owned turn through beta."""
+    stale_owner = CaptureSlackAdapter()
+    runner = _wire_runner(
+        monkeypatch,
+        tmp_path,
+        stale_owner,
+        [_successful_result("private alpha reply")],
+    )
+    runner._profile_name_for_source = lambda source: "beta"
+    runner._share_backend_notice_state(stale_owner, profile_name="alpha")
+
+    live_source = stale_owner.build_source(
+        chat_id="C123",
+        chat_type="channel",
+        thread_id="171717",
+        user_id="U123",
+        message_id="m-restored-routed",
+    )
+    assert live_source.profile == "beta"
+    restored_source = SessionSource.from_dict(live_source.to_dict())
+
+    active_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(active_adapter, profile_name="main")
+    runtime_adapter = CaptureSlackAdapter()
+    runner._share_backend_notice_state(runtime_adapter, profile_name="beta")
+    runner._active_profile_name = lambda: "main"
+    runner.adapters = {Platform.SLACK: active_adapter}
+    runner._profile_adapters = {
+        "beta": {Platform.SLACK: runtime_adapter},
+    }
+
+    assert runner._adapter_for_source(restored_source) is None
+    await stale_owner._process_message_background(
+        MessageEvent(
+            text="hello",
+            source=restored_source,
+            message_id="m-restored-routed",
+        ),
+        build_session_key(restored_source),
+    )
+
+    assert stale_owner.sent == []
+    assert active_adapter.sent == []
+    assert runtime_adapter.sent == []
 
 
 def test_missing_secondary_transport_owner_keeps_secondary_policy_scope():

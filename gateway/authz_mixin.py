@@ -159,12 +159,12 @@ class GatewayAuthorizationMixin:
                 getattr(source, "platform", None),
                 getattr(source, "_transport_profile", None),
             )
-        # ``getattr`` guards test fixtures that build a bare source via
-        # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
-        return self._authorization_adapter(
-            getattr(source, "platform", None),
-            getattr(source, "profile", None),
-        )
+        # ``source.profile`` is only the routed runtime/session namespace. An
+        # unstamped restored or hand-built source has no authoritative physical
+        # credential owner, so it must not borrow that runtime's same-platform
+        # adapter. Trusted synthetic ingress is stamped by the selected live
+        # adapter before it reaches this resolver.
+        return None
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -213,7 +213,10 @@ class GatewayAuthorizationMixin:
             ).get(platform):
                 return None
             return transport_profile
-        return getattr(source, "profile", None)
+        # Runtime routing is not physical credential ownership. Returning the
+        # logical profile here would let restored/hand-built sources inherit its
+        # policy, allowlist, or pairing store.
+        return None
 
     def _adapter_authorization_is_upstream(
         self,
@@ -404,11 +407,9 @@ class GatewayAuthorizationMixin:
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
         has_transport_owner = source_has_transport_owner(source)
-        profile = (
-            getattr(source, "_transport_profile", None)
-            if has_transport_owner
-            else getattr(source, "profile", None)
-        )
+        if not has_transport_owner:
+            return None
+        profile = getattr(source, "_transport_profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
         if has_transport_owner and profile:
@@ -443,8 +444,6 @@ class GatewayAuthorizationMixin:
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
-        adapter_profile = self._adapter_profile_for_source(source)
-
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
         # gateway's WS with a per-instance secret and resolves owner-only author
@@ -472,7 +471,20 @@ class GatewayAuthorizationMixin:
         # SessionSource, and an explicit identity check refuses to authorize a
         # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
         # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
+        if source.delivered_via_upstream_relay is True:
+            return True
+
+        # Every remaining network/platform authorization path depends on the
+        # physical adapter that received the message. A restored or hand-built
+        # source whose runtime-only owner stamp is absent cannot safely inherit
+        # the routed runtime's credentials, policy, pairing store, or upstream
+        # trust declaration.
+        if not source_has_transport_owner(source):
+            return False
+
+        adapter_profile = self._adapter_profile_for_source(source)
+
+        if self._adapter_authorization_is_upstream(
             source.platform,
             profile=adapter_profile,
         ):

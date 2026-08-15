@@ -17,6 +17,7 @@ from gateway.platforms.base import (
     PlatformConfig,
     Platform,
 )
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +191,12 @@ class TestBusyInputModeQueueFifo:
         return runner, adapter
 
     def _text_event(self, text: str) -> MessageEvent:
-        # profile=None: a MagicMock auto-attribute reads as a truthy stamped
-        # profile and trips fail-closed adapter resolution (AGENTS.md #17).
-        source = MagicMock(chat_id="c1", platform=Platform.TELEGRAM, profile=None)
+        source = SessionSource(
+            chat_id="c1",
+            chat_type="dm",
+            platform=Platform.TELEGRAM,
+        )
+        stamp_source_transport_owner(source, profile=None)
         return MessageEvent(
             text=text,
             message_type=MessageType.TEXT,

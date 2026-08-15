@@ -19,7 +19,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -131,6 +131,7 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     source = SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="dm")
+    stamp_source_transport_owner(source, profile=None)
 
     result = await runner._run_agent(
         message="hello",
