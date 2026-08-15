@@ -209,6 +209,26 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_failed_turn_preserves_structured_codex_error_info(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": "opaque provider prose",
+                    "codexErrorInfo": "internalServerError",
+                },
+            },
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is not None
+        assert result.codex_error_info == "internalServerError"
+
 
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):

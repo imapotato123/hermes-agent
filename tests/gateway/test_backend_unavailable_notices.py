@@ -476,8 +476,42 @@ async def test_shared_runner_state_does_not_cross_suppress_profiles():
     assert [message["content"] for message in first.sent] == [_NOTICE]
     assert [message["content"] for message in second.sent] == [_NOTICE]
     assert set(state.posted) == {
-        "agent:alpha:slack:channel:C123:171717",
-        "agent:beta:slack:channel:C123:171717",
+        "profile:5:alpha:agent:main:slack:channel:C123:171717",
+        "profile:4:beta:agent:main:slack:channel:C123:171717",
+    }
+
+
+@pytest.mark.asyncio
+async def test_default_profile_does_not_collide_with_profile_named_main():
+    state = BackendNoticeState()
+    default_adapter = CaptureSlackAdapter()
+    main_profile_adapter = CaptureSlackAdapter()
+    default_adapter.set_backend_notice_state(state, profile_name="default")
+    main_profile_adapter.set_backend_notice_state(state, profile_name="main")
+    default_adapter.set_message_handler(
+        AsyncMock(return_value=BackendUnavailableReply(_NOTICE))
+    )
+    main_profile_adapter.set_message_handler(
+        AsyncMock(return_value=BackendUnavailableReply(_NOTICE))
+    )
+
+    async def keep_typing(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    default_adapter._keep_typing = keep_typing
+    main_profile_adapter._keep_typing = keep_typing
+    default_event = _make_event("m-default")
+    main_event = _make_event("m-main")
+    raw_session_key = build_session_key(default_event.source)
+
+    await default_adapter._process_message_background(default_event, raw_session_key)
+    await main_profile_adapter._process_message_background(main_event, raw_session_key)
+
+    assert [message["content"] for message in default_adapter.sent] == [_NOTICE]
+    assert [message["content"] for message in main_profile_adapter.sent] == [_NOTICE]
+    assert set(state.posted) == {
+        "profile:7:default:agent:main:slack:channel:C123:171717",
+        "profile:4:main:agent:main:slack:channel:C123:171717",
     }
 
 
@@ -520,7 +554,12 @@ async def test_platform_send_connection_error_is_not_backend_outage(monkeypatch,
 
     contents = [message["content"] for message in adapter.sent]
     assert _NOTICE not in contents
-    assert any("ConnectionError" in content for content in contents)
+    assert contents == [
+        "Sorry, I couldn't deliver that response.\n"
+        "Try again or use /reset to start a fresh session."
+    ]
+    assert "ConnectionError" not in contents[0]
+    assert "Slack socket disconnected" not in contents[0]
 
 
 @pytest.mark.parametrize(
@@ -561,7 +600,9 @@ def test_notice_tracker_prunes_expired_sessions():
 
     adapter._record_llm_error_notice("live", "backend_unavailable", now)
 
-    assert set(adapter._llm_error_last_posted) == {"live"}
+    assert set(adapter._llm_error_last_posted) == {
+        "profile:7:default:live"
+    }
 
 
 def test_notice_tracker_is_bounded():
@@ -577,5 +618,8 @@ def test_notice_tracker_is_bounded():
         )
 
     assert len(adapter._llm_error_last_posted) <= _LLM_ERROR_TRACKER_MAX_SESSIONS
-    assert f"session-{overflow - 1}" in adapter._llm_error_last_posted
-    assert "session-0" not in adapter._llm_error_last_posted
+    assert (
+        f"profile:7:default:session-{overflow - 1}"
+        in adapter._llm_error_last_posted
+    )
+    assert "profile:7:default:session-0" not in adapter._llm_error_last_posted
