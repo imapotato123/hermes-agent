@@ -28,7 +28,7 @@ import pytest
 
 from agent import secret_scope as ss
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 @pytest.fixture(autouse=True)
@@ -75,12 +75,15 @@ def _make_qq_runner():
 
 
 def _qq_dm_source(profile="coder"):
-    return SessionSource(
-        platform=Platform.QQBOT,
-        user_id="user-1",
-        chat_id="dm-chat",
-        user_name="user-1",
-        chat_type="dm",
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=Platform.QQBOT,
+            user_id="user-1",
+            chat_id="dm-chat",
+            user_name="user-1",
+            chat_type="dm",
+            profile=profile,
+        ),
         profile=profile,
     )
 

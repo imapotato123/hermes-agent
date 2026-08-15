@@ -89,6 +89,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from gateway.session import stamp_source_transport_owner
+
 
 def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     src = MagicMock()
@@ -101,6 +103,7 @@ def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     # auto-attribute would read as a truthy "stamped profile" and trip the
     # fail-closed path in _adapter_for_source (see AGENTS.md pitfall #17).
     src.profile = None
+    stamp_source_transport_owner(src, profile=None)
     return src
 
 
