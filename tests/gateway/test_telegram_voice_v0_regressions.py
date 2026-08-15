@@ -17,11 +17,13 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 def _source():
-    return SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+    stamp_source_transport_owner(source, profile=None)
+    return source
 
 
 def _runner(adapter=None):

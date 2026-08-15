@@ -30,7 +30,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,22 @@ class RelayAdapter(BasePlatformAdapter):
         await self._localize_inbound_media(event)
         await self.handle_message(event)
 
+<<<<<<< HEAD
+=======
+    def _stamp_transport_owner(self, event: Any) -> None:
+        """Record relay as the physical owner without persisting auth trust."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return
+        # The process-level relay socket is deliberately profile-independent.
+        stamp_source_transport_owner(
+            source,
+            adapter=self,
+            profile=None,
+            platform=Platform.RELAY,
+        )
+
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
     def _relay_slack_extra(self) -> Dict[str, Any]:
         """The Slack-behavior subset of the RELAY platform config.
 

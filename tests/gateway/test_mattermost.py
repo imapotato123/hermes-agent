@@ -242,6 +242,215 @@ class TestMattermostSend:
         assert "Mattermost thread delivery failed" in flat_payload["message"]
         assert "Final answer body" in flat_payload["message"]
 
+    @pytest.mark.asyncio
+    async def test_image_batch_replacement_preserves_uploaded_unposted_prefix(
+        self, tmp_path
+    ):
+        """A reconnect between uploads transfers the post's prepared file IDs."""
+        stale = _make_adapter()
+        replacement = _make_adapter()
+        first = tmp_path / "first.png"
+        second = tmp_path / "second.png"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        images = [
+            (first.as_uri(), "first caption"),
+            (second.as_uri(), "second caption"),
+        ]
+
+        owner = {"adapter": stale}
+
+        def current_owner(source):
+            return owner["adapter"]
+
+        stale._final_delivery_adapter = current_owner
+        replacement._final_delivery_adapter = current_owner
+        stale._thread_root_for_send = AsyncMock(return_value=None)
+        replacement._thread_root_for_send = AsyncMock(return_value=None)
+        stale._post_preserving_thread = AsyncMock(return_value={"id": "stale-post"})
+        replacement._post_preserving_thread = AsyncMock(
+            return_value={"id": "replacement-post"}
+        )
+
+        async def upload_on_stale(*_args, **_kwargs):
+            owner["adapter"] = replacement
+            return "uploaded-by-stale"
+
+        stale._upload_file = AsyncMock(side_effect=upload_on_stale)
+        replacement._upload_file = AsyncMock(return_value="uploaded-by-replacement")
+
+        await stale.send_multiple_images(
+            "channel-1",
+            images,
+            metadata={"thread_id": "root-1"},
+            source=MagicMock(),
+        )
+
+        stale._post_preserving_thread.assert_not_awaited()
+        replacement._post_preserving_thread.assert_awaited_once()
+        await_args = replacement._post_preserving_thread.await_args
+        assert await_args is not None
+        payload = await_args.args[1]
+        assert payload["file_ids"] == [
+            "uploaded-by-stale",
+            "uploaded-by-replacement",
+        ]
+        assert payload["message"] == "first caption\nsecond caption"
+
+    @pytest.mark.asyncio
+    async def test_image_batch_replacement_before_upload_keeps_public_contract(
+        self, tmp_path
+    ):
+        """No prepared state means a duck-typed replacement remains valid."""
+        stale = _make_adapter()
+        image = tmp_path / "image.png"
+        image.write_bytes(b"image")
+        images = [(image.as_uri(), "caption")]
+
+        class Replacement:
+            def __init__(self):
+                self.calls = []
+
+            async def send_multiple_images(
+                self,
+                chat_id,
+                images,
+                metadata=None,
+                human_delay=0.0,
+                *,
+                source=None,
+            ):
+                self.calls.append(
+                    (chat_id, images, metadata, human_delay, source)
+                )
+
+        replacement = Replacement()
+        stale._final_delivery_adapter = lambda source: replacement
+        stale._upload_file = AsyncMock()
+        source = MagicMock()
+
+        await stale.send_multiple_images(
+            "channel-1",
+            images,
+            metadata={"thread_id": "root-1"},
+            source=source,
+        )
+
+        assert replacement.calls == [
+            ("channel-1", images, {"thread_id": "root-1"}, 0.0, source)
+        ]
+        stale._upload_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_image_batch_replacement_retries_upload_that_returned_no_file_id(
+        self, tmp_path
+    ):
+        """A failed retired upload is still unsent and belongs to the replacement."""
+        stale = _make_adapter()
+        replacement = _make_adapter()
+        image = tmp_path / "image.png"
+        image.write_bytes(b"image")
+        images = [(image.as_uri(), "caption")]
+        owner = {"adapter": stale}
+
+        stale._final_delivery_adapter = lambda source: owner["adapter"]
+        replacement._final_delivery_adapter = lambda source: owner["adapter"]
+        stale._thread_root_for_send = AsyncMock(return_value=None)
+        replacement._thread_root_for_send = AsyncMock(return_value=None)
+        stale._post_preserving_thread = AsyncMock(return_value={"id": "stale"})
+        replacement._post_preserving_thread = AsyncMock(
+            return_value={"id": "replacement"}
+        )
+
+        async def failed_retired_upload(*_args, **_kwargs):
+            owner["adapter"] = replacement
+            return None
+
+        stale._upload_file = AsyncMock(side_effect=failed_retired_upload)
+        replacement._upload_file = AsyncMock(return_value="replacement-file")
+
+        await stale.send_multiple_images(
+            "channel-1", images, source=MagicMock()
+        )
+
+        stale._post_preserving_thread.assert_not_awaited()
+        replacement._upload_file.assert_awaited_once()
+        replacement_post = replacement._post_preserving_thread.await_args
+        assert replacement_post is not None
+        payload = replacement_post.args[1]
+        assert payload["file_ids"] == ["replacement-file"]
+        assert payload["message"] == "caption"
+
+    @pytest.mark.asyncio
+    async def test_image_batch_replacement_preserves_uploads_after_failed_post(
+        self, tmp_path
+    ):
+        """A replacement reuses prepared IDs when the retired post fails."""
+        stale = _make_adapter()
+        replacement = _make_adapter()
+        image = tmp_path / "image.png"
+        image.write_bytes(b"image")
+        images = [(image.as_uri(), "caption")]
+        owner = {"adapter": stale}
+
+        stale._final_delivery_adapter = lambda source: owner["adapter"]
+        replacement._final_delivery_adapter = lambda source: owner["adapter"]
+        stale._thread_root_for_send = AsyncMock(return_value=None)
+        replacement._thread_root_for_send = AsyncMock(return_value=None)
+        stale._upload_file = AsyncMock(return_value="prepared-file")
+        replacement._upload_file = AsyncMock()
+
+        async def failed_retired_post(*_args, **_kwargs):
+            owner["adapter"] = replacement
+            return {}
+
+        stale._post_preserving_thread = AsyncMock(side_effect=failed_retired_post)
+        replacement._post_preserving_thread = AsyncMock(
+            return_value={"id": "replacement"}
+        )
+
+        await stale.send_multiple_images(
+            "channel-1", images, source=MagicMock()
+        )
+
+        replacement._upload_file.assert_not_awaited()
+        replacement_post = replacement._post_preserving_thread.await_args
+        assert replacement_post is not None
+        payload = replacement_post.args[1]
+        assert payload["file_ids"] == ["prepared-file"]
+        assert payload["message"] == "caption"
+
+    @pytest.mark.asyncio
+    async def test_image_batch_post_exception_is_not_retried_after_replacement(
+        self, tmp_path
+    ):
+        """An acknowledgement-ambiguous post is never duplicated by handoff."""
+        stale = _make_adapter()
+        replacement = _make_adapter()
+        image = tmp_path / "image.png"
+        image.write_bytes(b"image")
+        owner = {"adapter": stale}
+
+        stale._final_delivery_adapter = lambda source: owner["adapter"]
+        replacement._final_delivery_adapter = lambda source: owner["adapter"]
+        stale._thread_root_for_send = AsyncMock(return_value=None)
+        stale._upload_file = AsyncMock(return_value="prepared-file")
+        replacement.send_multiple_images = AsyncMock()
+
+        async def ambiguous_retired_post(*_args, **_kwargs):
+            owner["adapter"] = replacement
+            raise RuntimeError("response lost")
+
+        stale._post_preserving_thread = AsyncMock(side_effect=ambiguous_retired_post)
+
+        await stale.send_multiple_images(
+            "channel-1",
+            [(image.as_uri(), "caption")],
+            source=MagicMock(),
+        )
+
+        replacement.send_multiple_images.assert_not_awaited()
+
 
     @pytest.mark.asyncio
     async def test_progress_send_with_broken_thread_and_no_recorded_error_stays_quiet(self):

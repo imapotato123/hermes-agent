@@ -17,6 +17,9 @@ from gateway.session import (
     build_session_key,
     canonical_whatsapp_identifier,
     neutralize_untrusted_inline_text,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
 )
 
 # Legacy name preserved for these tests; product renamed the function to
@@ -55,7 +58,192 @@ class TestSessionSourceRoundtrip:
         assert restored.platform == Platform.LOCAL
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
+        assert restored._legacy_transport_owner_unstamped is False
 
+    def test_explicit_legacy_roundtrip_marks_compatibility_source(self):
+        payload = SessionSource(platform=Platform.SLACK, chat_id="C1").to_dict()
+        restored = SessionSource.from_dict(
+            payload,
+            allow_legacy_unstamped=True,
+        )
+        assert restored._legacy_transport_owner_unstamped is True
+
+    def test_direct_source_is_not_implicitly_legacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        assert source._legacy_transport_owner_unstamped is False
+        assert source_is_legacy_unstamped(source) is False
+
+    def test_manual_private_flags_cannot_forge_transport_provenance(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            _transport_profile=None,
+            _transport_platform=Platform.SLACK,
+            _transport_profile_stamped=True,
+            _transport_owner_capability=object(),
+            _legacy_transport_owner_unstamped=True,
+            _legacy_transport_owner_capability=object(),
+        )
+
+        assert source_has_transport_owner(source) is False
+        assert source_is_legacy_unstamped(source) is False
+
+    def test_stamped_roundtrip_is_not_legacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.SLACK,
+        )
+
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert restored._legacy_transport_owner_unstamped is False
+
+    def test_session_entry_load_marks_only_absent_owner_envelope_as_legacy(self):
+        entry = SessionEntry(
+            session_key="agent:main:slack:dm:C1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=SessionSource(platform=Platform.SLACK, chat_id="C1"),
+        )
+        historical_payload = entry.to_dict()
+        historical_payload.pop("transport_owner_stamped")
+        historical_payload.pop("transport_platform")
+        historical_payload.pop("transport_profile")
+        historical_payload.pop("transport_identity")
+
+        restored = SessionEntry.from_dict(historical_payload)
+
+        assert restored.origin is not None
+        assert restored.transport_owner_stamped is False
+        assert restored.origin._legacy_transport_owner_unstamped is True
+
+    def test_session_entry_load_preserves_modern_ownerless_as_nonlegacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        entry = SessionEntry(
+            session_key="agent:main:slack:dm:C1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+        )
+
+        payload = entry.to_dict()
+        restored = SessionEntry.from_dict(payload)
+
+        assert payload["transport_owner_stamped"] is False
+        assert restored.origin is not None
+        assert restored.transport_owner_stamped is False
+        assert restored.origin._legacy_transport_owner_unstamped is False
+
+    def test_transport_owner_is_runtime_only_but_survives_dataclass_replace(self):
+        from dataclasses import replace
+
+<<<<<<< HEAD
+=======
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="routed-runtime",
+        )
+        stamp_source_transport_owner(
+            source,
+            profile="coder",
+            platform=Platform.SLACK,
+        )
+        source._transport_identity = "slack:bot-1"
+
+        copied = replace(source, chat_id="C2")
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(
+            {
+                **payload,
+                "transport_owner_stamped": True,
+                "transport_profile": "forged-owner",
+                "transport_platform": "relay",
+                "transport_identity": "forged-account",
+            }
+        )
+
+        assert source_has_transport_owner(copied) is True
+        assert copied._transport_profile == "coder"
+        assert copied._transport_platform == Platform.SLACK
+        assert copied._transport_identity == "slack:bot-1"
+        assert not {
+            "transport_owner_stamped",
+            "transport_profile",
+            "transport_platform",
+            "transport_identity",
+        }.intersection(payload)
+        assert restored.profile == "routed-runtime"
+        assert restored._transport_profile_stamped is False
+        assert restored._transport_profile is None
+        assert restored._transport_platform is None
+        assert restored._transport_identity is None
+
+    def test_restamp_without_adapter_clears_old_generation_and_identity(self):
+        class RelayOwner:
+            platform = Platform.RELAY
+            _transport_profile = None
+
+            @staticmethod
+            def transport_identity_for_platform(_platform):
+                return "discord:old-bot"
+
+        source = SessionSource(platform=Platform.DISCORD, chat_id="C1")
+        old_owner = RelayOwner()
+        stamp_source_transport_owner(source, adapter=old_owner)
+
+        assert source._transport_adapter_ref is not None
+        assert source._transport_adapter_ref() is old_owner
+        assert source._transport_identity == "discord:old-bot"
+
+        stamp_source_transport_owner(
+            source,
+            profile="new-profile",
+            platform=Platform.DISCORD,
+        )
+
+        assert source_has_transport_owner(source) is True
+        assert source._transport_adapter_ref is None
+        assert source._transport_identity is None
+        assert source._transport_profile == "new-profile"
+        assert source._transport_platform == Platform.DISCORD
+
+    def test_legacy_source_remains_unstamped(self):
+        restored = SessionSource.from_dict(
+            {"platform": "slack", "chat_id": "C1", "profile": "coder"}
+        )
+
+        assert restored._transport_profile_stamped is False
+        assert restored._transport_profile is None
+        assert restored._transport_platform is None
+
+    def test_relay_upstream_trust_is_not_serialized(self):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="C1",
+            delivered_via_upstream_relay=True,
+        )
+        stamp_source_transport_owner(
+            source,
+            profile=None,
+            platform=Platform.RELAY,
+        )
+        source._transport_identity = "discord:app-1"
+
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(payload)
+
+        assert restored._transport_profile_stamped is False
+        assert restored._transport_platform is None
+        assert restored._transport_profile is None
+        assert restored._transport_identity is None
+        assert restored.delivered_via_upstream_relay is False
+
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
@@ -74,6 +262,50 @@ class TestSessionSourceDescription:
         assert "bob" in source.description
 
 
+<<<<<<< HEAD
+=======
+def test_session_entry_roundtrip_preserves_relay_delivery_owner():
+    now = datetime.now()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        chat_type="channel",
+        profile="coder",
+        delivered_via_upstream_relay=True,
+    )
+    entry = SessionEntry(
+        session_key="profile:coder:discord:channel:C1",
+        session_id="session-1",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        transport_owner_stamped=True,
+        transport_platform=Platform.RELAY.value,
+        transport_profile=None,
+        transport_identity="discord:app-1",
+    )
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+
+    assert restored.origin is not None
+    assert restored.origin.platform == Platform.DISCORD
+    assert restored.origin.profile == "coder"
+    assert restored.origin.scope_id == "guild-1"
+    assert restored.origin.user_id == "user-1"
+    assert restored.origin._transport_profile_stamped is False
+    assert restored.origin._transport_platform is None
+    assert restored.origin._transport_profile is None
+    assert restored.origin._transport_identity is None
+    assert restored.origin.delivered_via_upstream_relay is False
+    assert restored.transport_owner_stamped is True
+    assert restored.transport_platform == Platform.RELAY.value
+    assert restored.transport_profile is None
+    assert restored.transport_identity == "discord:app-1"
+
+
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 class TestLocalCliFactory:
     def test_local_cli_defaults(self):
         source = SessionSource(

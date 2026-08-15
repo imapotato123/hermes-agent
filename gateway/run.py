@@ -2441,6 +2441,9 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -10773,7 +10776,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
+<<<<<<< HEAD
             adapter = self.adapters.get(platform)
+=======
+            if row.get("transport_profile_stamped"):
+                _recovery_source = SessionSource(
+                    platform=platform,
+                    chat_id=str(row["chat_id"]),
+                    thread_id=row.get("thread_id"),
+                    scope_id=row.get("route_scope_id"),
+                    user_id=row.get("route_user_id"),
+                    chat_type=row.get("route_chat_type") or "dm",
+                )
+                try:
+                    _transport_platform = Platform(
+                        row.get("transport_platform") or row["platform"]
+                    )
+                except (TypeError, ValueError):
+                    _transport_platform = None
+                stamp_source_transport_owner(
+                    _recovery_source,
+                    profile=row.get("transport_profile"),
+                    platform=_transport_platform,
+                )
+                if row.get("transport_identity") is not None:
+                    setattr(
+                        _recovery_source,
+                        "_transport_identity",
+                        str(row.get("transport_identity")),
+                    )
+                adapter = self._adapter_for_source(_recovery_source)
+            else:
+                adapter = self.adapters.get(platform)
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
@@ -10901,7 +10936,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # Rebuild public origin metadata without importing authority from
+            # its generic dictionary. Physical ownership comes only from the
+            # private SessionEntry envelope written by mark_turn_active().
+            origin = entry.origin
+            if origin is None:
+                continue
+            runtime_owner_retained = source_has_transport_owner(origin)
+            if runtime_owner_retained:
+                # Same-process startup/reconnect scheduling can still hold an
+                # exact live source. dataclasses.replace preserves its declared
+                # runtime-only provenance while avoiding mutation of the
+                # canonical routing entry. A source loaded from persistence can
+                # never enter this branch because generic deserialization drops
+                # the stamp sentinel.
+                source = dataclasses.replace(origin)
+            else:
+                source = SessionSource.from_dict(
+                    origin.to_dict(),
+                    allow_legacy_unstamped=source_is_legacy_unstamped(origin),
+                )
+            transport_platform: Optional[Platform] = None
+            if entry.transport_owner_stamped:
+                try:
+                    transport_platform = Platform(entry.transport_platform)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Skipping auto-resume for %s: invalid durable transport owner",
+                        entry.session_key,
+                    )
+                    continue
+                stamp_source_transport_owner(
+                    source,
+                    profile=entry.transport_profile,
+                    platform=transport_platform,
+                )
+                if entry.transport_identity is not None:
+                    source._transport_identity = entry.transport_identity
+            elif runtime_owner_retained:
+                transport_platform = getattr(
+                    source,
+                    "_transport_platform",
+                    None,
+                )
+            elif not source_is_legacy_unstamped(source):
+                logger.debug(
+                    "Skipping auto-resume for %s: modern source has no transport owner",
+                    entry.session_key,
+                )
+                continue
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -10910,6 +10993,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     getattr(source.platform, "value", source.platform),
                 )
                 continue
+            if entry.transport_owner_stamped:
+                # The durable owner (including relay account identity) resolved
+                # to this current adapter generation. Reattach only now; generic
+                # source deserialization never mints either provenance or trust.
+                stamp_source_transport_owner(
+                    source,
+                    adapter=adapter,
+                    profile=entry.transport_profile,
+                    platform=transport_platform,
+                )
+                if entry.transport_identity is not None:
+                    source._transport_identity = entry.transport_identity
+                if transport_platform == Platform.RELAY:
+                    source.delivered_via_upstream_relay = True
 
             # Validate the session owner against the current allowlist
             # before auto-resuming. A session created before
@@ -12270,6 +12367,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
+        )
+        stamp_source_transport_owner(
+            dest_source,
+            adapter=adapter,
+            platform=getattr(adapter, "platform", platform),
         )
 
         # Compute the gateway's session_key for that destination using the
@@ -14379,6 +14481,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type=chat_type or "group",
                 user_id=user_id,
                 profile=profile_name,
+            )
+            adapter = self._authorization_adapter(platform, profile_name)
+            if adapter is None:
+                return False
+            stamp_source_transport_owner(
+                source,
+                adapter=adapter,
+                platform=getattr(adapter, "platform", platform),
             )
             return self._is_user_authorized(source)
         return check
@@ -16949,7 +17059,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                source=getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -19918,6 +20031,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+        stamp_source_transport_owner(
+            source,
+            adapter=adapter,
+            platform=Platform.DISCORD,
+        )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20046,6 +20164,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+<<<<<<< HEAD
+=======
+    def _live_delivery_operation(
+        self,
+        source: SessionSource,
+        fallback_adapter: Any,
+        operation: str,
+    ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+        """Resolve one current transport operation, preserving legacy sources.
+
+        Explicit owner stamps are authoritative and fail closed. Hand-built or
+        restored legacy sources without a stamp retain the historical captured
+        adapter fallback. Operations are duck-typed for plugin compatibility.
+        """
+        source_attrs = getattr(source, "__dict__", {})
+        stamped = source_has_transport_owner(source)
+        if not stamped and source_is_legacy_unstamped(source):
+            adapter = fallback_adapter
+        elif not stamped:
+            adapter = None
+        else:
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                adapter = None
+        if adapter is None:
+            return None, None
+        expected_platform = source_attrs.get(
+            "_transport_platform", getattr(source, "platform", None)
+        )
+        if stamped and getattr(adapter, "platform", None) != expected_platform:
+            return None, None
+        method = getattr(adapter, operation, None)
+        if not callable(method):
+            return adapter, None
+        return adapter, cast(Callable[..., Awaitable[Any]], method)
+
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -20219,7 +20375,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
+<<<<<<< HEAD
                     await adapter.send_multiple_images(
+=======
+                    live_adapter, image_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        "send_multiple_images",
+                    )
+                    if not callable(image_send):
+                        logger.warning(
+                            "Withholding post-stream images: no live transport owner"
+                        )
+                    else:
+                        _image_kwargs = {
+                            "chat_id": event.source.chat_id,
+                            "images": images,
+                            "metadata": _thread_meta,
+                        }
+                        try:
+                            source_attrs = getattr(
+                                event.source, "__dict__", {}
+                            )
+                            if source_has_transport_owner(event.source):
+                                signature = inspect.signature(image_send)
+                                if "source" in signature.parameters or any(
+                                    parameter.kind
+                                    is inspect.Parameter.VAR_KEYWORD
+                                    for parameter in signature.parameters.values()
+                                ):
+                                    _image_kwargs["source"] = event.source
+                        except (TypeError, ValueError):
+                            pass
+                        await image_send(**_image_kwargs)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Post-stream image batch delivery failed: %s",
+                        getattr(live_adapter, "name", getattr(adapter, "name", "gateway")),
+                        e,
+                    )
+
+            for media_path, is_voice in non_image_media:
+                live_adapter = None
+                try:
+                    ext = Path(media_path).suffix.lower()
+                    method_name = "send_document"
+                    path_arg = "file_path"
+                    if should_send_media_as_audio(
+                        event.source.platform, ext, is_voice=is_voice
+                    ):
+                        method_name = "send_voice"
+                        path_arg = "audio_path"
+                    elif ext in _VIDEO_EXTS:
+                        method_name = "send_video"
+                        path_arg = "video_path"
+                    live_adapter, media_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        method_name,
+                    )
+                    if not callable(media_send):
+                        logger.warning(
+                            "Withholding post-stream media: no live %s operation",
+                            method_name,
+                        )
+                        continue
+                    await media_send(
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,

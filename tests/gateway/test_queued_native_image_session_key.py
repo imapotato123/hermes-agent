@@ -8,7 +8,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 _ONE_BY_ONE_PNG = base64.b64decode(
@@ -117,12 +117,14 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         chat_id="-1001",
         chat_type="group",
     )
+    stamp_source_transport_owner(source, profile=None)
     pending_source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
         chat_type="group",
         thread_id="17585",
     )
+    stamp_source_transport_owner(pending_source, profile=None)
 
     adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
         text="describe this",

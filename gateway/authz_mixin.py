@@ -21,7 +21,11 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.session import (
+    SessionSource,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+)
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
@@ -146,6 +150,7 @@ class GatewayAuthorizationMixin:
             # register their own relay adapters, so profile-aware lookup would
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
+<<<<<<< HEAD
             return adapters.get(Platform.RELAY)
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
@@ -153,6 +158,86 @@ class GatewayAuthorizationMixin:
             getattr(source, "platform", None),
             getattr(source, "profile", None),
         )
+=======
+            adapter = adapters.get(Platform.RELAY)
+            source_attrs = getattr(source, "__dict__", {})
+            expected_identity = (
+                source_attrs.get("_transport_identity")
+                if isinstance(source_attrs, dict)
+                else None
+            )
+            if expected_identity is not None:
+                matches_identity = getattr(
+                    adapter, "matches_transport_identity", None
+                )
+                if not callable(matches_identity) or not matches_identity(
+                    str(expected_identity)
+                ):
+                    return None
+            fronts = getattr(adapter, "fronts_platform", None)
+            if callable(fronts) and not fronts(
+                getattr(source, "platform", None)
+            ):
+                return None
+            prime = getattr(adapter, "prime_routing_source", None)
+            if callable(prime):
+                prime(source)
+            return adapter
+        # ``source.profile`` names the runtime selected by profile_routes, not
+        # necessarily the credential that received the message. Resolve the
+        # durable physical platform/profile pair instead; relay sources retain
+        # their underlying logical platform for session identity.
+        source_attrs = getattr(source, "__dict__", {})
+        if source_has_transport_owner(source):
+            transport_platform = source_attrs.get(
+                "_transport_platform", getattr(source, "platform", None)
+            )
+            logical_platform = getattr(source, "platform", None)
+            if (
+                transport_platform != Platform.RELAY
+                and transport_platform != logical_platform
+            ):
+                return None
+            adapter = self._authorization_adapter(
+                transport_platform,
+                source_attrs.get("_transport_profile"),
+            )
+            if transport_platform == Platform.RELAY and adapter is not None:
+                expected_identity = source_attrs.get("_transport_identity")
+                matches_identity = getattr(
+                    adapter, "matches_transport_identity", None
+                )
+                if expected_identity is not None:
+                    if not callable(matches_identity) or not matches_identity(
+                        str(expected_identity)
+                    ):
+                        return None
+                elif getattr(source, "delivered_via_upstream_relay", False) is not True:
+                    # Restored relay owners without an account fingerprint are
+                    # ambiguous and must not degrade to platform-only routing.
+                    return None
+                fronts = getattr(adapter, "fronts_platform", None)
+                if (
+                    getattr(source, "platform", None) != Platform.RELAY
+                    and (not callable(fronts) or not fronts(
+                    getattr(source, "platform", None)
+                    ))
+                ):
+                    return None
+                prime = getattr(adapter, "prime_routing_source", None)
+                if callable(prime):
+                    prime(source)
+            return adapter
+        # Only an explicit deserialization marker proves this is a genuinely
+        # historical unstamped record. Fresh hand-built sources have no
+        # physical-owner authority and fail closed.
+        if source_is_legacy_unstamped(source):
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                getattr(source, "profile", None),
+            )
+        return None
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
@@ -166,7 +251,16 @@ class GatewayAuthorizationMixin:
         """
         adapter_ref = getattr(source, "_transport_adapter_ref", None)
         adapter = adapter_ref() if callable(adapter_ref) else None
+<<<<<<< HEAD
         platform = getattr(source, "platform", None)
+=======
+        source_attrs = getattr(source, "__dict__", {})
+        platform = (
+            source_attrs.get("_transport_platform")
+            if source_has_transport_owner(source)
+            else getattr(source, "platform", None)
+        )
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
         if adapter is None or platform is None:
             return None
         if adapter is (getattr(self, "adapters", None) or {}).get(platform):
@@ -179,6 +273,15 @@ class GatewayAuthorizationMixin:
 
     def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the transport-owning profile for adapter policy lookups."""
+<<<<<<< HEAD
+=======
+        source_attrs = getattr(source, "__dict__", {})
+        platform = (
+            source_attrs.get("_transport_platform")
+            if source_has_transport_owner(source)
+            else getattr(source, "platform", None)
+        )
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
         adapter = self._registered_transport_adapter(source)
         platform = getattr(source, "platform", None)
         if adapter is not None:
@@ -189,7 +292,24 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
+<<<<<<< HEAD
         return getattr(source, "profile", None)
+=======
+        source_attrs = getattr(source, "__dict__", {})
+        if source_has_transport_owner(source):
+            transport_profile = source_attrs.get("_transport_profile")
+            transport_adapter = self._authorization_adapter(
+                platform, transport_profile
+            )
+            if transport_adapter is not None and transport_adapter is (
+                getattr(self, "adapters", None) or {}
+            ).get(platform):
+                return None
+            return transport_profile
+        if source_is_legacy_unstamped(source):
+            return getattr(source, "profile", None)
+        return None
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 
     def _adapter_authorization_is_upstream(
         self,
@@ -378,9 +498,34 @@ class GatewayAuthorizationMixin:
         global default) so existing behavior is preserved.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
+<<<<<<< HEAD
         profile = getattr(source, "profile", None)
         if profile and profile in per_profile:
             return per_profile[profile]
+=======
+        source_attrs = getattr(source, "__dict__", {})
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
+        profile = (
+            source_attrs.get("_transport_profile")
+            if has_transport_owner
+            else getattr(source, "profile", None) if is_legacy else None
+        )
+        if profile and profile in per_profile:
+            return per_profile[profile]
+        if has_transport_owner and profile:
+            active_profile = None
+            active_profile_fn = getattr(self, "_active_profile_name", None)
+            if callable(active_profile_fn):
+                try:
+                    active_profile = active_profile_fn()
+                except Exception:
+                    active_profile = None
+            if profile != active_profile:
+                return None
+        if not has_transport_owner and not is_legacy:
+            return None
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -395,11 +540,18 @@ class GatewayAuthorizationMixin:
         5. Default: deny
         """
         from gateway.run import logger
-        # Home Assistant events are system-generated (state changes), not
-        # user-initiated messages.  The HASS_TOKEN already authenticates the
-        # connection, so HA events are always authorized.
-        # Webhook events are authenticated via HMAC signature validation in
-        # the adapter itself — no user allowlist applies.
+        # Every network/platform authorization path depends on the physical
+        # credential that received the message. Historical unstamped records may
+        # use the narrowly-scoped compatibility path; fresh ownerless sources
+        # fail closed before adapter-level trust or allowlist policy is consulted.
+        has_transport_owner = source_has_transport_owner(source)
+        is_legacy = source_is_legacy_unstamped(source)
+        if not has_transport_owner and not is_legacy:
+            return False
+
+        # Home Assistant and webhook adapters authenticate the transport itself
+        # (bearer token / HMAC), so no per-user allowlist applies after provenance
+        # proves this source actually crossed that adapter boundary.
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 

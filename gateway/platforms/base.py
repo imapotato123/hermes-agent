@@ -577,7 +577,13 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    source_has_transport_owner,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
+)
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
 if TYPE_CHECKING:
@@ -5402,12 +5408,41 @@ class BasePlatformAdapter(ABC):
         """
         runner = getattr(self, "gateway_runner", None)
         resolve = getattr(runner, "_adapter_for_source", None)
-        if not callable(resolve):
+        if source is None:
             return self
+<<<<<<< HEAD
+=======
+        if not callable(resolve):
+            adapter_ref = getattr(source, "_transport_adapter_ref", None)
+            if callable(adapter_ref) and adapter_ref() is self:
+                return self
+            return self if source_is_legacy_unstamped(source) else None
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
         try:
             live_adapter = resolve(source)
         except Exception:
             logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
+<<<<<<< HEAD
+=======
+            return self if source_is_legacy_unstamped(source) else None
+        if live_adapter is None:
+            # An explicitly stamped live source must never fall back to the
+            # disconnected generation when its credential owner is missing.
+            return self if source_is_legacy_unstamped(source) else None
+        if getattr(live_adapter, "platform", None) != self.platform:
+            return self if source_is_legacy_unstamped(source) else None
+        if not callable(getattr(live_adapter, "_send_with_retry", None)):
+            return self if source_is_legacy_unstamped(source) else None
+        # Plugin adapters are intentionally duck-typed; requiring inheritance
+        # here would reject a valid replacement and revive the stale transport.
+        return live_adapter
+
+    def _retry_delivery_adapter(
+        self, source: Optional[SessionSource]
+    ) -> Optional[Any]:
+        """Resolve the current owner immediately before one physical retry."""
+        if source is None:
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
             return self
         if (
             not isinstance(live_adapter, BasePlatformAdapter)
@@ -5939,6 +5974,28 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        source = getattr(event, "source", None)
+        if (
+            source is not None
+            and not source_has_transport_owner(source)
+            and not source_is_legacy_unstamped(source)
+        ):
+            # This live method call is an ingress boundary, but only for the
+            # adapter's own native namespace. Relay-fronted events must arrive
+            # already stamped by RelayAdapter._on_inbound; otherwise a direct
+            # native-adapter call could mint the wrong credential authority.
+            if (
+                getattr(source, "delivered_via_upstream_relay", False) is True
+                or getattr(source, "platform", None) != self.platform
+            ):
+                logger.warning(
+                    "[%s] Dropping ownerless message source outside this "
+                    "adapter's physical namespace",
+                    self.name,
+                )
+                return
+            stamp_source_transport_owner(source, adapter=self)
+
         coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
@@ -6162,6 +6219,17 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # The foreground ingress boundary is the only place that may mint
+        # physical transport provenance. Queue drains and other trusted
+        # same-process continuations already carry the stamp from their source.
+        if not source_has_transport_owner(event.source):
+            logger.warning(
+                "[%s] Dropping ownerless background message for %s",
+                self.name,
+                session_key,
+            )
+            self._release_session_guard(session_key)
+            return
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6462,6 +6530,35 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if await asyncio.to_thread(ledger_enabled):
+<<<<<<< HEAD
+=======
+                                _source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                _transport_profile_stamped = (
+                                    source_has_transport_owner(event.source)
+                                )
+                                _transport_profile = (
+                                    _source_attrs.get("_transport_profile")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
+                                _transport_identity = (
+                                    _source_attrs.get("_transport_identity")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
+                                _transport_platform = (
+                                    _source_attrs.get("_transport_platform")
+                                    if _transport_profile_stamped
+                                    else None
+                                )
+                                _transport_platform_value = getattr(
+                                    _transport_platform,
+                                    "value",
+                                    _transport_platform,
+                                )
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
@@ -6537,8 +6634,38 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+<<<<<<< HEAD
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+=======
+                    else:
+                        try:
+                            _image_kwargs: Dict[str, Any] = {
+                                "chat_id": event.source.chat_id,
+                                "images": images,
+                                "metadata": _final_thread_metadata,
+                                "human_delay": human_delay,
+                            }
+                            try:
+                                source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                if source_has_transport_owner(event.source):
+                                    signature = inspect.signature(image_send)
+                                    if "source" in signature.parameters or any(
+                                        parameter.kind
+                                        is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in signature.parameters.values()
+                                    ):
+                                        _image_kwargs["source"] = event.source
+                            except (TypeError, ValueError):
+                                pass
+                            await cast(
+                                Callable[..., Awaitable[Any]], image_send
+                            )(**_image_kwargs)
+                        except Exception as batch_err:
+                            logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 
 
                 # Send extracted media files — route by file type
@@ -6579,8 +6706,39 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+<<<<<<< HEAD
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+=======
+                    else:
+                        try:
+                            _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                            _image_kwargs = {
+                                "chat_id": event.source.chat_id,
+                                "images": _batch,
+                                "metadata": _final_thread_metadata,
+                                "human_delay": human_delay,
+                            }
+                            try:
+                                source_attrs = getattr(
+                                    event.source, "__dict__", {}
+                                )
+                                if source_has_transport_owner(event.source):
+                                    signature = inspect.signature(image_send)
+                                    if "source" in signature.parameters or any(
+                                        parameter.kind
+                                        is inspect.Parameter.VAR_KEYWORD
+                                        for parameter in signature.parameters.values()
+                                    ):
+                                        _image_kwargs["source"] = event.source
+                            except (TypeError, ValueError):
+                                pass
+                            await cast(
+                                Callable[..., Awaitable[Any]], image_send
+                            )(**_image_kwargs)
+                        except Exception as batch_err:
+                            logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
 
                 if _non_image_media:
                     logger.info(
@@ -7061,10 +7219,20 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
+<<<<<<< HEAD
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+=======
+        # The exact generation stays process-local, while the physical platform
+        # and profile form the durable transport owner. ``source.platform`` is
+        # only the logical chat namespace and may differ for relay ingress.
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. Preserve its owning profile independently so a turn
+        # that outlives a reconnect can resolve the replacement generation.
+        stamp_source_transport_owner(source, adapter=self, platform=self.platform)
+>>>>>>> 5ebdeeada (fix(gateway): fail closed without transport ownership)
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

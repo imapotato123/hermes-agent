@@ -10,7 +10,12 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
@@ -39,6 +44,8 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
         platforms={platform: PlatformConfig(enabled=True, token="***")}
     )
     adapter = MagicMock()
+    adapter.platform = platform
+    adapter._transport_profile = None
     adapter.send = AsyncMock()
     runner.adapters = {platform: adapter}
     runner._voice_mode = {}
@@ -245,7 +252,12 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
         lambda *_args, **_kwargs: 100000,
     )
 
-    result = await runner._handle_message(_make_event("hello", platform=Platform.SLACK))
+    event = _make_event("hello", platform=Platform.SLACK)
+    stamp_source_transport_owner(
+        event.source,
+        adapter=runner.adapters[Platform.SLACK],
+    )
+    result = await runner._handle_message(event)
 
     assert result == "ok"
     runner.adapters[Platform.SLACK].send.assert_awaited_once()
