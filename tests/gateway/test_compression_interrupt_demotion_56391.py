@@ -33,6 +33,7 @@ from gateway.platforms.base import (  # noqa: E402
     MessageType,
     SessionSource,
     build_session_key,
+    stamp_source_transport_owner,
 )
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL  # noqa: E402
 
@@ -44,6 +45,7 @@ def _make_event(text: str = "hello", chat_id: str = "123") -> MessageEvent:
         chat_type="private",
         user_id="user1",
     )
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,

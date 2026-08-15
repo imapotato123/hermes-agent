@@ -38,7 +38,11 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.run import GatewayRunner, _collect_auto_append_media_tags, _collect_history_media_paths
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    stamp_source_transport_owner,
+)
 
 
 class _DummyAdapter(BasePlatformAdapter):
@@ -101,10 +105,11 @@ class _StubStore:
 
 
 def _make_event(platform: Platform = Platform.DISCORD) -> MessageEvent:
+    source = SessionSource(platform=platform, chat_id="111", chat_type="dm")
     return MessageEvent(
         text="send me that file again",
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=platform, chat_id="111", chat_type="dm"),
+        source=source,
         message_id="m1",
     )
 
@@ -144,6 +149,7 @@ async def test_explicit_media_resend_is_delivered_despite_history(tmp_path, monk
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     assert adapter.documents == [str(pdf)], (
@@ -181,6 +187,7 @@ async def test_first_delivery_not_poisoned_by_current_turn_tool_output(tmp_path,
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     assert adapter.documents == [str(docx)], (
@@ -209,6 +216,7 @@ async def test_bare_local_path_history_dedup_survives_and_logs(tmp_path, monkeyp
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     with caplog.at_level(logging.INFO, logger="gateway.platforms.base"):
         await adapter._process_message_background(event, build_session_key(event.source))
 
@@ -241,6 +249,7 @@ async def test_plain_text_response_does_not_load_transcript():
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     assert store.calls == 0
@@ -269,6 +278,7 @@ async def test_explicit_media_response_does_not_load_transcript(tmp_path, monkey
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     await adapter._process_message_background(event, build_session_key(event.source))
 
     assert store.calls == 0
@@ -308,6 +318,7 @@ async def test_bare_path_history_lookup_does_not_block_event_loop(tmp_path, monk
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     delivery = asyncio.create_task(
         adapter._process_message_background(event, build_session_key(event.source))
     )
@@ -350,6 +361,7 @@ async def test_bare_path_history_lookup_timeout_fails_open(tmp_path, monkeypatch
 
     adapter.set_message_handler(handler)
     event = _make_event()
+    stamp_source_transport_owner(event.source, adapter=adapter)
     started = time.monotonic()
     await adapter._process_message_background(event, build_session_key(event.source))
 
@@ -452,16 +464,19 @@ async def test_history_lookup_worker_start_failure_fails_open_and_releases_slot(
 
 
 def _stream_event():
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="group")
+    stamp_source_transport_owner(source, profile=None)
     return MessageEvent(
         text="send it again",
         message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="group"),
+        source=source,
         message_id="171.1",
     )
 
 
 def _stream_adapter():
     return SimpleNamespace(
+        platform=Platform.SLACK,
         name="test",
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
@@ -481,10 +496,12 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
     accidental echo of auto-appended history)."""
     img = _allowed_file(tmp_path, monkeypatch, "flyer.png")
     adapter = _stream_adapter()
-    runner = SimpleNamespace(
-        _thread_metadata_for_source=lambda source, anchor=None: {},
-        _reply_anchor_for_event=lambda event: None,
-    )
+    runner = object.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: {}
+    runner._reply_anchor_for_event = lambda event: None
+    runner.adapters = {Platform.SLACK: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
 
     await GatewayRunner._deliver_media_from_response(
         runner,

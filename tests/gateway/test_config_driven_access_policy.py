@@ -31,7 +31,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionSource, stamp_source_transport_owner
 
 
 # Platforms whose adapters own their access policy at intake.
@@ -83,12 +83,15 @@ def _make_runner(platform: Platform, config: GatewayConfig, *, enforces: bool):
 
 
 def _source(platform: Platform, *, chat_type: str = "dm") -> SessionSource:
-    return SessionSource(
-        platform=platform,
-        user_id="some-user",
-        chat_id="some-chat",
-        user_name="tester",
-        chat_type=chat_type,
+    return stamp_source_transport_owner(
+        SessionSource(
+            platform=platform,
+            user_id="some-user",
+            chat_id="some-chat",
+            user_name="tester",
+            chat_type=chat_type,
+        ),
+        profile=None,
     )
 
 
