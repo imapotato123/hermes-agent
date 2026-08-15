@@ -48,6 +48,9 @@ def _adapter(name: str):
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
         send=AsyncMock(return_value=SendResult(success=True, message_id=f"{name}-text")),
+        send_prepared_text_chunk=AsyncMock(
+            return_value=SendResult(success=True, message_id=f"{name}-text")
+        ),
         send_multiple_images=AsyncMock(return_value=None),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id=f"{name}-voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id=f"{name}-doc")),
@@ -135,6 +138,67 @@ async def test_response_bundle_replays_exact_owner_text_images_and_documents(
     live.send_document.assert_awaited_once_with(
         chat_id="C1", file_path=str(document), caption=None,
         metadata={"thread_id": None}
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_recovery_preserves_original_reply_anchor(isolated_ledger):
+    teams_platform = Platform("teams")
+    payload = json.dumps(
+        {
+            "version": 1,
+            "text": "answer",
+            "text_chunks": [
+                {
+                    "content": "answer",
+                    "recovered_content": "recovered answer",
+                    "reply_to_original": True,
+                }
+            ],
+            "completed_operations": [],
+        },
+        sort_keys=True,
+    )
+    dl.record_obligation(
+        obligation_id="prepared-reply-row",
+        session_key="agent:coder:teams:dm:C1",
+        platform="teams",
+        chat_id="C1",
+        thread_id="thread-1",
+        message_ref="123",
+        content="answer",
+        transport_platform="teams",
+        transport_profile="coder",
+        transport_profile_stamped=True,
+        operation="response_bundle",
+        payload_json=payload,
+    )
+    _orphan("prepared-reply-row")
+    live = SimpleNamespace(
+        name="teams-live",
+        platform=teams_platform,
+        send_prepared_text_chunk=AsyncMock(
+            return_value=SendResult(success=True, message_id="reply-1")
+        ),
+    )
+    runner = _runner()
+    runner._profile_adapters = {"coder": {teams_platform: live}}
+    runner._share_backend_notice_state(live, profile_name="coder")
+    runner._async_session_store = MagicMock(
+        clear_resume_pending=AsyncMock(), _store=None
+    )
+    runner.session_store = None
+
+    assert await runner._redeliver_pending_obligations() == 1
+    live.send_prepared_text_chunk.assert_awaited_once_with(
+        chat_id="C1",
+        content="answer",
+        reply_to="123",
+        metadata={
+            "thread_id": "thread-1",
+            "_hermes_prepared_text_index": 0,
+            "_hermes_prepared_text_count": 1,
+        },
     )
 
 
@@ -1235,7 +1299,7 @@ async def test_ephemeral_delete_capability_comes_from_live_sending_owner(monkeyp
         AsyncMock(return_value=EphemeralReply("temporary", ttl_seconds=5))
     )
     stale._keep_typing = lambda *_args, **_kwargs: __import__("asyncio").Event().wait()
-    live._send_with_retry = AsyncMock(
+    live.send_prepared_text_chunk = AsyncMock(
         return_value=SendResult(success=True, message_id="live-message")
     )
 
@@ -1323,6 +1387,7 @@ async def test_owner_unavailable_final_text_is_left_pending_in_ledger(
 
     live = _adapter("live")
     setattr(runner, "_profile_adapters", {"coder": {Platform.SLACK: live}})
+    runner._share_backend_notice_state(live, profile_name="coder")
     store = MagicMock()
     store.clear_resume_pending = AsyncMock()
     store._store = None
@@ -1330,7 +1395,8 @@ async def test_owner_unavailable_final_text_is_left_pending_in_ledger(
     runner._async_session_store = store
 
     assert await runner._redeliver_pending_obligations() == 1
-    live.send.assert_awaited_once()
+    live.send.assert_not_awaited()
+    live.send_prepared_text_chunk.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1402,7 +1468,7 @@ async def test_live_failed_text_blocks_later_images(isolated_ledger, monkeypatch
     adapter._keep_typing = (
         lambda *_args, **_kwargs: __import__("asyncio").Event().wait()
     )
-    adapter._send_with_retry = AsyncMock(
+    adapter.send_prepared_text_chunk = AsyncMock(
         return_value=SendResult(success=False, error="text rejected")
     )
     adapter.send_multiple_images = AsyncMock(return_value=None)
@@ -1416,7 +1482,7 @@ async def test_live_failed_text_blocks_later_images(isolated_ledger, monkeypatch
         "agent:coder:slack:dm:C1",
     )
 
-    adapter._send_with_retry.assert_awaited_once()
+    adapter.send_prepared_text_chunk.assert_awaited_once()
     adapter.send_multiple_images.assert_not_awaited()
 
 
@@ -1493,6 +1559,7 @@ def test_ledger_persists_stamped_transport_owner(isolated_ledger):
         chat_id="C1",
         thread_id="171.001",
         content="private answer",
+        transport_platform="slack",
         transport_profile="coder",
         transport_profile_stamped=True,
     )
@@ -1515,6 +1582,7 @@ async def test_recovery_missing_secondary_owner_never_uses_primary(isolated_ledg
         chat_id="C1",
         thread_id="171.001",
         content="secondary private answer",
+        transport_platform="slack",
         transport_profile="coder",
         transport_profile_stamped=True,
     )
@@ -1592,6 +1660,7 @@ async def test_recovery_route_disappearing_after_claim_releases_budget(
         chat_id="C1",
         thread_id=None,
         content="private answer",
+        transport_platform="slack",
         transport_profile="coder",
         transport_profile_stamped=True,
     )

@@ -1138,6 +1138,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Matrix renders fenced code blocks (HTML/markdown)
     splits_long_messages = True  # send() chunks via truncate_message(max_message_length)
+    supports_prepared_text_chunks = True
 
     # Matrix clients commonly reserve typed "/" for client-local commands;
     # the adapter accepts "!command" as the alias that always reaches Hermes
@@ -2162,8 +2163,12 @@ class MatrixAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.max_message_length)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        if prepared_text:
+            chunks = [content]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.max_message_length)
 
         last_event_id = None
         for i, chunk in enumerate(chunks):
@@ -2184,7 +2189,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 # On E2EE errors, retry after sharing keys.
-                if self._encryption and getattr(self._client, "crypto", None):
+                if (
+                    not prepared_text
+                    and self._encryption
+                    and getattr(self._client, "crypto", None)
+                ):
                     try:
                         await self._client.crypto.share_keys()
                         event_id = await asyncio.wait_for(

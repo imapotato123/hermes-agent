@@ -755,6 +755,7 @@ class TeamsAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 28000  # Teams text message limit (~28 KB)
     splits_long_messages = True  # send() chunks via truncate_message()
+    supports_prepared_text_chunks = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("teams"))
@@ -1225,8 +1226,12 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        if prepared_text:
+            chunks = [content]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted)
         last_message_id = None
 
         for chunk in chunks:
@@ -1235,6 +1240,8 @@ class TeamsAdapter(BasePlatformAdapter):
                     try:
                         result = await self._app.reply(chat_id, reply_to, chunk)
                     except Exception as reply_err:
+                        if prepared_text:
+                            raise
                         # Group chats 400 on threaded sends; the Teams SDK
                         # doesn't expose typed HTTP errors, so fall back on
                         # any exception and log for diagnostics.
@@ -1247,7 +1254,11 @@ class TeamsAdapter(BasePlatformAdapter):
                     result = await self._app.send(chat_id, chunk)
                 last_message_id = getattr(result, "id", None)
             except Exception as e:
-                return SendResult(success=False, error=str(e), retryable=True)
+                return SendResult(
+                    success=False,
+                    error=str(e),
+                    retryable=not prepared_text,
+                )
 
         return SendResult(success=True, message_id=last_message_id)
 

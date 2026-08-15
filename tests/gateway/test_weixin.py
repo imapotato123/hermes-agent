@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import os
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -73,6 +73,34 @@ class TestWeixinFormatting:
 
 
 class TestWeixinChunking:
+
+    @pytest.mark.asyncio
+    async def test_prepared_text_uses_one_chunk_sender_without_transient_retry(self):
+        adapter = _make_adapter()
+        adapter._send_session = object()
+        adapter._token = "token"
+        adapter._account_id = "acct"
+        adapter._token_store = MagicMock()
+        adapter._token_store.get.return_value = "context"
+        adapter._send_text_chunk = AsyncMock()
+
+        plan = adapter.prepare_text_chunks(
+            "x" * 5000,
+            chat_id="user-1",
+        )
+        assert len(plan) > 1
+        assert all(
+            len(entry[key]) <= adapter.MAX_MESSAGE_LENGTH
+            for entry in plan
+            for key in ("content", "recovered_content")
+        )
+
+        result = await adapter.send_prepared_text_chunk(
+            "user-1", plan[0]["content"]
+        )
+
+        assert result.success is True
+        assert adapter._send_text_chunk.await_args.kwargs["retry_transient"] is False
 
 
     def test_split_text_keeps_four_line_structured_blocks_together(self):

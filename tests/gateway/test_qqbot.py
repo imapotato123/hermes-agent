@@ -410,6 +410,29 @@ class TestWaitForReconnection:
         return QQAdapter(_make_config(**extra))
 
     @pytest.mark.asyncio
+    async def test_prepared_text_uses_one_api_attempt_without_internal_retry(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._http_client = mock.MagicMock()
+        adapter._guess_chat_type = mock.Mock(return_value="c2c")
+        adapter._send_c2c_text = mock.AsyncMock(
+            side_effect=TimeoutError("ack unknown")
+        )
+        plan = adapter.prepare_text_chunks(
+            "x" * (adapter.MAX_MESSAGE_LENGTH + 500),
+            chat_id="user-1",
+        )
+
+        result = await adapter.send_prepared_text_chunk(
+            "user-1",
+            plan[0]["content"],
+        )
+
+        assert not result.success
+        adapter._send_c2c_text.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_waits_and_succeeds_on_reconnect(self):
         """send() should wait for reconnection and then deliver the message."""
         adapter = self._make_adapter(app_id="a", client_secret="b")

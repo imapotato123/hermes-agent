@@ -349,9 +349,7 @@ class SessionSource:
             prospective_thread_id=data.get("prospective_thread_id"),
         )
         if data.get("transport_owner_stamped") is True:
-            transport_platform_value = data.get("transport_platform") or data.get(
-                "platform"
-            )
+            transport_platform_value = data.get("transport_platform")
             try:
                 transport_platform = Platform(transport_platform_value)
             except (TypeError, ValueError):

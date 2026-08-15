@@ -693,6 +693,47 @@ class LineAdapter(BasePlatformAdapter):
 
     # LINE has its own message-edit story (none) — we always send fresh
     # bubbles, never edit, so REQUIRES_EDIT_FINALIZE stays False.
+    splits_long_messages = True
+    supports_prepared_text_chunks = True
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        text = self.format_message(content)
+        marker = self.format_message(RECOVERED_MARKER)
+        chunks = split_for_line(text, LINE_SAFE_BUBBLE_CHARS - len(marker))
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+
+    async def send_prepared_text_chunk(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del reply_to, metadata
+        return await self._send_text_chunks(
+            chat_id,
+            content,
+            force_push=False,
+            prepared_text=True,
+        )
 
     def __init__(self, config, **kwargs):
         platform = Platform("line")
@@ -1200,11 +1241,16 @@ class LineAdapter(BasePlatformAdapter):
         content: str,
         *,
         force_push: bool,
+        prepared_text: bool = False,
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
-        chunks = split_for_line(strip_markdown_preserving_urls(content))
+        chunks = (
+            [content]
+            if prepared_text
+            else split_for_line(strip_markdown_preserving_urls(content))
+        )
         if not chunks:
             return SendResult(success=True, message_id=None)
         messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
@@ -1215,6 +1261,12 @@ class LineAdapter(BasePlatformAdapter):
                 await self._client.reply(token, messages)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
+                if prepared_text:
+                    return SendResult(
+                        success=False,
+                        error=str(exc),
+                        retryable=False,
+                    )
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 

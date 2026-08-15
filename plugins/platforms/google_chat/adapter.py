@@ -639,6 +639,8 @@ class GoogleChatAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = _MAX_TEXT_LENGTH
+    splits_long_messages = True
+    supports_prepared_text_chunks = True
     # Pub/Sub supervisor configuration.
     _MAX_RECONNECT_ATTEMPTS = 10
     _RECONNECT_BASE_DELAY = 2.0
@@ -2086,7 +2088,12 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # and strip invisible Unicode that renders as tofu (□). Runs
             # BEFORE chunking so the size limit applies to the rendered
             # form, not the source markdown.
-            chunks = self._chunk_text(self.format_message(content))
+            prepared_text = self._is_prepared_text_metadata(metadata)
+            chunks = (
+                [content]
+                if prepared_text
+                else self._chunk_text(self.format_message(content))
+            )
             if not chunks:
                 return SendResult(success=False, error="empty message")
 

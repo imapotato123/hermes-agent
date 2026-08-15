@@ -676,6 +676,29 @@ class TestBuildMessageEvent:
 
 class TestSend:
     @pytest.mark.asyncio
+    async def test_prepared_text_sends_exactly_one_physical_message(self, adapter):
+        adapter._create_message = AsyncMock(
+            return_value=type(
+                "R",
+                (),
+                {"success": True, "message_id": "m/1", "error": None},
+            )()
+        )
+        plan = adapter.prepare_text_chunks(
+            "x" * (adapter.MAX_MESSAGE_LENGTH + 500),
+            chat_id="spaces/S",
+        )
+
+        result = await adapter.send_prepared_text_chunk(
+            "spaces/S",
+            plan[0]["content"],
+        )
+
+        assert result.success
+        adapter._create_message.assert_awaited_once()
+        assert adapter._create_message.await_args.args[1]["text"] == plan[0]["content"]
+
+    @pytest.mark.asyncio
     async def test_text_send_creates_message(self, adapter):
         adapter._create_message = AsyncMock(
             return_value=type("R", (), {"success": True, "message_id": "m/1",

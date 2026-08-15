@@ -100,6 +100,37 @@ class TestIRCAdapterSend:
         sent_data = writer.write.call_args[0][0]
         assert b"PRIVMSG #test :hello world" in sent_data
 
+    @pytest.mark.asyncio
+    async def test_prepared_text_respects_wire_bytes_and_sends_one_privmsg(
+        self, adapter
+    ):
+        writer = MagicMock()
+        writer.is_closing = MagicMock(return_value=False)
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
+        adapter._writer = writer
+
+        plan = adapter.prepare_text_chunks(
+            "あ" * 500,
+            chat_id="#long-target",
+            reply_to=None,
+            metadata=None,
+        )
+        assert len(plan) > 1
+        assert all(
+            len(
+                f"PRIVMSG #long-target :{entry[key]}\r\n".encode("utf-8")
+            ) <= 512
+            for entry in plan
+            for key in ("content", "recovered_content")
+        )
+
+        await adapter.send_prepared_text_chunk(
+            "#long-target", plan[0]["content"]
+        )
+
+        assert writer.write.call_count == 1
+
 
 class TestIRCAdapterMessageParsing:
 

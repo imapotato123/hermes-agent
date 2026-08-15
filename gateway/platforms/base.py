@@ -3093,6 +3093,10 @@ class BasePlatformAdapter(ABC):
     # support multi-message delivery (Discord, Telegram, …).  Default False
     # (conservative); adapters verified to chunk in ``send()`` set True.
     splits_long_messages: bool = False
+    # Opt-in for adapters whose ``send`` honors ``_hermes_prepared_text`` by
+    # skipping formatting and internal chunk loops. Generic preparation then
+    # uses the adapter's ordinary formatter/splitter safely.
+    supports_prepared_text_chunks: bool = False
 
     # The command prefix users can always TYPE on this platform to reach
     # Hermes commands.  Default "/" (most platforms deliver "/approve" etc.
@@ -5695,6 +5699,33 @@ class BasePlatformAdapter(ABC):
             return self
         return self._final_delivery_adapter(source)
 
+    def _text_planning_adapter(
+        self, source: Optional[SessionSource]
+    ) -> Optional[Any]:
+        """Resolve an adapter for pure physical-text planning.
+
+        Planning performs no authenticated operation. If the exact live owner
+        is absent, the source adapter may freeze a recoverable plan only when
+        the stamped physical platform matches this generation. Malformed
+        stamps remain fail-closed.
+        """
+        live_adapter = self._final_delivery_adapter(source)
+        if live_adapter is not None:
+            return live_adapter
+        if source is None:
+            return self
+        source_attrs = getattr(source, "__dict__", {})
+        if not isinstance(source_attrs, dict) or "_transport_profile" not in source_attrs:
+            return None
+        transport_platform = source_attrs.get("_transport_platform")
+        if transport_platform is None:
+            return None
+        if getattr(transport_platform, "value", transport_platform) != getattr(
+            self.platform, "value", self.platform
+        ):
+            return None
+        return self
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -6549,6 +6580,7 @@ class BasePlatformAdapter(ABC):
         _bundle_recording_failed = False
         _bundle_auto_tts_requested = False
         _bundle_auto_tts_caption_text = False
+        _bundle_text_chunks: List[Dict[str, Any]] = []
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded, _bundle_delivery_failed
@@ -6789,6 +6821,33 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Physical text planning is required even when persistence is
+                # intentionally disabled (ephemeral/system command replies).
+                # One logical send must never regain an internal multi-post
+                # loop merely because no durable row is recorded.
+                if text_content:
+                    _planning_adapter = self._text_planning_adapter(event.source)
+                    _prepare_text = (
+                        getattr(_planning_adapter, "prepare_text_chunks", None)
+                        if _planning_adapter is not None
+                        else None
+                    )
+                    if not callable(_prepare_text):
+                        raise RuntimeError(
+                            "transport owner cannot prepare physical text posts"
+                        )
+                    _prepared = _prepare_text(
+                        text_content,
+                        chat_id=event.source.chat_id,
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_final_thread_metadata,
+                    )
+                    if not isinstance(_prepared, list) or not _prepared:
+                        raise RuntimeError(
+                            "transport owner returned no physical text posts"
+                        )
+                    _bundle_text_chunks = [dict(item) for item in _prepared]
+
                 # Persist the complete physical-output plan before any send.
                 # Legacy text-only rows remain readable; new response_bundle
                 # rows retain native images and local/media attachments so an
@@ -6859,6 +6918,7 @@ class BasePlatformAdapter(ABC):
                             _bundle_payload_data = {
                                 "version": 1,
                                 "text": text_content,
+                                "text_chunks": _bundle_text_chunks,
                                 "images": images,
                                 "media_files": media_files,
                                 "local_files": local_files,
@@ -6912,6 +6972,7 @@ class BasePlatformAdapter(ABC):
                                 ),
                                 chat_id=event.source.chat_id,
                                 thread_id=getattr(event.source, "thread_id", None),
+                                message_ref=_reply_anchor_for_event(event),
                                 content=text_content,
                                 transport_platform=_transport_platform_value,
                                 transport_profile=_transport_profile,
@@ -7183,7 +7244,12 @@ class BasePlatformAdapter(ABC):
                             await _checkpoint_bundle_operation(
                                 f"auto_tts:{_tts_index}",
                                 *(
-                                    ("text",)
+                                    tuple(
+                                        f"text:{index}"
+                                        for index in range(
+                                            len(_bundle_text_chunks)
+                                        )
+                                    )
                                     if telegram_tts_caption is not None
                                     else ()
                                 ),
@@ -7364,6 +7430,7 @@ class BasePlatformAdapter(ABC):
                                     ),
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
+                                    message_ref=_reply_anchor_for_event(event),
                                     content=text_content,
                                     transport_platform=_transport_platform_value,
                                     transport_profile=_transport_profile,
@@ -7433,45 +7500,74 @@ class BasePlatformAdapter(ABC):
                             )
                             raise
                     else:
-                        delivery_adapter = self._final_delivery_adapter(event.source)
-                        if delivery_adapter is None:
-                            result = SendResult(
-                                success=False,
-                                error="transport owner unavailable",
+                        result = SendResult(success=True)
+                        for _text_index, _text_chunk in enumerate(
+                            _bundle_text_chunks
+                        ):
+                            _text_operation = f"text:{_text_index}"
+                            delivery_adapter = self._final_delivery_adapter(
+                                event.source
                             )
-                        else:
-                            if not await _begin_bundle_operation("text"):
+                            _send_prepared = (
+                                getattr(
+                                    delivery_adapter,
+                                    "send_prepared_text_chunk",
+                                    None,
+                                )
+                                if delivery_adapter is not None
+                                else None
+                            )
+                            if not callable(_send_prepared):
+                                result = SendResult(
+                                    success=False,
+                                    error=(
+                                        "transport owner cannot send prepared "
+                                        "physical text post"
+                                    ),
+                                )
+                                break
+                            if not await _begin_bundle_operation(_text_operation):
                                 result = SendResult(
                                     success=False,
                                     error="delivery ledger unavailable",
                                 )
-                            else:
-                                if _obligation_id is not None:
-                                    try:
-                                        from gateway.delivery_ledger import mark_attempting
-
-                                        await asyncio.to_thread(
-                                            mark_attempting, _obligation_id
-                                        )
-                                        _obligation_attempt_started = True
-                                    except Exception:
-                                        logger.debug(
-                                            "delivery ledger attempting update failed",
-                                            exc_info=True,
-                                        )
-                                result = await delivery_adapter._send_with_retry(
-                                    chat_id=event.source.chat_id,
-                                    content=text_content,
-                                    reply_to=_reply_anchor,
-                                    metadata=_final_thread_metadata,
-                                    source=event.source,
-                                )
+                                break
+                            result = await cast(
+                                Callable[..., Awaitable[SendResult]],
+                                _send_prepared,
+                            )(
+                                chat_id=event.source.chat_id,
+                                content=str(_text_chunk["content"]),
+                                reply_to=(
+                                    _reply_anchor
+                                    if _text_chunk.get(
+                                        "reply_to_original",
+                                        _text_index == 0,
+                                    )
+                                    else None
+                                ),
+                                metadata={
+                                    **dict(_final_thread_metadata or {}),
+                                    "_hermes_prepared_text_index": _text_index,
+                                    "_hermes_prepared_text_count": len(
+                                        _bundle_text_chunks
+                                    ),
+                                },
+                            )
+                            result._sending_adapter = delivery_adapter
+                            _record_delivery(result)
+                            if not getattr(result, "success", False):
+                                break
+                            self._schedule_ephemeral_delete_for_result(
+                                result=result,
+                                chat_id=event.source.chat_id,
+                                ttl_seconds=_ephemeral_ttl,
+                                fallback_adapter=delivery_adapter,
+                            )
+                            await _checkpoint_bundle_operation(_text_operation)
+                            if _bundle_delivery_failed:
+                                break
                     _record_delivery(result)
-                    if (
-                        _bundle_recorded
-                        and getattr(result, "success", False)
-                    ):
-                        await _checkpoint_bundle_operation("text")
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -7497,12 +7593,13 @@ class BasePlatformAdapter(ABC):
                                 "delivery ledger update failed", exc_info=True
                             )
 
-                    self._schedule_ephemeral_delete_for_result(
-                        result=result,
-                        chat_id=event.source.chat_id,
-                        ttl_seconds=_ephemeral_ttl,
-                        fallback_adapter=delivery_adapter,
-                    )
+                    if not _bundle_text_chunks:
+                        self._schedule_ephemeral_delete_for_result(
+                            result=result,
+                            chat_id=event.source.chat_id,
+                            ttl_seconds=_ephemeral_ttl,
+                            fallback_adapter=delivery_adapter,
+                        )
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
@@ -8303,6 +8400,96 @@ class BasePlatformAdapter(ABC):
         Default implementation returns content as-is.
         """
         return content
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Prepare a durable plan whose entries each equal one physical post.
+
+        Adapters whose logical ``send`` can fan out must override this method
+        together with :meth:`send_prepared_text_chunk`. The conservative guard
+        keeps a newly declared chunker from being treated as physically atomic.
+        """
+        del reply_to, metadata
+        if self.splits_long_messages and not self.supports_prepared_text_chunks:
+            raise RuntimeError(
+                f"{self.name} must implement physical text preparation"
+            )
+        text = str(content or "")
+        if not text:
+            return []
+        from gateway.delivery_ledger import RECOVERED_MARKER
+        if not self.splits_long_messages:
+            return [
+                {
+                    "content": text,
+                    "recovered_content": RECOVERED_MARKER + text,
+                    "reply_to_original": True,
+                }
+            ]
+
+        formatted = self.format_message(text)
+        limit = int(getattr(self, "MAX_MESSAGE_LENGTH", 4096) or 4096)
+        length_fn: Callable[[str], int] = len
+        per_chat_len = getattr(self, "message_len_fn_for_chat", None)
+        if callable(per_chat_len):
+            length_fn = per_chat_len(chat_id)
+        per_chat_limit = getattr(self, "max_message_length_for_chat", None)
+        if callable(per_chat_limit):
+            limit = int(per_chat_limit(chat_id) or limit)
+        recovered_prefix = self.format_message(RECOVERED_MARKER)
+        body_limit = limit - length_fn(recovered_prefix)
+        if body_limit < 1:
+            raise RuntimeError(
+                f"{self.name} message limit cannot fit recovery marker"
+            )
+        raw_chunks = self.truncate_message(
+            formatted,
+            body_limit,
+            len_fn=length_fn,
+        )
+        return [
+            {
+                "content": chunk,
+                "recovered_content": recovered_prefix + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(raw_chunks)
+            if chunk
+        ]
+
+    @staticmethod
+    def _is_prepared_text_metadata(metadata: Optional[Dict[str, Any]]) -> bool:
+        return bool(metadata and metadata.get("_hermes_prepared_text") is True)
+
+    async def send_prepared_text_chunk(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send exactly one prepared physical text post without re-chunking."""
+        if self.splits_long_messages and not self.supports_prepared_text_chunks:
+            return SendResult(
+                success=False,
+                error=f"{self.name} has no physical prepared-text sender",
+            )
+        send_metadata = dict(metadata or {})
+        send_metadata["_hermes_prepared_text"] = True
+        result = await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=send_metadata,
+        )
+        result._sending_adapter = self
+        return result
     
     @staticmethod
     def truncate_message(

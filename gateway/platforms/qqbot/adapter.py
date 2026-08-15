@@ -183,6 +183,8 @@ class QQAdapter(BasePlatformAdapter):
     # QQ Bot API does not support editing sent messages.
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    splits_long_messages = True
+    supports_prepared_text_chunks = True
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
 
@@ -2481,7 +2483,7 @@ class QQAdapter(BasePlatformAdapter):
         Applies format_message(), splits long messages via truncate_message(),
         and retries transient failures with exponential backoff.
         """
-        del metadata
+        prepared_text = self._is_prepared_text_metadata(metadata)
 
         if not self.is_connected:
             if not await self._wait_for_reconnection():
@@ -2490,12 +2492,21 @@ class QQAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True)
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        formatted = content if prepared_text else self.format_message(content)
+        chunks = (
+            [formatted]
+            if prepared_text
+            else self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        )
 
         last_result = SendResult(success=False, error="No chunks")
         for chunk in chunks:
-            last_result = await self._send_chunk(chat_id, chunk, reply_to)
+            last_result = await self._send_chunk(
+                chat_id,
+                chunk,
+                reply_to,
+                max_attempts=1 if prepared_text else 3,
+            )
             if not last_result.success:
                 return last_result
             # Only reply_to the first chunk
@@ -2507,12 +2518,14 @@ class QQAdapter(BasePlatformAdapter):
             chat_id: str,
             content: str,
             reply_to: Optional[str] = None,
+            max_attempts: int = 3,
     ) -> SendResult:
         """Send a single chunk with retry + exponential backoff."""
         last_exc: Optional[Exception] = None
         chat_type = self._guess_chat_type(chat_id)
+        max_attempts = max(1, int(max_attempts))
 
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 if chat_type == "c2c":
                     return await self._send_c2c_text(chat_id, content, reply_to)
@@ -2534,12 +2547,13 @@ class QQAdapter(BasePlatformAdapter):
                 ):
                     break
                 # Transient — back off and retry
-                if attempt < 2:
+                if attempt < max_attempts - 1:
                     delay = 1.0 * (2 ** attempt)
                     logger.warning(
-                        "[%s] send retry %d/3 after %.1fs: %s",
+                        "[%s] send retry %d/%d after %.1fs: %s",
                         self._log_tag,
                         attempt + 1,
+                        max_attempts,
                         delay,
                         exc,
                     )

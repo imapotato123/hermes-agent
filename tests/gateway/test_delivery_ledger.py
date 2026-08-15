@@ -127,12 +127,13 @@ class TestStateMachine:
                 ).fetchall()
             }
             owner = migrated.execute(
-                "SELECT transport_platform, transport_profile, "
+                "SELECT message_ref, transport_platform, transport_profile, "
                 "transport_profile_stamped, transport_identity, route_scope_id, "
                 "route_user_id, route_chat_type, operation, payload_json, sequence_no "
                 "FROM delivery_obligations WHERE obligation_id='ob-1'"
             ).fetchone()
         assert {
+            "message_ref",
             "transport_platform",
             "transport_profile",
             "transport_profile_stamped",
@@ -144,7 +145,9 @@ class TestStateMachine:
             "payload_json",
             "sequence_no",
         } <= columns
-        assert owner == (None, None, 0, None, None, None, None, "text", None, 0)
+        assert owner == (
+            None, None, None, 0, None, None, None, None, "text", None, 0
+        )
 
     def test_typed_bundle_payload_round_trips_through_claim(self):
         payload = json.dumps(
@@ -333,6 +336,55 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_stamped_row_missing_transport_platform_is_not_claimed(self):
+        dl.record_obligation(
+            obligation_id="malformed-stamp",
+            session_key="agent:coder:slack:dm:C1",
+            platform="slack",
+            chat_id="C1",
+            thread_id=None,
+            content="private answer",
+            transport_platform=None,
+            transport_profile="coder",
+            transport_profile_stamped=True,
+        )
+        _orphan("malformed-stamp")
+
+        claimed = dl.sweep_recoverable(
+            deliverable_routes={("slack", True, "coder", None)}
+        )
+
+        assert claimed == []
+        with dl._connect() as conn:
+            attempts, owner_pid = conn.execute(
+                "SELECT attempts, owner_pid FROM delivery_obligations "
+                "WHERE obligation_id=?",
+                ("malformed-stamp",),
+            ).fetchone()
+        assert attempts == 0
+        assert owner_pid == 999999999
+
+    def test_message_ref_survives_record_and_claim(self):
+        dl.record_obligation(
+            obligation_id="reply-anchor-row",
+            session_key="agent:coder:teams:dm:C1",
+            platform="teams",
+            chat_id="C1",
+            thread_id="thread-1",
+            message_ref="123",
+            content="private answer",
+            transport_platform="teams",
+            transport_profile="coder",
+            transport_profile_stamped=True,
+        )
+        _orphan("reply-anchor-row")
+
+        claimed = dl.sweep_recoverable(
+            deliverable_routes={("teams", True, "coder", None)}
+        )
+
+        assert claimed[0]["message_ref"] == "123"
 
     def test_claim_cas_includes_observed_process_start_time(self, monkeypatch):
         """PID reuse between liveness check and UPDATE cannot steal a live claim."""

@@ -165,6 +165,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_prepared_text_chunks = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.BLUEBUBBLES)
@@ -531,6 +532,43 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         chunks = BasePlatformAdapter.truncate_message(content, max_length)
         return [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
 
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        text = self.format_message(content)
+        marker = self.format_message(RECOVERED_MARKER)
+        body_limit = self.MAX_MESSAGE_LENGTH - len(marker)
+        if body_limit < 1:
+            raise RuntimeError("BlueBubbles limit cannot fit recovery marker")
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n", text)
+            if paragraph.strip()
+        ]
+        chunks: List[str] = []
+        for paragraph in paragraphs or [text]:
+            if len(paragraph) <= body_limit:
+                chunks.append(paragraph)
+            else:
+                chunks.extend(self.truncate_message(paragraph, body_limit))
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+
     async def send(
         self,
         chat_id: str,
@@ -538,19 +576,21 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        text = self.format_message(content)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        text = content if prepared_text else self.format_message(content)
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
         # Split on paragraph breaks first (double newlines) so each thought
         # becomes its own iMessage bubble, then truncate any that are still
         # too long.
         paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-        chunks: List[str] = []
-        for para in (paragraphs or [text]):
-            if len(para) <= self.MAX_MESSAGE_LENGTH:
-                chunks.append(para)
-            else:
-                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+        chunks: List[str] = [text] if prepared_text else []
+        if not prepared_text:
+            for para in (paragraphs or [text]):
+                if len(para) <= self.MAX_MESSAGE_LENGTH:
+                    chunks.append(para)
+                else:
+                    chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
         last = SendResult(success=True)
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)

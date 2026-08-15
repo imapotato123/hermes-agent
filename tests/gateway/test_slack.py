@@ -193,6 +193,129 @@ def adapter():
     return a
 
 
+def test_prepared_text_plan_splits_long_slack_content_into_bounded_posts(adapter):
+    entries = adapter.prepare_text_chunks(
+        "word " * 20000,
+        chat_id="C123",
+    )
+
+    assert len(entries) > 1
+    assert all(len(entry["content"]) <= adapter.MAX_MESSAGE_LENGTH for entry in entries)
+    assert all(
+        len(entry["recovered_content"]) <= adapter.MAX_MESSAGE_LENGTH
+        for entry in entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_posts_exactly_once_without_reformatting(adapter):
+    adapter._ensure_dm_conversation = AsyncMock(return_value="C123")
+    adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "123.456"})
+    adapter.format_message = MagicMock(side_effect=AssertionError("already formatted"))
+    adapter.truncate_message = MagicMock(side_effect=AssertionError("already chunked"))
+
+    result = await adapter.send_prepared_text_chunk("C123", "prepared *mrkdwn*")
+
+    assert result.success is True
+    adapter._app.client.chat_postMessage.assert_awaited_once_with(
+        channel="C123",
+        text="prepared *mrkdwn*",
+        mrkdwn=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_slash_chunks_remain_ephemeral_without_fallback(adapter):
+    import time
+    from plugins.platforms.slack.adapter import (
+        _slash_ephemeral_expected,
+        _slash_user_id,
+    )
+
+    adapter._ensure_dm_conversation = AsyncMock(return_value="C123")
+    adapter._slash_command_contexts[("C123", "U1")] = {
+        "response_url": "https://hooks.slack.test/response",
+        "user_id": "U1",
+        "ts": time.monotonic(),
+    }
+    mock_resp = AsyncMock(status=200)
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    mock_session = AsyncMock()
+    mock_session.post = MagicMock(return_value=mock_resp)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    token = _slash_user_id.set("U1")
+    try:
+        with patch(
+            "plugins.platforms.slack.adapter.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
+            first = await adapter.send_prepared_text_chunk(
+                "C123",
+                "part one",
+                metadata={
+                    "_hermes_prepared_text_index": 0,
+                    "_hermes_prepared_text_count": 2,
+                },
+            )
+            second = await adapter.send_prepared_text_chunk(
+                "C123",
+                "part two",
+                metadata={
+                    "_hermes_prepared_text_index": 1,
+                    "_hermes_prepared_text_count": 2,
+                },
+            )
+    finally:
+        _slash_user_id.reset(token)
+
+    assert first.success is True
+    assert second.success is True
+    assert mock_session.post.call_count == 2
+    payloads = [call.kwargs["json"] for call in mock_session.post.call_args_list]
+    assert payloads == [
+        {
+            "response_type": "ephemeral",
+            "replace_original": True,
+            "text": "part one",
+        },
+        {
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": "part two",
+        },
+    ]
+    assert ("C123", "U1") not in adapter._slash_command_contexts
+    adapter._app.client.chat_postEphemeral.assert_not_awaited()
+    adapter._app.client.chat_postMessage.assert_not_awaited()
+
+
+def test_slash_context_is_shared_only_with_same_profile_replacement():
+    from gateway.run import GatewayRunner
+
+    first = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+    replacement = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+    other_profile = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+    runner = object.__new__(GatewayRunner)
+    runner._active_profile_name = lambda: "main"
+
+    runner._share_backend_notice_state(first, profile_name="coder")
+    first._slash_command_contexts[("T1", "C1", "U1")] = {
+        "response_url": "https://hooks.slack.test/response",
+        "user_id": "U1",
+        "ts": 1.0,
+    }
+    runner._share_backend_notice_state(replacement, profile_name="coder")
+    runner._share_backend_notice_state(other_profile, profile_name="other")
+
+    assert replacement._slash_command_contexts is first._slash_command_contexts
+    assert ("T1", "C1", "U1") in replacement._slash_command_contexts
+    assert other_profile._slash_command_contexts is not first._slash_command_contexts
+    assert other_profile._slash_command_contexts == {}
+
+
 @pytest.fixture(autouse=True)
 def _redirect_cache(tmp_path, monkeypatch):
     """Point document cache to tmp_path so tests don't touch ~/.hermes."""

@@ -136,6 +136,56 @@ class TestMattermostSend:
         self.adapter = _make_adapter()
         self.adapter._session = MagicMock()
 
+    def test_prepared_text_plan_splits_long_content_into_bounded_posts(self):
+        entries = self.adapter.prepare_text_chunks(
+            "word " * 4000,
+            chat_id="channel_1",
+        )
+
+        assert len(entries) > 1
+        assert all(len(entry["content"]) <= 4000 for entry in entries)
+        assert all(len(entry["recovered_content"]) <= 4000 for entry in entries)
+
+    @pytest.mark.asyncio
+    async def test_prepared_text_posts_exactly_once_without_reformatting(self):
+        self.adapter._api_post = AsyncMock(return_value={"id": "post123"})
+        self.adapter.format_message = MagicMock(
+            side_effect=AssertionError("already formatted")
+        )
+        self.adapter.truncate_message = MagicMock(
+            side_effect=AssertionError("already chunked")
+        )
+
+        result = await self.adapter.send_prepared_text_chunk(
+            "channel_1",
+            "prepared **mattermost**",
+        )
+
+        assert result.success is True
+        self.adapter._api_post.assert_awaited_once()
+        payload = self.adapter._api_post.await_args.args[1]
+        assert payload["message"] == "prepared **mattermost**"
+
+    @pytest.mark.asyncio
+    async def test_prepared_text_does_not_fallback_after_thread_post_failure(self):
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "bad_root", "root_id": ""}
+        )
+        self.adapter._last_post_status = 400
+        self.adapter._last_post_error = "invalid root_id"
+        self.adapter._api_post = AsyncMock(return_value={})
+
+        result = await self.adapter.send_prepared_text_chunk(
+            "channel_1",
+            "prepared final",
+            reply_to="bad_root",
+            metadata={"notify": True},
+        )
+
+        assert result.success is False
+        self.adapter._api_post.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_send_calls_api_post(self):
         """send() should POST to /api/v4/posts with channel_id and message."""

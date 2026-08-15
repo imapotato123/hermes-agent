@@ -123,6 +123,9 @@ class IRCAdapter(BasePlatformAdapter):
     register_platform().
     """
 
+    splits_long_messages = True
+    supports_prepared_text_chunks = True
+
     def __init__(self, config, **kwargs):
         platform = Platform("irc")
         super().__init__(config=config, platform=platform)
@@ -290,7 +293,11 @@ class IRCAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         target = chat_id  # channel name or nick for DMs
-        lines = self._split_message(content, target)
+        lines = (
+            [content]
+            if self._is_prepared_text_metadata(metadata)
+            else self._split_message(content, target)
+        )
 
         for line in lines:
             try:
@@ -301,6 +308,39 @@ class IRCAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(e))
 
         return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        marker = self._strip_markdown(RECOVERED_MARKER)
+        overhead = len(f"PRIVMSG {chat_id} :".encode("utf-8")) + 2
+        wire_limit = min(self.max_message_length, 510 - overhead)
+        body_limit = wire_limit - len(marker.encode("utf-8"))
+        if body_limit < 1:
+            raise RuntimeError("IRC target leaves no room for recovery marker")
+        original_limit = self.max_message_length
+        try:
+            self.max_message_length = body_limit
+            chunks = self._split_message(content, chat_id)
+        finally:
+            self.max_message_length = original_limit
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """IRC has no typing indicator — no-op."""

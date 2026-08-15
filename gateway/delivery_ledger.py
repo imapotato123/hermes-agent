@@ -101,6 +101,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             platform TEXT NOT NULL,
             chat_id TEXT NOT NULL,
             thread_id TEXT,
+            message_ref TEXT,
             content TEXT NOT NULL,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +132,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     if "transport_profile" not in columns:
         conn.execute(
             "ALTER TABLE delivery_obligations ADD COLUMN transport_profile TEXT"
+        )
+    if "message_ref" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN message_ref TEXT"
         )
     if "transport_platform" not in columns:
         conn.execute(
@@ -276,6 +281,7 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    message_ref: Optional[str] = None,
     transport_platform: Optional[str] = None,
     transport_profile: Optional[str] = None,
     transport_profile_stamped: bool = False,
@@ -294,17 +300,18 @@ def record_obligation(
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
+                message_ref, content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, transport_platform, transport_profile,
                 transport_profile_stamped, transport_identity, route_scope_id,
                 route_user_id, route_chat_type, operation, payload_json, sequence_no)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 obligation_id,
                 session_key,
                 platform,
                 str(chat_id),
                 str(thread_id) if thread_id else None,
+                str(message_ref) if message_ref else None,
                 content,
                 now,
                 now,
@@ -605,7 +612,7 @@ def sweep_recoverable(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      message_ref, content, state, attempts, created_at,
                       transport_platform, transport_profile,
                       transport_profile_stamped, transport_identity,
                       route_scope_id, route_user_id, route_chat_type,
@@ -621,6 +628,7 @@ def sweep_recoverable(
             platform,
             chat_id,
             thread_id,
+            message_ref,
             content,
             state,
             attempts,
@@ -654,8 +662,14 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            if transport_profile_stamped and not transport_platform:
+                # An explicitly stamped owner without a physical platform is
+                # malformed, not legacy. Leave it inert without spending an
+                # attempt; substituting the logical platform could borrow a
+                # native credential.
+                continue
             route = (
-                (transport_platform or platform)
+                transport_platform
                 if transport_profile_stamped
                 else platform,
                 bool(transport_profile_stamped),
@@ -691,6 +705,7 @@ def sweep_recoverable(
                     "platform": platform,
                     "chat_id": chat_id,
                     "thread_id": thread_id,
+                    "message_ref": message_ref,
                     "content": content,
                     "transport_platform": transport_platform,
                     "transport_profile": transport_profile,

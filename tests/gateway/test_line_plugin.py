@@ -243,6 +243,24 @@ class TestSendRouting:
         assert not _is_system_bypass("Hello world")
         assert not _is_system_bypass("")
 
+    @pytest.mark.asyncio
+    async def test_prepared_text_uses_one_message_and_no_ambiguous_push_fallback(
+        self, adapter
+    ):
+        adapter._reply_tokens["U1"] = ("reply-token", float("inf"))
+        adapter._client.reply.side_effect = TimeoutError("ack unknown")
+        plan = adapter.prepare_text_chunks("x" * 6000, chat_id="U1")
+
+        result = await adapter.send_prepared_text_chunk(
+            "U1",
+            plan[0]["content"],
+        )
+
+        assert not result.success
+        adapter._client.reply.assert_awaited_once()
+        assert len(adapter._client.reply.await_args.args[1]) == 1
+        adapter._client.push.assert_not_awaited()
+
 
     def test_send_caps_messages_per_call_at_five(self, adapter):
         # Build a payload that would naturally split into more than 5 LINE

@@ -213,6 +213,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     """
 
     splits_long_messages = True  # send() chunks via truncate_message()
+    supports_prepared_text_chunks = True
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        del chat_id
+        return self._outgoing_chunk_limit()
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP_CLOUD)
@@ -527,8 +532,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        formatted = content if prepared_text else self.format_message(content)
+        chunks = (
+            [formatted]
+            if prepared_text
+            else self.truncate_message(formatted, self._outgoing_chunk_limit())
+        )
 
         url = self._graph_url("messages")
         headers = {

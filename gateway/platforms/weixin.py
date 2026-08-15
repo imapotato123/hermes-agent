@@ -1174,6 +1174,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Weixin renders fenced code blocks
     splits_long_messages = True  # send() chunks via _split_text()
+    supports_prepared_text_chunks = True
 
     MAX_MESSAGE_LENGTH = 2000
 
@@ -1764,6 +1765,7 @@ class WeixinAdapter(BasePlatformAdapter):
         chunk: str,
         context_token: Optional[str],
         client_id: str,
+        retry_transient: bool = True,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
@@ -1778,6 +1780,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 chunk=chunk,
                 context_token=context_token,
                 client_id=client_id,
+                retry_transient=retry_transient,
             )
 
     async def _send_text_chunk_locked(
@@ -1787,6 +1790,7 @@ class WeixinAdapter(BasePlatformAdapter):
         chunk: str,
         context_token: Optional[str],
         client_id: str,
+        retry_transient: bool = True,
     ) -> None:
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
@@ -1839,6 +1843,8 @@ class WeixinAdapter(BasePlatformAdapter):
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
+                            if not retry_transient:
+                                break
                             if self._record_rate_limit_event():
                                 last_error = self._rate_limit_error()
                                 break
@@ -1859,7 +1865,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             except Exception as exc:
                 last_error = exc
-                if attempt >= self._send_chunk_retries:
+                if not retry_transient or attempt >= self._send_chunk_retries:
                     break
                 wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
                 logger.warning(
@@ -1875,6 +1881,60 @@ class WeixinAdapter(BasePlatformAdapter):
                     await asyncio.sleep(wait)
         assert last_error is not None
         raise last_error
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        formatted = self.format_message(content)
+        marker = self.format_message(RECOVERED_MARKER)
+        body_limit = self.MAX_MESSAGE_LENGTH - len(marker)
+        if body_limit < 1:
+            raise RuntimeError("Weixin limit cannot fit recovery marker")
+        chunks = _split_text_for_weixin_delivery(
+            formatted,
+            body_limit,
+            self._split_multiline_messages,
+        )
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk and chunk.strip()
+        ]
+
+    async def send_prepared_text_chunk(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del reply_to, metadata
+        if not self._send_session or not self._token:
+            return SendResult(success=False, error="Not connected")
+        client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+        try:
+            await self._send_text_chunk(
+                chat_id=chat_id,
+                chunk=content,
+                context_token=self._token_store.get(self._account_id, chat_id),
+                client_id=client_id,
+                retry_transient=False,
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=False)
+        return SendResult(success=True, message_id=client_id)
 
     async def send(
         self,

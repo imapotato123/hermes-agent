@@ -4867,6 +4867,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
     splits_long_messages = True  # send() auto-chunks via truncate_message(MAX_TEXT_CHUNK)
+    supports_prepared_text_chunks = True
     MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
 
@@ -5080,6 +5081,50 @@ class YuanbaoAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send text message with auto-chunking. Delegates to OutboundManager."""
         return await self._outbound.send_text(chat_id, content, reply_to, group_code=group_code)
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        text = self._outbound.sender.strip_cron_wrapper(content)
+        marker = RECOVERED_MARKER
+        body_limit = self.MAX_TEXT_CHUNK - len(marker)
+        if body_limit < 1:
+            raise RuntimeError("Yuanbao limit cannot fit recovery marker")
+        chunks = self._outbound.sender.truncate_message(text, body_limit)
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+
+    async def send_prepared_text_chunk(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        group_code: str = "",
+    ) -> SendResult:
+        del metadata
+        return await self._outbound.sender.send_text_chunk(
+            chat_id,
+            content,
+            reply_to,
+            retry=1,
+            group_code=group_code,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic chat metadata derived from the chat_id prefix.

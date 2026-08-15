@@ -25,7 +25,7 @@ import hmac
 import logging
 import os
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -87,6 +87,34 @@ class SmsAdapter(BasePlatformAdapter):
     """
 
     MAX_MESSAGE_LENGTH = MAX_SMS_LENGTH
+    splits_long_messages = True
+    supports_prepared_text_chunks = True
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        marker = self.format_message(RECOVERED_MARKER)
+        body_limit = self.MAX_MESSAGE_LENGTH - len(marker)
+        if body_limit < 1:
+            raise RuntimeError("SMS limit cannot fit recovery marker")
+        chunks = self.truncate_message(self.format_message(content), body_limit)
+        return [
+            {
+                "content": chunk,
+                "recovered_content": marker + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SMS)
@@ -187,8 +215,9 @@ class SmsAdapter(BasePlatformAdapter):
     ) -> SendResult:
         import aiohttp
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        formatted = content if prepared_text else self.format_message(content)
+        chunks = [formatted] if prepared_text else self.truncate_message(formatted)
         last_result = SendResult(success=True)
 
         url = f"{TWILIO_API_BASE}/{self._account_sid}/Messages.json"

@@ -67,6 +67,20 @@ class TestSessionSourceRoundtrip:
         )
         assert restored._legacy_transport_owner_unstamped is True
 
+    def test_stamped_source_missing_transport_platform_stays_unresolvable(self):
+        restored = SessionSource.from_dict(
+            {
+                "platform": "slack",
+                "chat_id": "C1",
+                "transport_owner_stamped": True,
+                "transport_profile": "coder",
+            }
+        )
+
+        assert restored._transport_platform is None
+        assert restored._transport_profile == "coder"
+        assert restored._legacy_transport_owner_unstamped is False
+
     def test_direct_source_is_not_implicitly_legacy(self):
         source = SessionSource(platform=Platform.SLACK, chat_id="C1")
         assert source._legacy_transport_owner_unstamped is False

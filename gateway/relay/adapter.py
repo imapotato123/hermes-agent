@@ -259,6 +259,47 @@ class RelayAdapter(BasePlatformAdapter):
     def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
         return _LEN_FNS.get(self._descriptor_for_chat(chat_id).len_unit, len)
 
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        """Prepare one connector outbound frame per physical platform post."""
+        del reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        formatted = self.format_message(str(content or ""))
+        length_fn = self.message_len_fn_for_chat(chat_id)
+        limit = self.max_message_length_for_chat(chat_id)
+        recovered_prefix = self.format_message(RECOVERED_MARKER)
+        body_limit = limit - length_fn(recovered_prefix)
+        if body_limit < 1:
+            raise RuntimeError("relay message limit cannot fit recovery marker")
+        chunks = self.truncate_message(
+            formatted,
+            body_limit,
+            len_fn=length_fn,
+        )
+        plan = [
+            {
+                "content": chunk,
+                "recovered_content": recovered_prefix + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+        if any(
+            length_fn(entry[key]) > limit
+            for entry in plan
+            for key in ("content", "recovered_content")
+        ):
+            raise RuntimeError("relay prepared text exceeds negotiated limit")
+        return plan
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,

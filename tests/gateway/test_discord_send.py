@@ -47,6 +47,54 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+def test_prepared_text_plan_splits_long_discord_content_into_bounded_posts():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    entries = adapter.prepare_text_chunks(
+        "word " * 1000,
+        chat_id="555",
+    )
+
+    assert len(entries) > 1
+    assert all(len(entry["content"]) <= adapter.MAX_MESSAGE_LENGTH for entry in entries)
+    assert all(
+        len(entry["recovered_content"]) <= adapter.MAX_MESSAGE_LENGTH
+        for entry in entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_to_discord_forum_creates_only_one_starter_post():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread_channel = SimpleNamespace(id=777, send=AsyncMock())
+    created_thread = SimpleNamespace(
+        id=777,
+        message=SimpleNamespace(id=800),
+        thread=thread_channel,
+    )
+    forum_channel = SimpleNamespace(
+        id=999,
+        create_thread=AsyncMock(return_value=created_thread),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter._is_forum_parent = MagicMock(return_value=True)
+    adapter.format_message = MagicMock(side_effect=AssertionError("already formatted"))
+    adapter.truncate_message = MagicMock(side_effect=AssertionError("already chunked"))
+
+    result = await adapter.send_prepared_text_chunk(
+        "555",
+        "prepared forum post",
+    )
+
+    assert result.success is True
+    forum_channel.create_thread.assert_awaited_once()
+    assert forum_channel.create_thread.await_args.kwargs["content"] == "prepared forum post"
+    thread_channel.send.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path

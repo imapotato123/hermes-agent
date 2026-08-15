@@ -6166,6 +6166,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._transport_profile = None
         else:
             adapter._transport_profile = str(profile_name or "").strip() or None
+        # Native Slack slash response URLs are process-local authorization
+        # material for private follow-up delivery.  A reconnect replacement
+        # must inherit only its own transport profile's tenant/user-keyed map;
+        # otherwise the in-flight final response can fall through to a public
+        # channel post after the old adapter generation is retired.
+        if (
+            getattr(adapter, "platform", None) == Platform.SLACK
+            and isinstance(
+                getattr(adapter, "_slash_command_contexts", None), dict
+            )
+        ):
+            states = self.__dict__.setdefault("_slack_slash_context_states", {})
+            state_key = str(profile_name or "").strip() or None
+            shared_contexts = states.get(state_key)
+            if shared_contexts is None:
+                states[state_key] = adapter._slash_command_contexts
+            elif adapter._slash_command_contexts is not shared_contexts:
+                shared_contexts.update(adapter._slash_command_contexts)
+                adapter._slash_command_contexts = shared_contexts
         setter = getattr(adapter, "set_backend_notice_state", None)
         if callable(setter):
             setter(
@@ -11153,7 +11172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     _transport_platform = Platform(
-                        row.get("transport_platform") or row["platform"]
+                        row.get("transport_platform")
                     )
                 except (TypeError, ValueError):
                     _transport_platform = None
@@ -11574,7 +11593,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             else None
                         ),
-                        metadata=metadata,
+                        metadata={
+                            **dict(metadata or {}),
+                            "_hermes_prepared_text_index": text_index,
+                            "_hermes_prepared_text_count": len(text_chunks),
+                        },
                     )
                 except Exception as exc:
                     return _failure(str(exc))

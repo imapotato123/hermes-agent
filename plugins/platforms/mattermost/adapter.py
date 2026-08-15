@@ -114,7 +114,9 @@ def validate_mattermost_config(config: PlatformConfig) -> bool:
 class MattermostAdapter(BasePlatformAdapter):
     """Gateway adapter for Mattermost (self-hosted or cloud)."""
 
+    MAX_MESSAGE_LENGTH = MAX_POST_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_POST_LENGTH)
+    supports_prepared_text_chunks = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.MATTERMOST)
@@ -240,6 +242,8 @@ class MattermostAdapter(BasePlatformAdapter):
         """Post once, optionally falling back flat for final notify content."""
         data = await self._api_post("posts", payload)
         if data or "root_id" not in payload:
+            return data
+        if self._is_prepared_text_metadata(metadata):
             return data
         if not (isinstance(metadata, dict) and metadata.get("notify")):
             return data
@@ -400,8 +404,12 @@ class MattermostAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        if prepared_text:
+            chunks = [content]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, MAX_POST_LENGTH)
 
         last_id = None
         for chunk in chunks:

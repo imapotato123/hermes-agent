@@ -261,6 +261,10 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_slash_user_id",
     default=None,
 )
+_slash_ephemeral_expected: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_slash_ephemeral_expected",
+    default=False,
+)
 
 
 @dataclass
@@ -885,6 +889,42 @@ class SlackAdapter(BasePlatformAdapter):
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_prepared_text_chunks = True
+
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        entries = super().prepare_text_chunks(
+            content,
+            chat_id=chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if not _slash_ephemeral_expected.get() or len(entries) <= 5:
+            return entries
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        dropped = len(entries) - 5
+        notice = (
+            f"\n\n_[Reply truncated: {dropped} more part(s) exceeded "
+            "Slack's ephemeral reply limit.]_"
+        )
+        recovered_prefix = self.format_message(RECOVERED_MARKER)
+        body_limit = self.MAX_MESSAGE_LENGTH - len(recovered_prefix)
+        keep = max(0, body_limit - len(notice))
+        final_content = entries[4]["content"][:keep].rstrip() + notice
+        entries = entries[:5]
+        entries[4] = {
+            **entries[4],
+            "content": final_content,
+            "recovered_content": recovered_prefix + final_content,
+        }
+        return entries
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
@@ -1528,6 +1568,66 @@ class SlackAdapter(BasePlatformAdapter):
             return self._slash_command_contexts.pop(key, None)
 
         return None
+
+    def _prepared_slash_context(
+        self,
+        chat_id: str,
+        team_id: str,
+        *,
+        final_chunk: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Peek one exact slash context and pop it after the final chunk."""
+        now = time.monotonic()
+        team_id = str(team_id or "")
+        uid = _slash_user_id.get()
+        if not uid:
+            return None
+        key = (team_id, chat_id, uid) if team_id else (chat_id, uid)
+        ctx = self._slash_command_contexts.get(key)
+        if not ctx:
+            return None
+        if now - ctx["ts"] > self._SLASH_CTX_TTL:
+            self._slash_command_contexts.pop(key, None)
+            return None
+        if final_chunk:
+            self._slash_command_contexts.pop(key, None)
+        return ctx
+
+    async def _send_prepared_slash_ephemeral(
+        self,
+        ctx: Dict[str, Any],
+        content: str,
+        *,
+        replace_original: bool,
+    ) -> "SendResult":
+        """Attempt exactly one response-URL post for one durable text op."""
+        payload = {
+            "response_type": "ephemeral",
+            "replace_original": replace_original,
+            "text": content,
+        }
+        try:
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                async with session.post(
+                    ctx["response_url"],
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await _read_error_text_limited(resp)
+                        logger.warning(
+                            "[Slack] prepared response_url POST returned %s: %s",
+                            resp.status,
+                            body[:200],
+                        )
+                        return SendResult(
+                            success=False,
+                            error=f"response_url POST returned {resp.status}",
+                        )
+            return SendResult(success=True, message_id=None)
+        except Exception as exc:
+            logger.warning("[Slack] prepared response_url POST failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _send_slash_ephemeral(
         self,
@@ -2467,6 +2567,7 @@ class SlackAdapter(BasePlatformAdapter):
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
+        prepared_text = self._is_prepared_text_metadata(metadata)
         thread_ts = None
         try:
             team_id = self._metadata_team_id(metadata)
@@ -2475,8 +2576,29 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            prepared_index = int(
+                (metadata or {}).get("_hermes_prepared_text_index", 0) or 0
+            )
+            prepared_count = max(
+                1,
+                int((metadata or {}).get("_hermes_prepared_text_count", 1) or 1),
+            )
+            slash_ctx = (
+                self._prepared_slash_context(
+                    chat_id,
+                    team_id,
+                    final_chunk=prepared_index >= prepared_count - 1,
+                )
+                if prepared_text
+                else self._pop_slash_context(chat_id, team_id)
+            )
             if slash_ctx:
+                if prepared_text:
+                    return await self._send_prepared_slash_ephemeral(
+                        slash_ctx,
+                        content,
+                        replace_original=prepared_index == 0,
+                    )
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
                     content,
@@ -2519,8 +2641,15 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return fallback_result
 
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
+            if prepared_text and _slash_ephemeral_expected.get():
+                return SendResult(
+                    success=False,
+                    error="required slash ephemeral context unavailable",
+                )
+
+            # Convert standard markdown → Slack mrkdwn unless this is a
+            # gateway-prepared physical post.
+            formatted = content if prepared_text else self.format_message(content)
 
             # Guard against empty/whitespace-only messages — Slack API
             # returns ``no_text`` for chat.postMessage with blank text.
@@ -2532,8 +2661,13 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            # Prepared entries already represent exactly one bounded physical
+            # post; ordinary sends preserve the adapter's native chunking.
+            chunks = (
+                [content]
+                if prepared_text
+                else self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            )
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
@@ -2547,7 +2681,11 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            blocks = (
+                self._maybe_blocks(content)
+                if not prepared_text and len(chunks) == 1
+                else None
+            )
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -2613,7 +2751,9 @@ class SlackAdapter(BasePlatformAdapter):
             # "is thinking..." visible (#24117).
             await self._clear_thread_status_quietly(chat_id, metadata)
             logger.error("[Slack] Send error: %s", e, exc_info=True)
-            _retryable = self._is_retryable_upload_error(e)
+            _retryable = (
+                not prepared_text and self._is_retryable_upload_error(e)
+            )
             _retry_after = None
             if _retryable:
                 _resp = getattr(e, "response", None)
@@ -7836,9 +7976,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Set the ContextVar so send() can match the correct stashed
         # response_url even when multiple users slash concurrently.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
+        _slash_ephemeral_token = _slash_ephemeral_expected.set(
+            bool(response_url and user_id and channel_id and text.startswith("/"))
+        )
         try:
             await self.handle_message(event)
         finally:
+            _slash_ephemeral_expected.reset(_slash_ephemeral_token)
             _slash_user_id.reset(_slash_user_id_token)
 
     def _build_thread_session_key(

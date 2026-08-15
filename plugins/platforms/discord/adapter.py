@@ -1003,6 +1003,7 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_prepared_text_chunks = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -3077,6 +3078,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
 
         try:
+            prepared_text = self._is_prepared_text_metadata(metadata)
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -3101,7 +3103,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(
+                    channel,
+                    content,
+                    prepared_text=prepared_text,
+                )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3112,8 +3118,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 return result
 
             # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if prepared_text:
+                chunks = [content]
+            else:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
@@ -3132,7 +3141,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     err_text = str(e)
                     if (
-                        chunk_reference is not None
+                        not prepared_text
+                        and chunk_reference is not None
                         and (
                             (
                                 "error code: 50035" in err_text
@@ -3190,7 +3200,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        prepared_text: bool = False,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3202,8 +3218,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # _derive_forum_thread_name is defined further down in this same
         # module — no cross-module import needed.
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if prepared_text:
+            chunks = [content]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
         thread_name = _derive_forum_thread_name(content)
 

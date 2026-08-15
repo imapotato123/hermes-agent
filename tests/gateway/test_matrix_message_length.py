@@ -40,3 +40,57 @@ class TestMatrixMaxMessageLength:
         assert adapter.max_message_length == 20000
 
 
+def test_prepared_text_plan_splits_long_matrix_content_into_bounded_posts():
+    adapter = _make_adapter()
+
+    entries = adapter.prepare_text_chunks(
+        "word " * 8000,
+        chat_id="!room:example.org",
+    )
+
+    assert len(entries) > 1
+    assert all(len(entry["content"]) <= adapter.max_message_length for entry in entries)
+    assert all(
+        len(entry["recovered_content"]) <= adapter.max_message_length
+        for entry in entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_posts_exactly_once_without_reformatting():
+    adapter = _make_adapter()
+    adapter._client = MagicMock()
+    adapter._client.send_message_event = AsyncMock(return_value="$event")
+    adapter.format_message = MagicMock(side_effect=AssertionError("already formatted"))
+    adapter.truncate_message = MagicMock(side_effect=AssertionError("already chunked"))
+
+    result = await adapter.send_prepared_text_chunk(
+        "!room:example.org",
+        "prepared **matrix**",
+    )
+
+    assert result.success is True
+    adapter._client.send_message_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prepared_text_does_not_retry_after_ambiguous_e2ee_failure():
+    adapter = _make_adapter()
+    adapter._encryption = True
+    adapter._client = MagicMock()
+    adapter._client.crypto = MagicMock()
+    adapter._client.crypto.share_keys = AsyncMock()
+    adapter._client.send_message_event = AsyncMock(
+        side_effect=RuntimeError("ambiguous transport failure")
+    )
+
+    result = await adapter.send_prepared_text_chunk(
+        "!room:example.org",
+        "prepared matrix post",
+    )
+
+    assert result.success is False
+    adapter._client.send_message_event.assert_awaited_once()
+    adapter._client.crypto.share_keys.assert_not_awaited()
+
+

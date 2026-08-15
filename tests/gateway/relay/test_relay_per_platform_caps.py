@@ -177,6 +177,36 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
     assert adapter.message_len_fn_for_chat("dc-1")(surrogate) == 1
 
 
+@pytest.mark.asyncio
+async def test_relay_prepared_text_uses_destination_cap_and_one_outbound_frame():
+    stub = MultiDescriptorStub(TELEGRAM, DISCORD)
+    stub._identities = [("telegram", "bot-9"), ("discord", "app-1")]
+    adapter = RelayAdapter(PlatformConfig(), TELEGRAM, transport=stub)
+    await adapter.connect()
+    await _push(stub, Platform.DISCORD, "dc-1")
+
+    plan = adapter.prepare_text_chunks(
+        "x" * 5000,
+        chat_id="dc-1",
+        reply_to="m1",
+        metadata=None,
+    )
+
+    assert len(plan) > 1
+    assert all(
+        len(item["content"]) <= 2000
+        and len(item["recovered_content"]) <= 2000
+        for item in plan
+    )
+    before = len(stub.sent)
+    result = await adapter.send_prepared_text_chunk(
+        "dc-1", plan[0]["content"], reply_to="m1"
+    )
+
+    assert result.success is True
+    assert len(stub.sent) == before + 1
+
+
 # ───────────────────── stream consumer integration ─────────────────────
 
 

@@ -645,6 +645,7 @@ class TelegramAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_prepared_text_chunks = True
     # Bot API 10.1 Rich Messages cap the raw markdown/html text at 32,768
     # UTF-8 characters. Content above this is sent via the legacy chunking path.
     RICH_MESSAGE_MAX_CHARS = 32768
@@ -4536,6 +4537,52 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    def prepare_text_chunks(
+        self,
+        content: str,
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
+        """Persist MarkdownV2/UTF-16-safe one-post payloads for recovery."""
+        del chat_id, reply_to, metadata
+        from gateway.delivery_ledger import RECOVERED_MARKER
+
+        formatted = self.format_message(str(content or ""))
+        recovered_prefix = self.format_message(RECOVERED_MARKER)
+        body_limit = self.MAX_MESSAGE_LENGTH - utf16_len(recovered_prefix)
+        if body_limit < 1:
+            raise RuntimeError("Telegram message limit cannot fit recovery marker")
+        chunks = self.truncate_message(
+            formatted,
+            body_limit,
+            len_fn=utf16_len,
+        )
+        if len(chunks) > 1:
+            chunks = [
+                _separate_chunk_indicator_from_fence(
+                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                )
+                for chunk in chunks
+            ]
+        plan = [
+            {
+                "content": chunk,
+                "recovered_content": recovered_prefix + chunk,
+                "reply_to_original": index == 0,
+            }
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+        if any(
+            utf16_len(entry[key]) > self.MAX_MESSAGE_LENGTH
+            for entry in plan
+            for key in ("content", "recovered_content")
+        ):
+            raise RuntimeError("Telegram prepared text exceeds UTF-16 limit")
+        return plan
+
     async def send(
         self,
         chat_id: str,
@@ -4554,14 +4601,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        prepared_text = self._is_prepared_text_metadata(metadata)
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if not prepared_text and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4578,10 +4626,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 pass  # Typing failures are non-fatal
                     return rich_result
 
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            # Prepared durable content is already MarkdownV2-formatted and
+            # bounded by ``prepare_text_chunks``; one call must equal one post.
+            formatted = content if prepared_text else self.format_message(content)
+            chunks = (
+                [formatted]
+                if prepared_text
+                else self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
             )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
@@ -4689,6 +4742,14 @@ class TelegramAdapter(BasePlatformAdapter):
                                 raise
                         break  # success
                     except _NetErr as send_err:
+                        if prepared_text and not (
+                            _BadReq and isinstance(send_err, _BadReq)
+                        ):
+                            return SendResult(
+                                success=False,
+                                error=_redact_telegram_error_text(send_err),
+                                retryable=False,
+                            )
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle

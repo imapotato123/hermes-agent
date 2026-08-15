@@ -369,6 +369,59 @@ class TestTeamsConnect:
 
 class TestTeamsSend:
 
+    def test_prepared_text_plan_splits_long_content_into_bounded_posts(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+
+        entries = adapter.prepare_text_chunks(
+            "word " * 12000,
+            chat_id="conv-id",
+        )
+
+        assert len(entries) > 1
+        assert all(len(entry["content"]) <= adapter.MAX_MESSAGE_LENGTH for entry in entries)
+        assert all(
+            len(entry["recovered_content"]) <= adapter.MAX_MESSAGE_LENGTH
+            for entry in entries
+        )
+
+    @pytest.mark.anyio
+    async def test_prepared_text_posts_exactly_once_without_reformatting(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(return_value=MagicMock(id="msg-123"))
+        adapter._app = mock_app
+        adapter.format_message = MagicMock(side_effect=AssertionError("already formatted"))
+        adapter.truncate_message = MagicMock(side_effect=AssertionError("already chunked"))
+
+        result = await adapter.send_prepared_text_chunk("conv-id", "prepared text")
+
+        assert result.success is True
+        mock_app.send.assert_awaited_once_with("conv-id", "prepared text")
+
+    @pytest.mark.anyio
+    async def test_prepared_reply_failure_does_not_fallback_to_flat_send(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.reply = AsyncMock(side_effect=RuntimeError("ambiguous reply failure"))
+        mock_app.send = AsyncMock()
+        adapter._app = mock_app
+
+        result = await adapter.send_prepared_text_chunk(
+            "conv-id",
+            "prepared reply",
+            reply_to="123",
+        )
+
+        assert result.success is False
+        mock_app.reply.assert_awaited_once_with("conv-id", "123", "prepared reply")
+        mock_app.send.assert_not_awaited()
+
     @pytest.mark.anyio
     async def test_send_calls_app_send(self):
         adapter = TeamsAdapter(_make_config(

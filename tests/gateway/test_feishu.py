@@ -1248,6 +1248,77 @@ class TestAdapterBehavior(unittest.TestCase):
 
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_prepared_text_plan_splits_long_content_into_bounded_posts(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        entries = adapter.prepare_text_chunks(
+            "word " * 4000,
+            chat_id="oc_chat",
+        )
+
+        self.assertGreater(len(entries), 1)
+        self.assertTrue(
+            all(len(entry["content"]) <= adapter.MAX_MESSAGE_LENGTH for entry in entries)
+        )
+        self.assertTrue(
+            all(
+                len(entry["recovered_content"]) <= adapter.MAX_MESSAGE_LENGTH
+                for entry in entries
+            )
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_prepared_text_posts_exactly_once_without_reformatting(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._send_raw_message = AsyncMock(
+            return_value=SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_prepared"),
+            )
+        )
+        adapter.format_message = Mock(side_effect=AssertionError("already formatted"))
+        adapter.truncate_message = Mock(side_effect=AssertionError("already chunked"))
+
+        result = asyncio.run(
+            adapter.send_prepared_text_chunk(
+                "oc_chat",
+                "prepared **post**",
+            )
+        )
+
+        self.assertTrue(result.success)
+        adapter._send_raw_message.assert_awaited_once()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_prepared_text_does_not_retry_after_ambiguous_api_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._send_raw_message = AsyncMock(
+            side_effect=RuntimeError("ambiguous transport failure")
+        )
+
+        result = asyncio.run(
+            adapter.send_prepared_text_chunk(
+                "oc_chat",
+                "prepared post",
+                reply_to="om_parent",
+            )
+        )
+
+        self.assertFalse(result.success)
+        adapter._send_raw_message.assert_awaited_once()
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_every_chunk_of_multi_chunk_markdown(self):
         """Regression for #26841: when a long Markdown message is split
         across multiple chunks, every chunk must go out as

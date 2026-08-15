@@ -75,6 +75,36 @@ class TestSmsFormatAndTruncate:
         result = adapter.format_message("a\n\n\n\nb")
         assert result == "a\n\nb"
 
+    @pytest.mark.asyncio
+    async def test_prepared_segment_is_bounded_and_posts_once(self):
+        adapter = self._make_adapter()
+        response = MagicMock()
+        response.status = 201
+        response.json = AsyncMock(return_value={"sid": "SM1"})
+        context = AsyncMock()
+        context.__aenter__.return_value = response
+        context.__aexit__.return_value = None
+        session = MagicMock()
+        session.post.return_value = context
+        adapter._http_session = session
+
+        plan = adapter.prepare_text_chunks(
+            "x" * 4000, chat_id="+15551234567"
+        )
+        assert len(plan) > 1
+        assert all(
+            len(entry[key]) <= adapter.MAX_MESSAGE_LENGTH
+            for entry in plan
+            for key in ("content", "recovered_content")
+        )
+
+        result = await adapter.send_prepared_text_chunk(
+            "+15551234567", plan[0]["content"]
+        )
+
+        assert result.success is True
+        assert session.post.call_count == 1
+
 
 # ── Echo prevention ────────────────────────────────────────────────
 

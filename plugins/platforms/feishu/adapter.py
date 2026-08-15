@@ -1486,6 +1486,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_prepared_text_chunks = True
 
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
@@ -1956,8 +1957,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        if prepared_text:
+            formatted = content
+            chunks = [content]
+        else:
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         # When chunking splits a long markdown response, an individual chunk
         # can end up as plain prose that doesn't match the per-chunk hint
         # regex — so it would be sent as ``msg_type=text`` and the user would
@@ -1982,7 +1988,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    if (
+                        prepared_text
+                        or msg_type != "post"
+                        or not _POST_CONTENT_INVALID_RE.search(str(exc))
+                    ):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
                     response = await self._feishu_send_with_retry(
@@ -1993,6 +2003,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 if (
+                    not prepared_text
+                    and
                     msg_type == "post"
                     and not self._response_succeeded(response)
                     and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
@@ -4998,7 +5010,9 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
-        for attempt in range(_FEISHU_SEND_ATTEMPTS):
+        prepared_text = self._is_prepared_text_metadata(metadata)
+        attempts = 1 if prepared_text else _FEISHU_SEND_ATTEMPTS
+        for attempt in range(attempts):
             try:
                 response = await self._send_raw_message(
                     chat_id=chat_id,
@@ -5009,7 +5023,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
-                if active_reply_to and not self._response_succeeded(response):
+                if (
+                    not prepared_text
+                    and active_reply_to
+                    and not self._response_succeeded(response)
+                ):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
                         if (metadata or {}).get("thread_id"):
@@ -5041,13 +5059,13 @@ class FeishuAdapter(BasePlatformAdapter):
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
-                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                if attempt >= attempts - 1:
                     raise
                 wait_seconds = 2 ** attempt
                 logger.warning(
                     "[Feishu] Send attempt %d/%d failed for chat %s; retrying in %ds: %s",
                     attempt + 1,
-                    _FEISHU_SEND_ATTEMPTS,
+                    attempts,
                     chat_id,
                     wait_seconds,
                     exc,

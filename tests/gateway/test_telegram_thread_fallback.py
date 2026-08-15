@@ -137,6 +137,43 @@ def _make_adapter():
     return adapter
 
 
+@pytest.mark.asyncio
+async def test_prepared_text_is_utf16_bounded_and_one_physical_post():
+    from gateway.platforms.base import utf16_len
+
+    adapter = _make_adapter()
+    calls = []
+
+    async def mock_send_message(**kwargs):
+        calls.append(dict(kwargs))
+        return SimpleNamespace(message_id=991)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    plan = adapter.prepare_text_chunks(
+        "\U0001f600" * 3000,
+        chat_id="123",
+        reply_to="462",
+        metadata={"thread_id": None},
+    )
+
+    assert len(plan) > 1
+    assert all(
+        utf16_len(entry["content"]) <= adapter.MAX_MESSAGE_LENGTH
+        and utf16_len(entry["recovered_content"]) <= adapter.MAX_MESSAGE_LENGTH
+        for entry in plan
+    )
+    result = await adapter.send_prepared_text_chunk(
+        "123",
+        plan[0]["content"],
+        reply_to="462",
+        metadata={"thread_id": None},
+    )
+
+    assert result.success is True
+    assert len(calls) == 1
+    assert calls[0]["text"] == plan[0]["content"]
+
+
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
     """Reply-derived thread ids in ordinary groups must not create topic lanes."""
     import plugins.platforms.telegram.adapter as telegram_mod
