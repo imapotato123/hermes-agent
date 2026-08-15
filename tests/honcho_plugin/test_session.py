@@ -266,6 +266,22 @@ class TestConcludeToolDispatch:
         assert session.add_message.call_args_list[0].args == ("user", "hello")
         assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
 
+    def test_sync_turn_honors_save_messages_false_as_write_fence(self):
+        provider = HonchoMemoryProvider()
+        provider._session_initialized = True
+        provider._session_key = "webui:production"
+        provider._manager = MagicMock()
+        provider._cron_skipped = False
+        provider._config = SimpleNamespace(
+            message_max_chars=25000,
+            save_messages=False,
+        )
+
+        provider.sync_turn("real user text", "visible assistant answer")
+
+        assert provider._sync_thread is None
+        provider._manager.get_or_create.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Message chunking

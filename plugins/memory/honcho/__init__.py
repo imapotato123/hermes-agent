@@ -1322,6 +1322,13 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if self._cron_skipped:
             return
+        # ``saveMessages`` is the operator's compatibility-preserving write
+        # fence: keep recall/tools available while preventing new conversation
+        # messages from entering Honcho's derivation pipeline.  The config was
+        # historically parsed but not enforced here, so setting it false had
+        # no effect and cleanup could never catch a moving corpus.
+        if self._config is not None and not getattr(self._config, "save_messages", True):
+            return
         if self._recall_mode == "tools" and not self._session_ready():
             return
         if not self._session_ready():
