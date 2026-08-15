@@ -89,6 +89,24 @@ class DeliveryTransport:
         return await self.adapter.send(chat_id, content, metadata=metadata)
 
 
+def relay_fronts_platform(adapter: Any, platform: Optional[Platform]) -> bool:
+    """Return an affirmative relay capability advertisement, fail closed."""
+    if adapter is None or platform is None:
+        return False
+    fronts_platform = getattr(adapter, "fronts_platform", None)
+    if not callable(fronts_platform):
+        return False
+    try:
+        return fronts_platform(platform) is True
+    except Exception:
+        logger.debug(
+            "relay fronts_platform(%s) failed",
+            getattr(platform, "value", platform),
+            exc_info=True,
+        )
+        return False
+
+
 def resolve_delivery_transport(
     platform: Platform,
     config: GatewayConfig,
@@ -116,12 +134,10 @@ def resolve_delivery_transport(
 
     relay = live_adapters.get(Platform.RELAY)
     relay_config = config.platforms.get(Platform.RELAY)
-    fronts_platform = getattr(relay, "fronts_platform", None)
     if (
         relay is not None
         and (relay_config is None or relay_config.enabled)
-        and callable(fronts_platform)
-        and fronts_platform(platform)
+        and relay_fronts_platform(relay, platform)
     ):
         return DeliveryTransport(
             adapter=relay,

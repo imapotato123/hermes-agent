@@ -6,6 +6,7 @@ marker, compare-and-swap cleanup, and promotion into the existing
 ``resume_pending`` recovery path after an unclean exit.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -475,7 +476,7 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
             clear_turn_active=clear_active,
         ),
     )
-    event = SimpleNamespace()
+    event = SimpleNamespace(_relay_durable_handoff=asyncio.Event())
 
     await runner._mark_durable_active_turn(
         cast(Any, event), "resolved-session-key"
@@ -483,6 +484,7 @@ async def test_runner_active_turn_carrier_clears_the_exact_resolved_key():
 
     assert event._gateway_active_turn_session_key == "resolved-session-key"
     assert event._gateway_active_turn_token == "token-1"
+    assert event._relay_durable_handoff.is_set() is True
 
     await runner._clear_durable_active_turn(cast(Any, event))
 

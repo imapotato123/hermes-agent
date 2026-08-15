@@ -65,6 +65,8 @@ def _wire(
 ):
     """A RelayAdapter fronting Slack, with inbound scope + chat_type captured."""
     stub = StubConnector(_slack_desc())
+    platform_value = str(getattr(platform, "value", platform))
+    stub._identities = [(platform_value, f"{platform_value}-test-bot")]
     adapter = RelayAdapter(PlatformConfig(), _slack_desc(), transport=stub)
     src = SessionSource(
         platform=platform,

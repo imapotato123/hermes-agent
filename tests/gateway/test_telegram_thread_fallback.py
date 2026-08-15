@@ -502,6 +502,42 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_media_group_topic_retry_reacquires_replaced_bot(tmp_path):
+    adapter = _make_adapter()
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"png-data")
+    stale_calls = []
+    live_calls = []
+
+    async def live_send_media_group(**kwargs):
+        live_calls.append(dict(kwargs))
+        return [SimpleNamespace(message_id=784)]
+
+    live_bot = SimpleNamespace(send_media_group=live_send_media_group)
+
+    async def stale_send_media_group(**kwargs):
+        stale_calls.append(dict(kwargs))
+        adapter._bot = live_bot
+        raise FakeBadRequest("Message to be replied not found")
+
+    adapter._bot = SimpleNamespace(send_media_group=stale_send_media_group)
+
+    await adapter.send_multiple_images(
+        chat_id="123",
+        images=[(f"file://{image_path}", "caption")],
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert len(stale_calls) == 1
+    assert len(live_calls) == 1
+    assert live_calls[0]["reply_to_message_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_send_image_upload_dm_topic_reply_not_found_retry_drops_thread_id(monkeypatch):
     adapter = _make_adapter()
     call_log = []

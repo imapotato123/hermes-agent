@@ -126,6 +126,31 @@ async def test_transport_descriptor_map_resets_on_redial(monkeypatch):
     assert t._descriptor is None
 
 
+@pytest.mark.asyncio
+async def test_late_secondary_descriptor_notifies_recovery_once():
+    t = _make_transport()
+    loop = asyncio.get_running_loop()
+    t._descriptor_ready = loop.create_future()
+    seen: List[str] = []
+
+    async def on_descriptor(platform: str) -> None:
+        seen.append(platform)
+
+    t.set_descriptor_handler(on_descriptor)
+    await t._handle_frame(
+        json.dumps({"type": "descriptor", "descriptor": TELEGRAM.__dict__})
+    )
+    await t._handle_frame(
+        json.dumps({"type": "descriptor", "descriptor": DISCORD.__dict__})
+    )
+    await t._handle_frame(
+        json.dumps({"type": "descriptor", "descriptor": DISCORD.__dict__})
+    )
+    await asyncio.sleep(0)
+
+    assert seen == ["telegram", "discord"]
+
+
 # ───────────────────── adapter per-chat capability surface ─────────────────────
 
 
