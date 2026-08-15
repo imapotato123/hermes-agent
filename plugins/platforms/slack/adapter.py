@@ -3228,6 +3228,8 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        *,
+        source: Optional[Any] = None,
     ) -> None:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
@@ -3238,6 +3240,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
+        if not images:
+            return
+        if await self._handoff_image_batch_if_replaced(
+            source=source,
+            chat_id=chat_id,
+            images=images,
+            metadata=metadata,
+            human_delay=human_delay,
+        ):
+            return
         if self._is_ignored_channel(chat_id):
             logger.warning(
                 "[Slack] Suppressed multi-image upload in configured ignored channel %s",
@@ -3260,7 +3272,9 @@ class SlackAdapter(BasePlatformAdapter):
                 is_safe_url as _is_safe_url,
             )
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(
+                chat_id, images, metadata, human_delay, source=source
+            )
             return
 
         thread_ts = self._resolve_thread_ts(None, metadata)
@@ -3269,6 +3283,14 @@ class SlackAdapter(BasePlatformAdapter):
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
 
         for chunk_idx, chunk in enumerate(chunks):
+            if await self._handoff_image_batch_if_replaced(
+                source=source,
+                chat_id=chat_id,
+                images=images[chunk_idx * CHUNK :],
+                metadata=metadata,
+                human_delay=human_delay,
+            ):
+                return
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
@@ -3331,6 +3353,15 @@ class SlackAdapter(BasePlatformAdapter):
                 if not file_uploads:
                     continue
 
+                if await self._handoff_image_batch_if_replaced(
+                    source=source,
+                    chat_id=chat_id,
+                    images=images[chunk_idx * CHUNK :],
+                    metadata=metadata,
+                    human_delay=human_delay,
+                ):
+                    return
+
                 initial_comment = (
                     "\n".join(initial_comment_parts) if initial_comment_parts else ""
                 )
@@ -3359,7 +3390,8 @@ class SlackAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 await super().send_multiple_images(
-                    chat_id, chunk, metadata, human_delay=human_delay
+                    chat_id, chunk, metadata, human_delay=human_delay,
+                    source=source,
                 )
 
     def _record_uploaded_file_thread(

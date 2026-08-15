@@ -9,6 +9,8 @@ from hermes_state import SessionDB
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
+    backend_notice_session_key,
+    copy_session_source,
     SessionEntry,
     SessionSource,
     SessionStore,
@@ -55,6 +57,183 @@ class TestSessionSourceRoundtrip:
         assert restored.platform == Platform.LOCAL
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
+        assert restored._legacy_transport_owner_unstamped is False
+
+    def test_explicit_legacy_roundtrip_marks_compatibility_source(self):
+        payload = SessionSource(platform=Platform.SLACK, chat_id="C1").to_dict()
+        restored = SessionSource.from_dict(
+            payload,
+            allow_legacy_unstamped=True,
+        )
+        assert restored._legacy_transport_owner_unstamped is True
+
+    def test_direct_source_is_not_implicitly_legacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        assert source._legacy_transport_owner_unstamped is False
+
+    def test_copy_preserves_stamped_transport_owner_and_live_adapter(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        adapter = MagicMock()
+        source._transport_profile = "coder"
+        source._transport_platform = Platform.RELAY
+        source._transport_identity = "slack:bot-1"
+        source._transport_adapter_ref = lambda: adapter
+        source._untrusted_dynamic_attribute = "must-not-copy"
+
+        copied = copy_session_source(source, thread_id="T1")
+
+        assert copied is not source
+        assert copied.thread_id == "T1"
+        assert copied._transport_profile == "coder"
+        assert copied._transport_platform == Platform.RELAY
+        assert copied._transport_identity == "slack:bot-1"
+        assert copied._transport_adapter_ref() is adapter
+        assert not hasattr(copied, "_untrusted_dynamic_attribute")
+
+    def test_notice_key_uses_stamped_primary_not_routed_runtime_profile(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="routed-runtime",
+        )
+        source._transport_profile = None
+        source._transport_platform = Platform.SLACK
+
+        key = backend_notice_session_key(
+            "agent:routed-runtime:slack:dm:C1",
+            source,
+            fallback_profile="default",
+        )
+
+        assert key == (
+            "profile:7:default:agent:routed-runtime:slack:dm:C1"
+        )
+
+    def test_notice_key_includes_stamped_relay_identity(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.RELAY
+        source._transport_identity = "slack:bot-1"
+
+        key = backend_notice_session_key(
+            "agent:main:slack:dm:C1",
+            source,
+            fallback_profile="default",
+        )
+
+        assert key == (
+            "transport:11:slack:bot-1:"
+            "profile:7:default:agent:main:slack:dm:C1"
+        )
+
+    def test_copy_preserves_explicit_trusted_legacy_state(self):
+        source = SessionSource.from_dict(
+            {"platform": "slack", "chat_id": "C1"},
+            allow_legacy_unstamped=True,
+        )
+
+        copied = copy_session_source(source, thread_id="T1")
+
+        assert copied._legacy_transport_owner_unstamped is True
+        assert not hasattr(copied, "_transport_profile")
+
+    def test_stamped_roundtrip_is_not_legacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.SLACK
+
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert restored._legacy_transport_owner_unstamped is False
+
+    def test_session_entry_load_marks_only_unstamped_origin_as_legacy(self):
+        entry = SessionEntry(
+            session_key="agent:main:slack:dm:C1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=SessionSource(platform=Platform.SLACK, chat_id="C1"),
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.origin is not None
+        assert restored.origin._legacy_transport_owner_unstamped is True
+
+    def test_session_entry_load_preserves_stamped_origin_as_nonlegacy(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.SLACK
+        entry = SessionEntry(
+            session_key="agent:main:slack:dm:C1",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.origin is not None
+        assert restored.origin._legacy_transport_owner_unstamped is False
+
+    def test_transport_owner_roundtrips_independently_from_runtime_profile(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            profile="routed-runtime",
+        )
+        source._transport_profile = "coder"
+        source._transport_platform = Platform.SLACK
+        source._transport_identity = "slack:bot-1"
+
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(payload)
+
+        assert payload["transport_owner_stamped"] is True
+        assert payload["transport_profile"] == "coder"
+        assert payload["transport_platform"] == "slack"
+        assert restored.profile == "routed-runtime"
+        assert restored._transport_profile == "coder"
+        assert restored._transport_platform == Platform.SLACK
+        assert restored._transport_identity == "slack:bot-1"
+
+    def test_explicit_primary_transport_owner_roundtrips_as_stamped_none(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+        source._transport_profile = None
+        source._transport_platform = Platform.SLACK
+
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert "_transport_profile" in restored.__dict__
+        assert restored._transport_profile is None
+        assert restored._transport_platform == Platform.SLACK
+
+    def test_legacy_source_remains_unstamped(self):
+        restored = SessionSource.from_dict(
+            {"platform": "slack", "chat_id": "C1", "profile": "coder"}
+        )
+
+        assert "_transport_profile" not in restored.__dict__
+        assert "_transport_platform" not in restored.__dict__
+
+    def test_relay_transport_roundtrips_without_persisting_upstream_trust(self):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="C1",
+            delivered_via_upstream_relay=True,
+        )
+        source._transport_profile = None
+        source._transport_platform = Platform.RELAY
+        source._transport_identity = "discord:app-1"
+
+        payload = source.to_dict()
+        restored = SessionSource.from_dict(payload)
+
+        assert restored._transport_platform == Platform.RELAY
+        assert restored._transport_profile is None
+        assert restored._transport_identity == "discord:app-1"
+        assert restored.delivered_via_upstream_relay is False
 
 
 class TestSessionSourceDescription:
@@ -72,6 +251,41 @@ class TestSessionSourceDescription:
         )
         assert "DM" in source.description
         assert "bob" in source.description
+
+
+def test_session_entry_roundtrip_preserves_relay_delivery_owner():
+    now = datetime.now()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="C1",
+        scope_id="guild-1",
+        user_id="user-1",
+        chat_type="channel",
+        profile="coder",
+        delivered_via_upstream_relay=True,
+    )
+    source._transport_profile = None
+    source._transport_platform = Platform.RELAY
+    source._transport_identity = "discord:app-1"
+    entry = SessionEntry(
+        session_key="profile:coder:discord:channel:C1",
+        session_id="session-1",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+    )
+
+    restored = SessionEntry.from_dict(entry.to_dict())
+
+    assert restored.origin is not None
+    assert restored.origin.platform == Platform.DISCORD
+    assert restored.origin.profile == "coder"
+    assert restored.origin.scope_id == "guild-1"
+    assert restored.origin.user_id == "user-1"
+    assert restored.origin._transport_platform == Platform.RELAY
+    assert restored.origin._transport_profile is None
+    assert restored.origin._transport_identity == "discord:app-1"
+    assert restored.origin.delivered_via_upstream_relay is False
 
 
 class TestLocalCliFactory:

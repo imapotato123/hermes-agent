@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import SendResult
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
@@ -199,8 +200,13 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        adapter_resolver: Optional[Callable[[], Any]] = None,
     ):
         self.adapter = adapter
+        # Gateway-owned consumers resolve the stamped physical owner before
+        # every platform operation. Standalone/plugin callers that omit the
+        # resolver retain the historical captured-adapter contract.
+        self._adapter_resolver = adapter_resolver
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
@@ -241,6 +247,11 @@ class GatewayStreamConsumer:
         # the run-wide set for fresh-final bookkeeping, but a failure recovery
         # must never delete an earlier finalized preamble/commentary message.
         self._segment_preview_message_ids: "set[str]" = set()
+        # Physical adapter generation that created each addressable message.
+        # Message IDs are scoped to that transport session/credential owner:
+        # after reconnect, a replacement may accept fresh sends but must never
+        # edit or delete an ID minted by the retired adapter.
+        self._message_owners: dict[str, Any] = {}
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
@@ -321,6 +332,63 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
 
+    def _current_adapter(self) -> Any:
+        """Return the current physical owner, or ``None`` when it vanished."""
+        if self._adapter_resolver is None:
+            return self.adapter
+        try:
+            return self._adapter_resolver()
+        except Exception:
+            logger.debug("stream adapter resolution failed", exc_info=True)
+            return None
+
+    def _current_operation(self, name: str) -> tuple[Any, Any]:
+        adapter = self._current_adapter()
+        method = getattr(adapter, name, None) if adapter is not None else None
+        return adapter, method if callable(method) else None
+
+    async def _call_operation(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        _adapter, result = await self._call_operation_with_adapter(
+            name, *args, **kwargs
+        )
+        return result
+
+    async def _call_operation_with_adapter(
+        self, name: str, *args: Any, **kwargs: Any
+    ) -> tuple[Any, Any]:
+        adapter, method = self._current_operation(name)
+        if method is None:
+            return (
+                None,
+                SendResult(
+                    success=False,
+                    error="stamped transport owner unavailable",
+                ),
+            )
+        return adapter, await method(*args, **kwargs)
+
+    def _message_owner_matches(self, message_id: str, adapter: Any) -> bool:
+        """Whether *adapter* may mutate *message_id*.
+
+        IDs without a recorded owner predate this consumer's send tracking
+        (including legacy callers/tests that seed ``_message_id`` directly), so
+        they retain the historical current-adapter behavior. Every ID minted by
+        this consumer is stamped and therefore fails closed across replacement.
+        """
+        owner = self._message_owners.get(str(message_id))
+        return owner is None or owner is adapter
+
+    async def _delete_owned_message(self, message_id: str) -> None:
+        """Best-effort delete without crossing adapter generations."""
+        adapter, delete_message = self._current_operation("delete_message")
+        if (
+            adapter is None
+            or delete_message is None
+            or not self._message_owner_matches(message_id, adapter)
+        ):
+            return
+        await delete_message(self.chat_id, message_id)
+
     def _metadata_for_send(
         self,
         *,
@@ -399,9 +467,20 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
+        adapter, edit_message = self._current_operation("edit_message")
+        if adapter is None or edit_message is None:
+            return SendResult(
+                success=False,
+                error="stamped transport owner unavailable",
+            )
+        if not self._message_owner_matches(message_id, adapter):
+            return SendResult(
+                success=False,
+                error="message transport owner generation changed",
+            )
         if self.metadata:
             try:
-                params = inspect.signature(self.adapter.edit_message).parameters
+                params = inspect.signature(edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
@@ -409,7 +488,10 @@ class GatewayStreamConsumer:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        result = await edit_message(**kwargs)
+        if getattr(result, "success", False):
+            self._track_preview_ids_from_result(result, adapter=adapter)
+        return result
 
     def _append_accumulated(self, text: str) -> None:
         """Append to the live buffer and the split-stable stream ledger."""
@@ -1277,7 +1359,8 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
+            adapter, result = await self._call_operation_with_adapter(
+                "send",
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
@@ -1288,7 +1371,7 @@ class GatewayStreamConsumer:
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
-                self._track_preview_ids_from_result(result)
+                self._track_preview_ids_from_result(result, adapter=adapter)
                 self._already_sent = True
                 self._last_sent_text = text
                 # Fresh content bubble — close off any stale tool bubble
@@ -1492,8 +1575,10 @@ class GatewayStreamConsumer:
         for chunk in chunks:
             # Try sending with one retry on flood-control errors.
             result = None
+            adapter = None
             for attempt in range(2):
-                result = await self.adapter.send(
+                adapter, result = await self._call_operation_with_adapter(
+                    "send",
                     chat_id=self.chat_id,
                     content=chunk,
                     metadata=self._metadata_for_send(final=True),
@@ -1533,6 +1618,8 @@ class GatewayStreamConsumer:
             sent_any_chunk = True
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
+            if result.message_id:
+                self._message_owners[str(result.message_id)] = adapter
             # Each fallback chunk is a fresh platform message — notify
             # so any stale tool-progress bubble gets closed off.
             self._notify_new_message()
@@ -1553,15 +1640,13 @@ class GatewayStreamConsumer:
             and not self._fallback_preserve_partial_messages
             and continuation == final_text
         ):
-            delete_fn = getattr(self.adapter, "delete_message", None)
-            if delete_fn is not None:
-                try:
-                    await delete_fn(self.chat_id, stale_message_id)
-                except Exception as e:
-                    logger.debug(
-                        "Fallback partial cleanup failed (%s): %s",
-                        stale_message_id, e,
-                    )
+            try:
+                await self._delete_owned_message(stale_message_id)
+            except Exception as e:
+                logger.debug(
+                    "Fallback partial cleanup failed (%s): %s",
+                    stale_message_id, e,
+                )
 
         self._message_id = last_message_id
         self._already_sent = True
@@ -1593,9 +1678,11 @@ class GatewayStreamConsumer:
             stale_ids.add(str(self._message_id))
 
         result = None
+        adapter = None
         for attempt in range(2):
             try:
-                result = await self.adapter.send(
+                adapter, result = await self._call_operation_with_adapter(
+                    "send",
                     chat_id=self.chat_id,
                     content=final_text,
                     metadata=self._metadata_for_send(final=True),
@@ -1625,19 +1712,19 @@ class GatewayStreamConsumer:
             )
 
         new_message_id = getattr(result, "message_id", None)
-        delete_fn = getattr(self.adapter, "delete_message", None)
-        if delete_fn is not None:
-            for stale_id in stale_ids:
-                if not stale_id or stale_id == new_message_id:
-                    continue
-                try:
-                    await delete_fn(self.chat_id, stale_id)
-                except Exception as exc:
-                    logger.debug(
-                        "Empty fallback preview cleanup failed (%s): %s",
-                        stale_id,
-                        exc,
-                    )
+        if new_message_id:
+            self._message_owners[str(new_message_id)] = adapter
+        for stale_id in stale_ids:
+            if not stale_id or stale_id == new_message_id:
+                continue
+            try:
+                await self._delete_owned_message(stale_id)
+            except Exception as exc:
+                logger.debug(
+                    "Empty fallback preview cleanup failed (%s): %s",
+                    stale_id,
+                    exc,
+                )
 
         self._segment_preview_message_ids = set()
         self._message_id = new_message_id or "__no_edit__"
@@ -1751,7 +1838,8 @@ class GatewayStreamConsumer:
             self._use_draft_streaming = False
             return False
         try:
-            result = await self.adapter.send_draft(
+            result = await self._call_operation(
+                "send_draft",
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
@@ -1799,7 +1887,8 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
-            result = await self.adapter.send(
+            result = await self._call_operation(
+                "send",
                 chat_id=self.chat_id,
                 content=tail,
                 metadata=self.metadata,
@@ -1836,7 +1925,8 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            result = await self.adapter.send(
+            result = await self._call_operation(
+                "send",
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self.metadata,
@@ -1912,24 +2002,36 @@ class GatewayStreamConsumer:
                 return cap
         return base
 
-    def _track_preview_id(self, message_id: Optional[str]) -> None:
-        """Record a real preview message id for finalization cleanup."""
+    def _track_preview_id(
+        self,
+        message_id: Optional[str],
+        *,
+        adapter: Any = None,
+    ) -> None:
+        """Record a real preview ID and the adapter generation that minted it."""
         if message_id and message_id != "__no_edit__":
             message_id = str(message_id)
             self._preview_message_ids.add(message_id)
             self._segment_preview_message_ids.add(message_id)
+            if adapter is not None:
+                self._message_owners[message_id] = adapter
 
-    def _track_preview_ids_from_result(self, result: Any) -> None:
+    def _track_preview_ids_from_result(
+        self,
+        result: Any,
+        *,
+        adapter: Any = None,
+    ) -> None:
         """Record every message id a send/edit result exposes: the primary id
         plus any continuation ids from an oversized split
         (``continuation_message_ids`` or ``raw_response['message_ids']``)."""
-        self._track_preview_id(getattr(result, "message_id", None))
+        self._track_preview_id(getattr(result, "message_id", None), adapter=adapter)
         for mid in (getattr(result, "continuation_message_ids", None) or ()):
-            self._track_preview_id(mid)
+            self._track_preview_id(mid, adapter=adapter)
         raw = getattr(result, "raw_response", None) or {}
         if isinstance(raw, dict):
             for mid in (raw.get("message_ids") or ()):
-                self._track_preview_id(mid)
+                self._track_preview_id(mid, adapter=adapter)
 
     def _adapter_prefers_fresh_final(self, text: str) -> bool:
         """Return True when the adapter would rather finalize a streamed reply
@@ -1991,7 +2093,8 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            result = await self.adapter.send(
+            adapter, result = await self._call_operation_with_adapter(
+                "send",
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self._metadata_for_send(final=True),
@@ -2005,24 +2108,24 @@ class GatewayStreamConsumer:
         # callers (e.g. overflow split loops, finalize retries) see a
         # consistent state.
         new_message_id = getattr(result, "message_id", None)
+        if new_message_id:
+            self._message_owners[str(new_message_id)] = adapter
         # Successful fresh send — try to delete the stale preview(s) so the
         # user doesn't see the old edit-stuck message(s) underneath.  Cleanup
         # is best-effort; platforms that don't implement ``delete_message``
         # just leave the preview behind (still an acceptable outcome — the
         # visible final timestamp is the important part).  Never delete the
         # message we just sent.
-        delete_fn = getattr(self.adapter, "delete_message", None)
-        if delete_fn is not None:
-            for stale_id in stale_ids:
-                if not stale_id or stale_id == "__no_edit__" or stale_id == new_message_id:
-                    continue
-                try:
-                    await delete_fn(self.chat_id, stale_id)
-                except Exception as e:
-                    logger.debug(
-                        "Fresh-final preview cleanup failed (%s): %s",
-                        stale_id, e,
-                    )
+        for stale_id in stale_ids:
+            if not stale_id or stale_id == "__no_edit__" or stale_id == new_message_id:
+                continue
+            try:
+                await self._delete_owned_message(stale_id)
+            except Exception as e:
+                logger.debug(
+                    "Fresh-final preview cleanup failed (%s): %s",
+                    stale_id, e,
+                )
         self._preview_message_ids = set()
         if new_message_id:
             self._message_id = new_message_id
@@ -2058,18 +2161,16 @@ class GatewayStreamConsumer:
         stale_ids = set(self._preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
-        delete_fn = getattr(self.adapter, "delete_message", None)
-        if delete_fn is not None:
-            for stale_id in stale_ids:
-                if not stale_id or stale_id == "__no_edit__":
-                    continue
-                try:
-                    await delete_fn(self.chat_id, stale_id)
-                except Exception as e:
-                    logger.debug(
-                        "Silence-marker preview cleanup failed (%s): %s",
-                        stale_id, e,
-                    )
+        for stale_id in stale_ids:
+            if not stale_id or stale_id == "__no_edit__":
+                continue
+            try:
+                await self._delete_owned_message(stale_id)
+            except Exception as e:
+                logger.debug(
+                    "Silence-marker preview cleanup failed (%s): %s",
+                    stale_id, e,
+                )
         self._preview_message_ids = set()
         self._message_id = None
         self._accumulated = ""
@@ -2175,6 +2276,20 @@ class GatewayStreamConsumer:
                         finalize and self._adapter_requires_finalize
                     ):
                         return True
+                    current_adapter = self._current_adapter()
+                    if not self._message_owner_matches(
+                        self._message_id, current_adapter
+                    ):
+                        # The current transport owner cannot address an ID
+                        # created by the retired generation. Final content is
+                        # safe to re-send through the replacement; intermediate
+                        # frames remain buffered for that final handoff.
+                        if finalize:
+                            return await self._try_fresh_final(
+                                text,
+                                is_turn_final=is_turn_final,
+                            )
+                        return False
                     # Fresh-final for long-lived previews: when finalizing
                     # the last edit in a streaming sequence, if the
                     # original preview has been visible for at least
@@ -2392,7 +2507,8 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
+                adapter, result = await self._call_operation_with_adapter(
+                    "send",
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,
@@ -2410,7 +2526,7 @@ class GatewayStreamConsumer:
                         self._message_created_ts = time.monotonic()
                         # Record this (and any continuation fragments from an
                         # oversized first send) for fresh-final cleanup.
-                        self._track_preview_ids_from_result(result)
+                        self._track_preview_ids_from_result(result, adapter=adapter)
                     else:
                         self._edit_supported = False
                     self._already_sent = True

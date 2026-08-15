@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, Iterable, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -2435,12 +2435,17 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    backend_notice_session_key,
     build_session_context,
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    copy_session_source,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    session_source_from_trusted_marker,
+    source_is_legacy_unstamped,
+    stamp_source_transport_owner,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -2463,6 +2468,8 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
+    BackendNoticeState,
+    BackendUnavailableReply,
     BasePlatformAdapter,
     EphemeralReply,
     MessageEvent,
@@ -2499,6 +2506,31 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_BACKEND_UNAVAILABLE_FAILURE_REASONS = frozenset({
+    "overloaded",
+    "server_error",
+    "timeout",
+})
+_BACKEND_UNAVAILABLE_NOTICE = (
+    "The AI backend is temporarily unavailable. "
+    "Please try sending your message again in a moment."
+)
+
+
+def _is_backend_unavailable_agent_result(agent_result: dict) -> bool:
+    """Whether a failed agent result represents a transient backend outage.
+
+    The agent retry loop emits this structured classification.  Do not infer
+    it from exceptions at the adapter layer, where a connection failure may
+    belong to Slack, Telegram, media delivery, storage, or another subsystem.
+    """
+    return bool(
+        agent_result.get("failed")
+        and agent_result.get("failure_reason")
+        in _BACKEND_UNAVAILABLE_FAILURE_REASONS
+    )
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -3810,6 +3842,39 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
 
+    def _live_adapter(self) -> Any:
+        resolver = self._ctx._live_adapter
+        return resolver() if callable(resolver) else self._ctx._status_adapter
+
+    def _live_operation(self, name: str) -> tuple[Any, Any]:
+        resolver = self._ctx._live_operation
+        if callable(resolver):
+            return resolver(name)
+        adapter = self._live_adapter()
+        method = getattr(adapter, name, None) if adapter is not None else None
+        return adapter, method if callable(method) else None
+
+    async def _call_live(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        _adapter, result = await self._call_live_with_adapter(
+            name, *args, **kwargs
+        )
+        return result
+
+    async def _call_live_with_adapter(
+        self, name: str, *args: Any, **kwargs: Any
+    ) -> tuple[Any, Any]:
+        adapter, method = self._live_operation(name)
+        if method is None:
+            from gateway.platforms.base import SendResult
+            return (
+                None,
+                SendResult(
+                    success=False,
+                    error="stamped transport owner unavailable",
+                ),
+            )
+        return adapter, await method(*args, **kwargs)
+
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
@@ -3826,17 +3891,29 @@ class TurnRunner:
             and tool_name != "_thinking"
         ):
             try:
-                if event_type == "tool.started" and tool_name and ctx._run_still_current():
+                _status_state_adapter = self._live_adapter()
+                if not getattr(
+                    _status_state_adapter, "supports_status_text", False
+                ):
+                    _status_state_adapter = None
+                if (
+                    _status_state_adapter is not None
+                    and event_type == "tool.started"
+                    and tool_name
+                    and ctx._run_still_current()
+                ):
                     from agent.display import build_status_phrase
                     _phrase = build_status_phrase(
                         tool_name,
                         args if ctx._live_status_mode == "full" else None,
                     )
-                    ctx._live_status_adapter.set_status_text(ctx.source.chat_id, _phrase)
-                elif event_type == "tool.completed":
+                    _status_state_adapter.set_status_text(
+                        ctx.source.chat_id, _phrase
+                    )
+                elif _status_state_adapter is not None and event_type == "tool.completed":
                     # Between tools the model is genuinely "thinking"
                     # again — revert to the static default.
-                    ctx._live_status_adapter.set_status_text(ctx.source.chat_id, None)
+                    _status_state_adapter.set_status_text(ctx.source.chat_id, None)
             except Exception as _ls_err:
                 logger.debug("live status update failed: %s", _ls_err)
         # "log" mode: append tool.started lines to the log queue and stay
@@ -4076,7 +4153,7 @@ class TurnRunner:
         if not ctx.progress_queue:
             return
 
-        adapter = self._runner._adapter_for_source(ctx.source)
+        adapter = self._live_adapter()
         if not adapter:
             return
 
@@ -4097,6 +4174,7 @@ class TurnRunner:
 
         progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
         progress_msg_id = None   # ID of the current progress message to edit
+        progress_msg_owner = None  # Adapter generation that minted progress_msg_id
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
@@ -4150,11 +4228,25 @@ class TurnRunner:
                 "message_id": message_id,
                 "content": content,
             }
-            if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+            _edit_adapter, edit_message = self._live_operation("edit_message")
+            if edit_message is None or (
+                progress_msg_owner is not None
+                and _edit_adapter is not progress_msg_owner
+            ):
+                from gateway.platforms.base import SendResult
+                return SendResult(
+                    success=False,
+                    error=(
+                        "stamped transport owner unavailable"
+                        if edit_message is None
+                        else "message transport owner generation changed"
+                    ),
+                )
+            if getattr(_edit_adapter, "REQUIRES_EDIT_FINALIZE", False):
                 kwargs["finalize"] = True
             if _edit_accepts_metadata:
                 kwargs["metadata"] = ctx._progress_metadata
-            return await adapter.edit_message(**kwargs)
+            return await edit_message(**kwargs)
 
         def _progress_text(lines: list) -> str:
             return "\n".join(str(line) for line in lines)
@@ -4174,23 +4266,26 @@ class TurnRunner:
                 groups.append(current)
             return groups
 
-        def _track_progress_result(result) -> None:
+        def _track_progress_result(result, owner) -> None:
             if (
                 ctx._cleanup_progress
                 and getattr(result, "success", False)
                 and getattr(result, "message_id", None)
             ):
-                ctx._cleanup_msg_ids.append(str(result.message_id))
+                _mid = str(result.message_id)
+                ctx._cleanup_msg_ids.append(_mid)
+                ctx._cleanup_msg_owners[_mid] = owner
 
         async def _send_progress_text(text: str):
-            result = await adapter.send(
+            owner, result = await self._call_live_with_adapter(
+                "send",
                 chat_id=ctx.source.chat_id,
                 content=text,
                 reply_to=ctx._progress_reply_to,
                 metadata=ctx._progress_metadata,
             )
-            _track_progress_result(result)
-            return result
+            _track_progress_result(result, owner)
+            return owner, result
 
         async def _roll_progress_overflow_if_needed() -> bool:
             """Start fresh editable progress bubbles before a bubble exceeds limit.
@@ -4200,7 +4295,14 @@ class TurnRunner:
                 intact for a later retry.  In either case the caller should skip
                 the normal send/edit path for this tick.
                 """
-            nonlocal progress_msg_id, progress_lines, can_edit
+            nonlocal progress_msg_id, progress_msg_owner, progress_lines, can_edit
+            if (
+                progress_msg_id is not None
+                and progress_msg_owner is not None
+                and self._live_adapter() is not progress_msg_owner
+            ):
+                progress_msg_id = None
+                progress_msg_owner = None
             if not progress_lines or not can_edit:
                 return False
             groups = _split_progress_groups(progress_lines)
@@ -4221,12 +4323,14 @@ class TurnRunner:
                     # Fall back to the existing non-edit behavior below.
                     return False
             else:
-                result = await _send_progress_text(first_text)
+                progress_msg_owner, result = await _send_progress_text(first_text)
                 if result.success and result.message_id:
                     progress_msg_id = result.message_id
 
             for group in groups[1:]:
-                result = await _send_progress_text(_progress_text(group))
+                progress_msg_owner, result = await _send_progress_text(
+                    _progress_text(group)
+                )
                 if result.success and result.message_id:
                     progress_msg_id = result.message_id
 
@@ -4280,6 +4384,7 @@ class TurnRunner:
                     # on the content side. (Issue: tool + content
                     # linearization regression after PR #7885.)
                     progress_msg_id = None
+                    progress_msg_owner = None
                     progress_lines = []
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
@@ -4292,7 +4397,11 @@ class TurnRunner:
                     _last_edit_ts = time.monotonic()
                     await asyncio.sleep(0.3)
                     if ctx._run_still_current():
-                        await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                        await self._call_live(
+                            "send_typing",
+                            ctx.source.chat_id,
+                            metadata=ctx._progress_metadata,
+                        )
                     continue
 
                 # Throttle edits: batch rapid tool updates into fewer
@@ -4310,6 +4419,14 @@ class TurnRunner:
 
                 if not ctx._run_still_current():
                     return
+
+                if (
+                    progress_msg_id is not None
+                    and progress_msg_owner is not None
+                    and self._live_adapter() is not progress_msg_owner
+                ):
+                    progress_msg_id = None
+                    progress_msg_owner = None
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
@@ -4338,47 +4455,64 @@ class TurnRunner:
                             _last_edit_ts = time.monotonic()
                         else:
                             can_edit = False
-                        _flood_result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        _flood_owner, _flood_result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=msg,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                         if (
                             ctx._cleanup_progress
                             and getattr(_flood_result, "success", False)
                             and getattr(_flood_result, "message_id", None)
                         ):
-                            ctx._cleanup_msg_ids.append(str(_flood_result.message_id))
+                            _mid = str(_flood_result.message_id)
+                            ctx._cleanup_msg_ids.append(_mid)
+                            ctx._cleanup_msg_owners[_mid] = _flood_owner
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
                         full_text = "\n".join(progress_lines)
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=full_text,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        progress_msg_owner, result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=full_text,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                     else:
                         # Editing unsupported: send just this line
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
+                        progress_msg_owner, result = (
+                            await self._call_live_with_adapter(
+                                "send",
+                                chat_id=ctx.source.chat_id,
+                                content=msg,
+                                reply_to=ctx._progress_reply_to,
+                                metadata=ctx._progress_metadata,
+                            )
                         )
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
                         if ctx._cleanup_progress:
-                            ctx._cleanup_msg_ids.append(str(result.message_id))
+                            _mid = str(result.message_id)
+                            ctx._cleanup_msg_ids.append(_mid)
+                            ctx._cleanup_msg_owners[_mid] = progress_msg_owner
 
                 _last_edit_ts = time.monotonic()
 
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
                 if ctx._run_still_current():
-                    await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+                    await self._call_live(
+                        "send_typing",
+                        ctx.source.chat_id,
+                        metadata=ctx._progress_metadata,
+                    )
 
             except queue.Empty:
                 await asyncio.sleep(0.3)
@@ -4404,6 +4538,7 @@ class TurnRunner:
                                 except Exception:
                                     pass
                             progress_msg_id = None
+                            progress_msg_owner = None
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
@@ -4434,12 +4569,12 @@ class TurnRunner:
         if not ctx._run_still_current():
             return
         ctx._voice_ack_fired[0] = True
-        _adapter = self._runner.adapters.get(Platform.DISCORD)
-        if _adapter is None or not hasattr(_adapter, "play_ack_in_voice"):
+        _adapter, _play_ack = self._live_operation("play_ack_in_voice")
+        if _adapter is None or _play_ack is None:
             return
         try:
             safe_schedule_threadsafe(
-                _adapter.play_ack_in_voice(ctx._voice_ack_guild[0]),
+                _play_ack(ctx._voice_ack_guild[0]),
                 ctx._voice_ack_loop,
                 logger=logger,
                 log_message="voice ack scheduling error",
@@ -4545,6 +4680,7 @@ class TurnRunner:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
             return
+
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
             event_type,
@@ -4558,8 +4694,20 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        async def _send_live_status():
+            adapter = self._live_adapter()
+            if adapter is None:
+                return None
+            return adapter, await _send_or_update_status_coro(
+                adapter,
+                ctx._status_chat_id,
+                event_type,
+                prepared_message,
+                ctx._status_thread_metadata,
+            )
+
         _fut = safe_schedule_threadsafe(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
+            _send_live_status(),
             ctx._loop_for_step,
             logger=logger,
             log_message=f"status_callback ({event_type}) scheduling error",
@@ -4569,12 +4717,14 @@ class TurnRunner:
         if ctx._cleanup_progress:
             def _track_status_id(fut) -> None:
                 try:
-                    res = fut.result()
+                    owner, res = fut.result()
                 except Exception:
                     return
                 mid = getattr(res, "message_id", None)
                 if getattr(res, "success", False) and mid:
-                    ctx._cleanup_msg_ids.append(str(mid))
+                    _mid = str(mid)
+                    ctx._cleanup_msg_ids.append(_mid)
+                    ctx._cleanup_msg_owners[_mid] = owner
             _fut.add_done_callback(_track_status_id)
 
     def run_sync(self):
@@ -4705,6 +4855,7 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        adapter_resolver=ctx._live_adapter,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -4735,10 +4886,11 @@ class TurnRunner:
                 else:
                     _stream_consumer.on_commentary(display_text)
                 return
-            if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
+            if already_streamed or not str(display_text or "").strip():
                 return
             safe_schedule_threadsafe(
-                ctx._status_adapter.send(
+                self._call_live(
+                    "send",
                     ctx._status_chat_id,
                     display_text,
                     metadata=ctx._status_thread_metadata,
@@ -5103,10 +5255,11 @@ class TurnRunner:
         _bg_review_pending_lock = threading.Lock()
 
         def _deliver_bg_review_message(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if not ctx._run_still_current():
                 return
             safe_schedule_threadsafe(
-                ctx._status_adapter.send(
+                self._call_live(
+                    "send",
                     ctx._status_chat_id,
                     message,
                     metadata=_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform),
@@ -5126,7 +5279,7 @@ class TurnRunner:
 
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            if not ctx._run_still_current():
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -5138,15 +5291,20 @@ class TurnRunner:
         agent.background_review_callback = _bg_review_send
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
-        if ctx._status_adapter and ctx.session_key:
-            if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
-                ctx._status_adapter.register_post_delivery_callback(
+        if ctx.session_key:
+            _callback_adapter = self._live_adapter()
+            if _callback_adapter and getattr(
+                type(_callback_adapter),
+                "register_post_delivery_callback",
+                None,
+            ) is not None:
+                _callback_adapter.register_post_delivery_callback(
                     ctx.session_key,
                     _release_bg_review_messages,
                     generation=ctx.run_generation,
                 )
-            else:
-                _pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
+            elif _callback_adapter is not None:
+                _pdc = getattr(_callback_adapter, "_post_delivery_callbacks", None)
                 if _pdc is not None:
                     _pdc[ctx.session_key] = _release_bg_review_messages
         # Memory update notifications in chat.  Config: display.memory_notifications
@@ -5173,7 +5331,7 @@ class TurnRunner:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
-            if not ctx._status_adapter:
+            if self._live_adapter() is None:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
@@ -5190,7 +5348,11 @@ class TurnRunner:
             # an "Other" response on platforms that disable input while
             # typing is active (Slack Assistant API).
             try:
-                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+                _pause_adapter, pause_typing = self._live_operation(
+                    "pause_typing_for_chat"
+                )
+                if pause_typing is not None:
+                    pause_typing(ctx._status_chat_id)
             except Exception:
                 pass
 
@@ -5215,7 +5377,8 @@ class TurnRunner:
 
             send_ok = False
             fut = safe_schedule_threadsafe(
-                ctx._status_adapter.send_clarify(
+                self._call_live(
+                    "send_clarify",
                     chat_id=ctx._status_chat_id,
                     question=question,
                     choices=list(choices) if choices else None,
@@ -5350,7 +5513,11 @@ class TurnRunner:
             # is active.  The approval message send auto-clears the Slack
             # status; pausing prevents _keep_typing from re-setting it.
             # Typing resumes in _handle_approve_command/_handle_deny_command.
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            _pause_adapter, pause_typing = self._live_operation(
+                "pause_typing_for_chat"
+            )
+            if pause_typing is not None:
+                pause_typing(ctx._status_chat_id)
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
@@ -5366,10 +5533,14 @@ class TurnRunner:
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+            _approval_adapter, _send_exec = self._live_operation(
+                "send_exec_approval"
+            )
+            if _send_exec is not None:
                 try:
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
+                        self._call_live(
+                            "send_exec_approval",
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
@@ -5401,7 +5572,7 @@ class TurnRunner:
             # typed prefix so Slack/Matrix users are told the form they
             # can actually type (`!approve`) — typed "/" is blocked in
             # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
+            _p = getattr(self._live_adapter(), "typed_command_prefix", "/")
             msg = _format_exec_approval_fallback(
                 cmd,
                 desc,
@@ -5412,7 +5583,8 @@ class TurnRunner:
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
+                    self._call_live(
+                        "send",
                         ctx._status_chat_id,
                         msg,
                         metadata=ctx._status_thread_metadata,
@@ -5956,6 +6128,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.__dict__["_sessions"] = sessions
         return sessions
 
+    def _backend_notice_state_for_adapters(self) -> BackendNoticeState:
+        """Return runner-owned notice state, tolerating partial test runners."""
+        state = self.__dict__.get("_backend_notice_state")
+        if state is None:
+            state = BackendNoticeState()
+            self.__dict__["_backend_notice_state"] = state
+        return state
+
+    def _share_backend_notice_state(
+        self,
+        adapter: Any,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Wire runner routing and profile-scoped state across reconnects."""
+        # All adapters participate in replacement routing, including direct
+        # built-ins created outside plugin factories.
+        adapter.gateway_runner = self
+        if not profile_name:
+            try:
+                profile_name = self._active_profile_name()
+            except Exception:
+                profile_name = None
+        # ``source.profile`` is the runtime/session namespace and may be changed
+        # by a chat-based profile route. Keep the credential/transport owner
+        # separately so an in-flight turn can find this adapter's replacement.
+        # Relay is a single process-level socket shared across runtime profiles,
+        # so its owner profile is intentionally ``None`` and route discovery
+        # advertises that exact durable identity.
+        if getattr(adapter, "platform", None) == Platform.RELAY:
+            adapter._transport_profile = None
+        else:
+            adapter._transport_profile = str(profile_name or "").strip() or None
+        setter = getattr(adapter, "set_backend_notice_state", None)
+        if callable(setter):
+            setter(
+                self._backend_notice_state_for_adapters(),
+                profile_name=profile_name,
+            )
+
     def _session_state(self, session_key: str) -> "SessionState":
         """Get-or-create the :class:`SessionState` for ``session_key``."""
         sessions = self._sessions_map()
@@ -6014,6 +6225,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._backend_notice_state = BackendNoticeState()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -7060,7 +7272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         if recovered is None:
             return source
-        return dataclasses.replace(source, thread_id=recovered)
+        return copy_session_source(source, thread_id=recovered)
 
     def _resolve_session_agent_runtime(
         self,
@@ -9688,8 +9900,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
-                if not adapter:
+                if source is not None and source_is_legacy_unstamped(source):
+                    adapter, send = self._legacy_marker_delivery_operation(source)
+                elif source is not None:
+                    adapter, send = self._live_delivery_operation(
+                        source,
+                        None,
+                        "send",
+                    )
+                else:
+                    adapter = self.adapters.get(platform)
+                    method = getattr(adapter, "send", None)
+                    send = (
+                        cast(Callable[..., Awaitable[Any]], method)
+                        if callable(method)
+                        else None
+                    )
+                if adapter is None or send is None:
                     continue
 
                 platform_cfg = self.config.platforms.get(platform)
@@ -9711,16 +9938,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=getattr(source, "chat_type", None) if source is not None else None,
-                    reply_to_message_id=reply_to_message_id,
-                    adapter=adapter,
-                )
+                if source is not None:
+                    metadata = self._thread_metadata_for_source(
+                        source,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                else:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        chat_id,
+                        thread_id,
+                        chat_type=None,
+                        reply_to_message_id=reply_to_message_id,
+                        adapter=adapter,
+                    )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -10743,19 +10976,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                release_claim,
                 sweep_recoverable,
+                undelivered_session_keys,
             )
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
-            # holds a platform only after its connect() succeeded, and each
-            # claim spends one of the row's three redelivery attempts.
-            _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
-            }
+            # A ledger row means the turn already produced its answer. Clear
+            # resume_pending even when the exact transport owner is currently
+            # unavailable, otherwise startup can regenerate the completed turn
+            # through a different runtime/credential while delivery is owed.
+            owed_session_keys = await asyncio.to_thread(
+                undelivered_session_keys
+            )
+            for session_key in owed_session_keys:
+                try:
+                    await self.async_session_store.clear_resume_pending(
+                        session_key
+                    )
+                except Exception:
+                    logger.error(
+                        "clear_resume_pending failed for owed session %s",
+                        session_key,
+                        exc_info=True,
+                    )
+            # Persistence is best-effort, but suppression is not: a ledger row
+            # proves the answer already exists, so this boot must never
+            # regenerate that turn through another runtime or credential.
+            self._ledger_owed_session_keys = set(owed_session_keys)
+            # Claim only rows whose exact transport credential is connected.
+            # Legacy rows have no owner stamp and retain the historical primary
+            # route. A same-platform adapter owned by another profile is never
+            # a deliverable route for a stamped row.
+            _deliverable_routes = set()
+            for _platform, _adapter in self.adapters.items():
+                _platform_value = getattr(_platform, "value", str(_platform))
+                _deliverable_routes.add((_platform_value, False, None, None))
+                if hasattr(_adapter, "_transport_profile"):
+                    _identity_values = (None,)
+                    if _platform == Platform.RELAY:
+                        _identity_fn = getattr(
+                            _adapter, "acknowledged_transport_identities", None
+                        )
+                        _identity_values = (
+                            tuple(cast(Iterable[Any], _identity_fn()))
+                            if callable(_identity_fn)
+                            else ()
+                        )
+                    for _identity in _identity_values:
+                        _deliverable_routes.add(
+                            (
+                                _platform_value,
+                                True,
+                                getattr(_adapter, "_transport_profile", None),
+                                _identity,
+                            )
+                        )
+            for _profile, _profile_adapters in (
+                getattr(self, "_profile_adapters", None) or {}
+            ).items():
+                for _platform in _profile_adapters:
+                    _deliverable_routes.add(
+                        (
+                            getattr(_platform, "value", str(_platform)),
+                            True,
+                            _profile,
+                            None,
+                        )
+                    )
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable,
+                None,
+                deliverable_routes=_deliverable_routes,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -10765,6 +11058,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         redelivered = 0
         for row in claimed:
+            _recovery_source: Optional[SessionSource] = None
             try:
                 platform = Platform(row["platform"])
             except Exception:
@@ -10772,11 +11066,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "obligation %s: unknown platform %r",
                     row["obligation_id"], row.get("platform"),
                 )
+                try:
+                    await asyncio.to_thread(
+                        release_claim, row["obligation_id"]
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: malformed-row claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
                 continue
-            adapter = self.adapters.get(platform)
+            if row.get("transport_profile_stamped"):
+                _recovery_source = SessionSource(
+                    platform=platform,
+                    chat_id=str(row["chat_id"]),
+                    thread_id=row.get("thread_id"),
+                    scope_id=row.get("route_scope_id"),
+                    user_id=row.get("route_user_id"),
+                    chat_type=row.get("route_chat_type") or "dm",
+                )
+                setattr(
+                    _recovery_source,
+                    "_transport_profile",
+                    row.get("transport_profile"),
+                )
+                try:
+                    _transport_platform = Platform(
+                        row.get("transport_platform") or row["platform"]
+                    )
+                except (TypeError, ValueError):
+                    _transport_platform = None
+                setattr(
+                    _recovery_source,
+                    "_transport_platform",
+                    _transport_platform,
+                )
+                if row.get("transport_identity") is not None:
+                    setattr(
+                        _recovery_source,
+                        "_transport_identity",
+                        str(row.get("transport_identity")),
+                    )
+                adapter = self._adapter_for_source(_recovery_source)
+            else:
+                adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # The route existed at claim time but vanished before delivery.
+                # Fail closed and restore the recovery budget for a later boot.
+                try:
+                    await asyncio.to_thread(
+                        release_claim, row["obligation_id"]
+                    )
+                except Exception:
+                    logger.debug(
+                        "obligation %s: claim release failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -10785,11 +11132,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
-                )
+                if row.get("transport_profile_stamped"):
+                    assert _recovery_source is not None
+                    adapter, send = self._live_delivery_operation(
+                        _recovery_source, adapter, "send"
+                    )
+                    if send is None:
+                        await asyncio.to_thread(
+                            release_claim, row["obligation_id"]
+                        )
+                        continue
+                    if adapter is not None:
+                        prime = getattr(adapter, "prime_routing_source", None)
+                        if callable(prime):
+                            prime(_recovery_source)
+                    result = await send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await cast(Any, adapter).send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
@@ -10815,17 +11182,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
 
-            # The answer reached (or was owed to) this session — don't ALSO
-            # re-run the turn via the resume path.
-            session_key = row.get("session_key") or ""
-            if session_key:
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception:
-                    logger.debug(
-                        "clear_resume_pending failed for %s", session_key,
-                        exc_info=True,
-                    )
+            # The answer reached (or was owed to) this session. Its resume
+            # marker was cleared before sweeping, including for unavailable
+            # owners, so there is nothing further to do here.
         return redelivered
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
@@ -10862,6 +11221,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
+                    and entry.session_key
+                    not in getattr(self, "_ledger_owed_session_keys", set())
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
@@ -10901,7 +11262,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._is_session_running(entry.session_key):
                 continue
 
-            source = entry.origin
+            # Rebuild from the durable representation rather than passing the
+            # canonical routing-entry object into a live adapter. This drops a
+            # retired process-local adapter reference while retaining the
+            # stamped platform/profile/identity needed to resolve the current
+            # physical owner. Ownerless modern sources remain ownerless.
+            origin = entry.origin
+            if origin is None:
+                continue
+            source = SessionSource.from_dict(
+                origin.to_dict(),
+                allow_legacy_unstamped=source_is_legacy_unstamped(origin),
+            )
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -11518,6 +11890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
+            self._share_backend_notice_state(adapter)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -12271,6 +12644,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name="Handoff",
             thread_id=effective_thread_id,
         )
+        stamp_source_transport_owner(
+            dest_source,
+            adapter=adapter,
+            platform=getattr(adapter, "platform", platform),
+        )
 
         # Compute the gateway's session_key for that destination using the
         # same rules its adapters use, so switch_session targets the right
@@ -12911,6 +13289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
 
                     adapter.set_message_handler(self._primary_message_handler())
+                    self._share_backend_notice_state(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
@@ -13886,6 +14265,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
+        self._share_backend_notice_state(adapter, profile_name=profile_name)
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
@@ -14379,6 +14759,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type=chat_type or "group",
                 user_id=user_id,
                 profile=profile_name,
+            )
+            adapter = self._authorization_adapter(platform, profile_name)
+            if adapter is None:
+                return False
+            stamp_source_transport_owner(
+                source,
+                adapter=adapter,
+                platform=getattr(adapter, "platform", platform),
             )
             return self._is_user_authorized(source)
         return check
@@ -15041,7 +15429,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_type == "dm"
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
-                    profile=source.profile,
+                    profile=self._adapter_profile_for_source(source),
                 )
                 == "pair"
             ):
@@ -16920,7 +17308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cached_sources = OrderedDict()
             self._session_sources = cached_sources
         try:
-            cached_sources[session_key] = dataclasses.replace(source)
+            cached_sources[session_key] = copy_session_source(source)
         except Exception:
             logger.debug("Failed to cache live session source for %s", session_key, exc_info=True)
             return
@@ -16949,7 +17337,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            token = await self.async_session_store.mark_turn_active(
+                session_key,
+                source=getattr(event, "source", None),
+            )
         except Exception as exc:
             logger.warning(
                 "Could not persist active-turn marker for %s: %s",
@@ -17045,7 +17436,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
                 source.chat_id, source.user_id, source.thread_id, recovered,
             )
-            source = dataclasses.replace(source, thread_id=recovered)
+            source = copy_session_source(source, thread_id=recovered)
             try:
                 event.source = source
             except Exception:
@@ -18891,6 +19282,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # The retry loop already classified provider failures.  Mark
+            # transient backend outages explicitly so the adapter can suppress
+            # only this safe notice and arm its cooldown after delivery.
+            if (
+                not _gateway_surface_passes_raw_text(source.platform)
+                and _is_backend_unavailable_agent_result(agent_result)
+            ):
+                return BackendUnavailableReply(_BACKEND_UNAVAILABLE_NOTICE)
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -19918,6 +20318,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(user_id),
                 chat_type="channel",
             )
+        stamp_source_transport_owner(
+            source,
+            adapter=adapter,
+            platform=Platform.DISCORD,
+        )
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -20046,6 +20451,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+    def _live_delivery_operation(
+        self,
+        source: SessionSource,
+        fallback_adapter: Any,
+        operation: str,
+    ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+        """Resolve one current transport operation, preserving legacy sources.
+
+        Explicit owner stamps are authoritative and fail closed. Hand-built or
+        restored legacy sources without a stamp retain the historical captured
+        adapter fallback. Operations are duck-typed for plugin compatibility.
+        """
+        source_attrs = getattr(source, "__dict__", {})
+        stamped = (
+            isinstance(source_attrs, dict)
+            and "_transport_profile" in source_attrs
+        )
+        if not stamped and source_is_legacy_unstamped(source):
+            adapter = fallback_adapter
+        elif not stamped:
+            adapter = None
+        else:
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                adapter = None
+        if adapter is None:
+            return None, None
+        expected_platform = source_attrs.get(
+            "_transport_platform", getattr(source, "platform", None)
+        )
+        if stamped and getattr(adapter, "platform", None) != expected_platform:
+            return None, None
+        method = getattr(adapter, operation, None)
+        if not callable(method):
+            return adapter, None
+        return adapter, cast(Callable[..., Awaitable[Any]], method)
+
+    def _legacy_marker_delivery_operation(
+        self,
+        source: SessionSource,
+    ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+        """Resolve a trusted pre-owner lifecycle marker's historical route."""
+        config = getattr(self, "config", None)
+        transport = (
+            resolve_delivery_transport(source.platform, config, self.adapters)
+            if config is not None
+            else None
+        )
+        if transport is not None:
+            async def send(
+                chat_id: str,
+                content: str,
+                **kwargs: Any,
+            ) -> Any:
+                return await transport.send(
+                    source.platform,
+                    chat_id,
+                    content,
+                    **kwargs,
+                )
+
+            return transport.adapter, send
+        adapter = self.adapters.get(source.platform)
+        method = getattr(adapter, "send", None)
+        if adapter is None or not callable(method):
+            return None, None
+        return adapter, cast(Callable[..., Awaitable[Any]], method)
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -20064,9 +20538,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Ogg/Opus bytes for every provider. Others keep MP3.
             audio_path = build_auto_tts_output_path(event.source.platform)
 
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+            _tts_task = asyncio.create_task(
+                asyncio.to_thread(
+                    text_to_speech_tool,
+                    text=tts_text,
+                    output_path=audio_path,
+                )
             )
+
+            def _cleanup_cancelled_voice_tts(task: asyncio.Task) -> None:
+                cleanup_paths = {audio_path}
+                try:
+                    cancelled_result = json.loads(task.result())
+                    cleanup_paths.update(
+                        str(path)
+                        for path in (
+                            cancelled_result.get("file_paths")
+                            or [cancelled_result.get("file_path")]
+                        )
+                        if path
+                    )
+                except BaseException:
+                    pass
+                for cleanup_path in cleanup_paths - {None}:
+                    try:
+                        os.unlink(cleanup_path)
+                    except OSError:
+                        pass
+
+            try:
+                result_json = await asyncio.shield(_tts_task)
+            except asyncio.CancelledError:
+                _tts_task.add_done_callback(_cleanup_cancelled_voice_tts)
+                raise
             try:
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
@@ -20087,47 +20591,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            adapter = self._adapter_for_source(event.source)
+            fallback_adapter = self._adapter_for_source(event.source)
 
-            # If connected to a voice channel, play there instead of sending a file
+            # If connected to a voice channel, play there instead of sending a file.
+            # Re-evaluate this policy and operation for each generated file because
+            # reconnect can replace the credential while an earlier send awaits.
             guild_id = self._get_guild_id(event)
-            play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
-            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
-            send_voice = getattr(adapter, "send_voice", None)
-            in_voice_channel = bool(
-                guild_id
-                and callable(play_in_voice_channel)
-                and callable(is_in_voice_channel)
-                and is_in_voice_channel(guild_id)
-            )
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if not in_voice_channel and callable(send_voice):
-                # Mark the auto voice reply as notify-worthy.  Mirrors the
-                # final-text path in gateway/platforms/base.py which sets
-                # ``notify=True`` so platform adapters that gate push
-                # notifications (Telegram "important" mode) deliver the
-                # final voice reply as a normal notification instead of a
-                # silent message.  Clone first so we don't mutate metadata
-                # shared with concurrent typing-indicator state.
-                if thread_meta is not None:
-                    thread_meta = dict(thread_meta)
-                    thread_meta["notify"] = True
-                else:
-                    thread_meta = {"notify": True}
+            if thread_meta is not None:
+                thread_meta = dict(thread_meta)
+                thread_meta["notify"] = True
+            else:
+                thread_meta = {"notify": True}
             for actual_path in actual_paths:
+                adapter, play_in_voice_channel = self._live_delivery_operation(
+                    event.source,
+                    fallback_adapter,
+                    "play_in_voice_channel",
+                )
+                is_in_voice_channel = getattr(
+                    adapter, "is_in_voice_channel", None
+                ) if adapter is not None else None
+                in_voice_channel = bool(
+                    guild_id
+                    and callable(play_in_voice_channel)
+                    and callable(is_in_voice_channel)
+                    and is_in_voice_channel(guild_id)
+                )
                 if in_voice_channel:
-                    play_voice = cast(Callable[..., Awaitable[Any]], play_in_voice_channel)
-                    await play_voice(guild_id, actual_path)
-                elif callable(send_voice):
-                    send_voice_call = cast(Callable[..., Awaitable[Any]], send_voice)
-                    send_kwargs: Dict[str, Any] = {
-                        "chat_id": event.source.chat_id,
-                        "audio_path": actual_path,
-                        "reply_to": reply_anchor,
-                        "metadata": thread_meta,
-                    }
-                    await send_voice_call(**send_kwargs)
+                    await cast(
+                        Callable[..., Awaitable[Any]], play_in_voice_channel
+                    )(guild_id, actual_path)
+                    continue
+                _, send_voice = self._live_delivery_operation(
+                    event.source,
+                    fallback_adapter,
+                    "send_voice",
+                )
+                if not callable(send_voice):
+                    logger.warning(
+                        "Withholding auto voice reply: no live transport owner"
+                    )
+                    continue
+                await send_voice(
+                    chat_id=event.source.chat_id,
+                    audio_path=actual_path,
+                    reply_to=reply_anchor,
+                    metadata=thread_meta,
+                )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -20172,6 +20684,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
+            # Extract with the captured adapter for parser compatibility; every
+            # physical delivery below resolves the current transport owner.
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
@@ -20217,39 +20731,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     non_image_media.append((media_path, is_voice))
 
             if image_paths:
+                live_adapter = None
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    live_adapter, image_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        "send_multiple_images",
+                    )
+                    if not callable(image_send):
+                        logger.warning(
+                            "Withholding post-stream images: no live transport owner"
+                        )
+                    else:
+                        _image_kwargs = {
+                            "chat_id": event.source.chat_id,
+                            "images": images,
+                            "metadata": _thread_meta,
+                        }
+                        try:
+                            source_attrs = getattr(
+                                event.source, "__dict__", {}
+                            )
+                            if (
+                                isinstance(source_attrs, dict)
+                                and "_transport_profile" in source_attrs
+                            ):
+                                signature = inspect.signature(image_send)
+                                if "source" in signature.parameters or any(
+                                    parameter.kind
+                                    is inspect.Parameter.VAR_KEYWORD
+                                    for parameter in signature.parameters.values()
+                                ):
+                                    _image_kwargs["source"] = event.source
+                        except (TypeError, ValueError):
+                            pass
+                        await image_send(**_image_kwargs)
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Post-stream image batch delivery failed: %s",
+                        getattr(live_adapter, "name", getattr(adapter, "name", "gateway")),
+                        e,
+                    )
+
+            for media_path, is_voice in non_image_media:
+                live_adapter = None
+                try:
+                    ext = Path(media_path).suffix.lower()
+                    method_name = "send_document"
+                    path_arg = "file_path"
+                    if should_send_media_as_audio(
+                        event.source.platform, ext, is_voice=is_voice
+                    ):
+                        method_name = "send_voice"
+                        path_arg = "audio_path"
+                    elif ext in _VIDEO_EXTS:
+                        method_name = "send_video"
+                        path_arg = "video_path"
+                    live_adapter, media_send = GatewayRunner._live_delivery_operation(
+                        self,
+                        event.source,
+                        adapter,
+                        method_name,
+                    )
+                    if not callable(media_send):
+                        logger.warning(
+                            "Withholding post-stream media: no live %s operation",
+                            method_name,
+                        )
+                        continue
+                    await media_send(
                         chat_id=event.source.chat_id,
-                        images=images,
+                        **{path_arg: media_path},
                         metadata=_thread_meta,
                     )
                 except Exception as e:
-                    logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
-
-            for media_path, is_voice in non_image_media:
-                try:
-                    ext = Path(media_path).suffix.lower()
-                    if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream media delivery failed: %s",
+                        getattr(live_adapter, "name", getattr(adapter, "name", "gateway")),
+                        e,
+                    )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -20268,11 +20830,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
-                await adapter.send(
-                    source.chat_id,
-                    text_content,
-                    metadata=metadata,
+                _, send = self._live_delivery_operation(
+                    source, adapter, "send"
                 )
+                if not callable(send):
+                    logger.warning(
+                        "Withholding queued turn response: no live transport owner"
+                    )
+                else:
+                    await send(
+                        source.chat_id,
+                        text_content,
+                        metadata=metadata,
+                    )
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
@@ -20335,12 +20905,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_urls = media_urls or []
         media_types = media_types or []
 
-        adapter = self._adapter_for_source(source)
+        adapter: Any = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        suppress_failure_fallback = False
 
         try:
             user_config = _load_gateway_config()
@@ -20349,11 +20920,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
-                )
+                _, send = self._live_delivery_operation(source, adapter, "send")
+                if send is not None:
+                    await send(
+                        source.chat_id,
+                        f"❌ Background task {task_id} failed: no provider credentials configured.",
+                        metadata=_thread_metadata,
+                    )
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -20431,98 +21004,218 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            is_backend_unavailable = bool(
+                isinstance(result, dict)
+                and _is_backend_unavailable_agent_result(result)
+            )
+            response = (
+                result.get("final_response", "")
+                if isinstance(result, dict)
+                else ""
+            )
+            if is_backend_unavailable:
+                suppress_failure_fallback = True
+                # Preserve the retry loop's structured classification. Never
+                # surface provider endpoints/details from ``error`` and never
+                # treat this synthetic notice as a durable answer obligation.
+                response = _BACKEND_UNAVAILABLE_NOTICE
+            elif (
+                not response
+                and isinstance(result, dict)
+                and result.get("error")
+            ):
                 response = f"Error: {result['error']}"
 
-            # Extract media files from the response
-            if response:
-                media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
+            async def _deliver(operation: str, **kwargs):
+                """Resolve the stamped owner immediately before one physical send."""
+                _, method = self._live_delivery_operation(source, adapter, operation)
+                if method is None:
+                    return None
+                return await method(**kwargs)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
+            backend_notice_claimed = False
+            backend_notice_key = ""
+            if is_backend_unavailable:
+                session_key = self._session_key_for_source(source)
+                backend_notice_key = backend_notice_session_key(
+                    session_key,
+                    source,
+                    fallback_profile=getattr(
+                        adapter, "_backend_notice_profile", None
+                    ),
+                )
+                backend_notice_claimed = await (
+                    self._backend_notice_state_for_adapters().claim(
+                        backend_notice_key, "backend_unavailable"
                     )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
+                )
+                if not backend_notice_claimed:
+                    return
+
+            notice_delivered = False
+            try:
+                # Extraction is pure parsing; all resulting physical operations
+                # independently re-resolve their current owner via ``_deliver``.
+                if response:
+                    if is_backend_unavailable:
+                        # Synthetic notices bypass media parsing and generated
+                        # attachments/TTS just like foreground outage notices.
+                        media_files = []
+                        images = []
+                        text_content = response
+                    else:
+                        media_files, response = adapter.extract_media(response)
+                        from gateway.platforms.base import BasePlatformAdapter
+                        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                        images, text_content = adapter.extract_images(response)
+
+                    preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                    header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                    outbound_text = (
+                        text_content
+                        if is_backend_unavailable
+                        else header + text_content
                     )
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
+                    if text_content:
+                        if is_backend_unavailable:
+                            notice_state = self._backend_notice_state_for_adapters()
+
+                            async def _send_and_finish_background_notice_claim():
+                                delivered = False
+                                try:
+                                    send_result = await _deliver(
+                                        "send",
+                                        chat_id=source.chat_id,
+                                        content=outbound_text,
+                                        metadata=_thread_metadata,
+                                    )
+                                    delivered = bool(
+                                        getattr(send_result, "success", False)
+                                    )
+                                    return send_result
+                                finally:
+                                    notice_state.finish_claim(
+                                        backend_notice_key,
+                                        "backend_unavailable",
+                                        time.monotonic(),
+                                        delivered=delivered,
+                                    )
+
+                            send_task = asyncio.create_task(
+                                _send_and_finish_background_notice_claim()
+                            )
+                            try:
+                                send_result = await asyncio.shield(send_task)
+                            except asyncio.CancelledError:
+                                notice_state.track_delivery_task(send_task)
+                                raise
+                            finally:
+                                backend_notice_claimed = False
+                        else:
+                            send_result = await _deliver(
+                                "send",
+                                chat_id=source.chat_id,
+                                content=outbound_text,
+                                metadata=_thread_metadata,
+                            )
+                        notice_delivered = bool(
+                            getattr(send_result, "success", False)
+                        )
+                    elif not images and not media_files:
+                        await _deliver(
+                            "send",
                             chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
+                            content=header + "(No response generated)",
                             metadata=_thread_metadata,
                         )
-                    except Exception:
-                        pass
 
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
-                from gateway.platforms.base import (
-                    should_send_media_as_audio as _should_send_media_as_audio,
-                )
-                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-                for media_path, _is_voice in (media_files or []):
-                    _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
+                    # Send extracted images. Resolve between every item because
+                    # native batches and uploads may reconnect independently.
+                    for image_url, alt_text in (images or []):
+                        try:
+                            await _deliver(
+                                "send_image",
                                 chat_id=source.chat_id,
-                                audio_path=media_path,
+                                image_url=image_url,
+                                caption=alt_text,
                                 metadata=_thread_metadata,
                             )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
-            else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
-                )
+                        except Exception:
+                            pass
 
-        except Exception as e:
+                    # Route each generated file by type and re-resolve between
+                    # files; trailing artifacts must never stay on a retired owner.
+                    from gateway.platforms.base import (
+                        should_send_media_as_audio as _should_send_media_as_audio,
+                    )
+                    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                    _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                    for media_path, _is_voice in (media_files or []):
+                        _ext = os.path.splitext(media_path)[1].lower()
+                        try:
+                            if _should_send_media_as_audio(source.platform, _ext, _is_voice):
+                                await _deliver(
+                                    "send_voice",
+                                    chat_id=source.chat_id,
+                                    audio_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            elif _ext in _VIDEO_EXTS:
+                                await _deliver(
+                                    "send_video",
+                                    chat_id=source.chat_id,
+                                    video_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            elif _ext in _IMAGE_EXTS:
+                                await _deliver(
+                                    "send_image_file",
+                                    chat_id=source.chat_id,
+                                    image_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                            else:
+                                await _deliver(
+                                    "send_document",
+                                    chat_id=source.chat_id,
+                                    file_path=media_path,
+                                    metadata=_thread_metadata,
+                                )
+                        except Exception:
+                            pass
+                else:
+                    preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                    await _deliver(
+                        "send",
+                        chat_id=source.chat_id,
+                        content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                        metadata=_thread_metadata,
+                    )
+            finally:
+                if backend_notice_claimed:
+                    self._backend_notice_state_for_adapters().finish_claim(
+                        backend_notice_key,
+                        "backend_unavailable",
+                        time.monotonic(),
+                        delivered=notice_delivered,
+                    )
+
+        except Exception:
             logger.exception("Background task %s failed", task_id)
+            if suppress_failure_fallback:
+                # A failed synthetic-notice send releases its shared claim for
+                # a later retry. Do not bypass that contract with an ordinary
+                # background-failure message from this same failed transport.
+                return
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
-                )
+                _, send = self._live_delivery_operation(source, adapter, "send")
+                if send is not None:
+                    await send(
+                        chat_id=source.chat_id,
+                        content=f"❌ Background task {task_id} failed.",
+                        metadata=_thread_metadata,
+                    )
             except Exception:
                 pass
 
@@ -20860,7 +21553,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if loop is None or loop.is_closed():
             return
         try:
-            copied_source = dataclasses.replace(source)
+            copied_source = copy_session_source(source)
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
@@ -21008,7 +21701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if loop is None or loop.is_closed():
             return
         try:
-            copied_source = dataclasses.replace(source)
+            copied_source = copy_session_source(source)
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
@@ -21549,6 +22242,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        source_attrs = getattr(source, "__dict__", {})
+        if (
+            isinstance(source_attrs, dict)
+            and source_attrs.get("_transport_platform") == Platform.RELAY
+        ):
+            logical_platform = getattr(
+                getattr(source, "platform", None),
+                "value",
+                getattr(source, "platform", None),
+            )
+            if logical_platform and logical_platform != Platform.RELAY.value:
+                metadata = dict(metadata or {})
+                metadata["_relay_logical_platform"] = str(logical_platform)
+            scope_id = getattr(source, "scope_id", None)
+            user_id = getattr(source, "user_id", None)
+            if scope_id:
+                metadata = dict(metadata or {})
+                metadata["scope_id"] = str(scope_id)
+            if user_id:
+                metadata = dict(metadata or {})
+                metadata["user_id"] = str(user_id)
         return metadata
 
     def _thread_metadata_for_target(
@@ -21684,40 +22398,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
-        # Resolve the adapter and chat_id for sending messages
-        adapter = None
+        # Resolve the exact marker source once; resolve its live owner before
+        # every outward operation so reconnects cannot strand or misroute a
+        # long-running update.
+        source = None
         chat_id = None
         session_key = None
-        metadata = None
+        platform = None
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
                     pending = json.loads(path.read_text(encoding="utf-8"))
-                    platform_str = pending.get("platform")
-                    chat_id = pending.get("chat_id")
-                    chat_type = pending.get("chat_type")
-                    session_key = pending.get("session_key")
-                    thread_id = pending.get("thread_id")
-                    message_id = pending.get("message_id")
-                    if platform_str and chat_id:
-                        platform = Platform(platform_str)
-                        adapter = self.adapters.get(platform)
-                        metadata = self._thread_metadata_for_target(
-                            platform,
-                            chat_id,
-                            thread_id,
-                            chat_type=chat_type,
-                            reply_to_message_id=message_id,
-                            adapter=adapter,
-                        )
-                        # Fallback session key if not stored (old pending files)
+                    source = session_source_from_trusted_marker(pending)
+                    if source is not None:
+                        platform = source.platform
+                        chat_id = source.chat_id
+                        session_key = pending.get("session_key")
                         if not session_key:
-                            session_key = f"{platform_str}:{chat_id}"
+                            session_key = f"{platform.value}:{chat_id}"
                     break
                 except Exception:
                     pass
 
-        if not adapter or not chat_id:
+        def _live_update_operation(
+            method_name: str = "send",
+        ) -> tuple[Optional[Any], Optional[Callable[..., Awaitable[Any]]]]:
+            if source is None:
+                return None, None
+            if source_is_legacy_unstamped(source):
+                if method_name != "send":
+                    adapter, _send = self._legacy_marker_delivery_operation(source)
+                    method = getattr(adapter, method_name, None)
+                    if adapter is None or not callable(method):
+                        return adapter, None
+                    return adapter, cast(Callable[..., Awaitable[Any]], method)
+                return self._legacy_marker_delivery_operation(source)
+            return self._live_delivery_operation(source, None, method_name)
+
+        adapter, send = _live_update_operation()
+        metadata = (
+            self._thread_metadata_for_source(source) if source is not None else None
+        )
+        if adapter is None or send is None or not chat_id:
             logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
             # Fall back to completion-only: wait for the exit code and send the
             # final notification. _send_update_notification re-resolves the
@@ -21753,30 +22475,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_stream_time = loop.time()
         buffer = ""
 
-        async def _flush_buffer() -> None:
-            """Send buffered output to the user."""
+        async def _flush_buffer() -> bool:
+            """Send buffered output, retaining the exact unsent suffix on failure."""
             nonlocal buffer, last_stream_time
             if not buffer.strip():
                 buffer = ""
-                return
-            # Chunk to fit message limits (Telegram: 4096, others: generous)
+                return True
+            # Chunk to fit message limits (Telegram: 4096, others: generous).
             clean = _strip_ansi(buffer).strip()
-            buffer = ""
-            last_stream_time = loop.time()
             if not clean:
-                return
-            # Split into chunks if too long
+                buffer = ""
+                return True
             max_chunk = 3500
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
-            for chunk in chunks:
+            last_stream_time = loop.time()
+            for chunk_index, chunk in enumerate(chunks):
                 try:
-                    await adapter.send(
+                    _adapter, live_send = _live_update_operation()
+                    if _adapter is None or live_send is None:
+                        logger.debug("Update stream deferred: exact owner unavailable")
+                        buffer = "".join(chunks[chunk_index:])
+                        return False
+                    result = await live_send(
                         chat_id,
                         f"```\n{chunk}\n```",
                         metadata=_non_conversational_metadata(metadata, platform=platform),
                     )
+                    if result is not None and getattr(result, "success", True) is False:
+                        logger.debug(
+                            "Update stream send returned success=False: %s",
+                            getattr(result, "error", "unknown delivery failure"),
+                        )
+                        buffer = "".join(chunks[chunk_index:])
+                        return False
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
+                    buffer = "".join(chunks[chunk_index:])
+                    return False
+            buffer = ""
+            return True
 
         while loop.time() < deadline:
             # Check for completion
@@ -21789,27 +22526,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             buffer += chunk
                     except OSError:
                         pass
-                await _flush_buffer()
+                flushed = await _flush_buffer()
+                if not flushed:
+                    await asyncio.sleep(poll_interval)
+                    continue
 
                 # Send final status
                 try:
                     exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
+                    _adapter, final_send = _live_update_operation()
+                    if _adapter is None or final_send is None:
+                        logger.info("Update final notification deferred: exact owner unavailable")
+                        await asyncio.sleep(poll_interval)
+                        continue
                     if exit_code == 0:
-                        await adapter.send(
+                        final_result = await final_send(
                             chat_id,
                             "✅ Hermes update finished.",
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     else:
-                        await adapter.send(
+                        final_result = await final_send(
                             chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
+                    if final_result is not None and getattr(
+                        final_result, "success", True
+                    ) is False:
+                        logger.info(
+                            "Update final notification deferred after delivery failure: %s",
+                            getattr(final_result, "error", "unknown delivery failure"),
+                        )
+                        await asyncio.sleep(poll_interval)
+                        continue
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
                     logger.warning("Update final notification failed: %s", e)
+                    await asyncio.sleep(poll_interval)
+                    continue
 
                 # Cleanup
                 for p in (pending_path, claimed_path, output_path,
@@ -21855,23 +22611,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # context before the prompt
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
+                        prompt_adapter, prompt_send = _live_update_operation()
+                        if prompt_adapter is None or prompt_send is None:
+                            logger.debug("Update prompt deferred: exact owner unavailable")
+                            await asyncio.sleep(poll_interval)
+                            continue
                         sent_buttons = False
-                        if getattr(type(adapter), "send_update_prompt", None) is not None:
+                        _button_adapter, send_prompt = _live_update_operation(
+                            "send_update_prompt"
+                        )
+                        native_prompt_method = (
+                            getattr(type(_button_adapter), "send_update_prompt", None)
+                            if _button_adapter is not None
+                            else None
+                        )
+                        if send_prompt is not None and callable(native_prompt_method):
                             try:
-                                await adapter.send_update_prompt(
+                                prompt_result = await send_prompt(
                                     chat_id=chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
                                     metadata=_non_conversational_metadata(metadata, platform=platform),
                                 )
-                                sent_buttons = True
+                                sent_buttons = (
+                                    prompt_result is None
+                                    or getattr(prompt_result, "success", True) is not False
+                                )
+                                if not sent_buttons:
+                                    logger.debug(
+                                        "Button-based update prompt returned success=False: %s",
+                                        getattr(
+                                            prompt_result,
+                                            "error",
+                                            "unknown delivery failure",
+                                        ),
+                                    )
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
                         if not sent_buttons:
                             default_hint = f" (default: {default})" if default else ""
-                            _p = getattr(adapter, "typed_command_prefix", "/")
-                            await adapter.send(
+                            _p = getattr(prompt_adapter, "typed_command_prefix", "/")
+                            prompt_result = await prompt_send(
                                 chat_id,
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
@@ -21879,6 +22660,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"or type your answer directly.",
                                 metadata=_non_conversational_metadata(metadata, platform=platform),
                             )
+                            if prompt_result is not None and getattr(
+                                prompt_result, "success", True
+                            ) is False:
+                                logger.debug(
+                                    "Update prompt returned success=False: %s",
+                                    getattr(
+                                        prompt_result,
+                                        "error",
+                                        "unknown delivery failure",
+                                    ),
+                                )
+                                await asyncio.sleep(poll_interval)
+                                continue
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
                         # next watcher can recover by re-forwarding it from
@@ -21900,11 +22694,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=_non_conversational_metadata(metadata, platform=platform),
-                )
+                _adapter, timeout_send = _live_update_operation()
+                if _adapter is not None and timeout_send is not None:
+                    await timeout_send(
+                        chat_id,
+                        "❌ Hermes update timed out after 30 minutes.",
+                        metadata=_non_conversational_metadata(
+                            metadata, platform=platform
+                        ),
+                    )
             except Exception:
                 pass
             for p in (pending_path, claimed_path, output_path,
@@ -21967,21 +22765,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if output_path.exists():
                 output = output_path.read_bytes().decode("utf-8", errors="replace")
 
-            # Resolve adapter
-            platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
+            # Resolve the exact persisted transport owner. New markers are
+            # stamped; only trusted pre-owner marker files may use the legacy
+            # physical-route fallback.
+            source = session_source_from_trusted_marker(pending)
+            platform = source.platform if source is not None else None
+            if source is not None and source_is_legacy_unstamped(source):
+                adapter, send = self._legacy_marker_delivery_operation(source)
+            elif source is not None:
+                adapter, send = self._live_delivery_operation(
+                    source,
+                    None,
+                    "send",
+                )
+            else:
+                adapter, send = None, None
 
-            if not adapter and chat_id:
-                # The update finished, but the target platform has not
-                # reconnected yet (common right after the restart that
-                # `hermes update` triggers). Treating "adapter missing" as a
-                # definitive skip would delete the markers and silently lose the
-                # completion notification — the user never learns whether the
-                # update succeeded or timed out. Preserve the markers instead so
-                # a later retry (the watcher poll loop, or the next gateway
-                # startup) can deliver the result once the adapter is back.
+            if (adapter is None or send is None) and chat_id:
+                # The update finished, but the exact owner has not reconnected.
+                # Preserve markers instead of leaking through another profile.
                 logger.info(
-                    "Update notification deferred: %s adapter not connected yet",
+                    "Update notification deferred: exact owner not connected for %s",
                     platform_str,
                 )
                 cleanup = False
@@ -21989,15 +22793,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 claimed_path.replace(pending_path)
                 return False
 
-            if adapter and chat_id:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    chat_id,
-                    thread_id,
-                    chat_type=chat_type,
-                    reply_to_message_id=message_id,
-                    adapter=adapter,
-                )
+            if adapter and send and source is not None and chat_id:
+                metadata = self._thread_metadata_for_source(source)
                 # Strip ANSI escape codes for clean display
                 from tools.ansi_strip import strip_ansi
                 output = strip_ansi(output).strip()
@@ -22012,7 +22809,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(
+                await send(
                     chat_id,
                     msg,
                     metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -22040,24 +22837,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        cleanup = True
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
-            chat_type = data.get("chat_type")
-            thread_id = data.get("thread_id")
-            message_id = data.get("message_id")
+            source = session_source_from_trusted_marker(data)
 
-            if not platform_str or not chat_id:
+            if source is None:
                 return None
 
-            platform = Platform(platform_str)
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
-            if transport is None:
+            platform = source.platform
+            platform_str = platform.value
+            chat_id = source.chat_id
+            thread_id = source.thread_id
+            if source_is_legacy_unstamped(source):
+                adapter, send = self._legacy_marker_delivery_operation(source)
+            else:
+                adapter, send = self._live_delivery_operation(
+                    source,
+                    None,
+                    "send",
+                )
+            if adapter is None or send is None:
                 logger.debug(
-                    "Restart notification skipped: no live transport for %s",
+                    "Restart notification deferred: exact owner unavailable for %s",
                     platform_str,
                 )
+                cleanup = False
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
@@ -22068,22 +22875,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
-            metadata = self._thread_metadata_for_target(
-                platform,
-                chat_id,
-                thread_id,
-                chat_type=chat_type,
-                reply_to_message_id=message_id,
-                adapter=transport.adapter,
-            )
-            if data.get("delivered_via_upstream_relay") is True:
+            metadata = self._thread_metadata_for_source(source)
+            if source.delivered_via_upstream_relay is True:
                 metadata = dict(metadata or {})
-                if data.get("user_id"):
-                    metadata["user_id"] = str(data["user_id"])
-                if data.get("scope_id"):
-                    metadata["scope_id"] = str(data["scope_id"])
-            result = await transport.send(
-                platform,
+                if source.user_id:
+                    metadata["user_id"] = str(source.user_id)
+                if source.scope_id:
+                    metadata["scope_id"] = str(source.scope_id)
+            result = await send(
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -22111,7 +22910,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup:
+                notify_path.unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,
@@ -24901,11 +25701,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
-            def _pause_typing_before_finalize(
-                _adapter=adapter,
-                _chat_id=source.chat_id,
-            ) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+            def _pause_typing_before_finalize(_chat_id=source.chat_id) -> None:
+                _adapter, _pause = self._live_delivery_operation(
+                    source,
+                    None,
+                    "pause_typing_for_chat",
+                )
+                if _adapter is not None and _pause is not None:
+                    _pause(_chat_id)
         # Platforms that don't support editing sent messages
         # (e.g. QQ, WeChat) should skip streaming entirely —
         # without edit support, the consumer sends a partial
@@ -25082,6 +25885,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        adapter_resolver=lambda: self._live_delivery_operation(
+                            source,
+                            None,
+                            "send",
+                        )[0],
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -25092,10 +25900,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             stream_task = asyncio.create_task(_stream_consumer.run())
 
         # Send typing indicator
-        _adapter = self._adapter_for_source(source)
-        if _adapter:
+        _adapter, _send_typing = self._live_delivery_operation(
+            source,
+            None,
+            "send_typing",
+        )
+        if _adapter and _send_typing:
             try:
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
+                await _send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
                 pass
 
@@ -25452,6 +26264,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
+
+        def _live_adapter() -> Any:
+            return self._adapter_for_source(source)
+
+        def _live_operation(name: str) -> tuple[Any, Any]:
+            adapter = _live_adapter()
+            method = getattr(adapter, name, None) if adapter is not None else None
+            return adapter, method if callable(method) else None
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -25656,6 +26476,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        _cleanup_msg_owners: dict[str, Any] = {}
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -25664,6 +26485,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
+            _live_adapter=_live_adapter,
+            _live_operation=_live_operation,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
             _thinking_enabled=_thinking_enabled,
@@ -25680,6 +26503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
+            _cleanup_msg_owners=_cleanup_msg_owners,
             message=message,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,
@@ -25938,7 +26762,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #
         # Gates: voice input, auto-TTS enabled for this chat, adapter
         # supports streaming, and a usable streaming TTS provider configured.
-        _stts_adapter = self._adapter_for_source(source)
+        _stts_adapter = turn_ctx._live_adapter()
         _is_voice_input = (
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
@@ -25959,6 +26783,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     tts_config=_tts_cfg,
                     loop=_gateway_loop,
                     metadata=_status_thread_metadata,
+                    adapter_resolver=turn_ctx._live_adapter,
                 )
                 if _stts_consumer.active:
                     streaming_tts_consumer_holder[0] = _stts_consumer
@@ -26120,8 +26945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
-            _notify_adapter = self._adapter_for_source(source)
-            if not _notify_adapter:
+            if _live_adapter() is None:
                 return
             # Track the heartbeat message id so we can edit-in-place on
             # platforms that support it (Telegram, Discord, Slack, etc.)
@@ -26129,6 +26953,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
+            _heartbeat_msg_owner = None
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 # Stop heartbeating once this run no longer owns the session
@@ -26181,8 +27006,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 try:
+                    _notify_adapter = _live_adapter()
+                    if _notify_adapter is None:
+                        continue
                     _notify_res = None
-                    if _heartbeat_msg_id:
+                    if (
+                        _heartbeat_msg_id
+                        and _heartbeat_msg_owner is _notify_adapter
+                    ):
                         try:
                             _notify_res = await _notify_adapter.edit_message(
                                 source.chat_id,
@@ -26192,6 +27023,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
+                    elif _heartbeat_msg_id:
+                        _heartbeat_msg_id = None
+                        _heartbeat_msg_owner = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
@@ -26202,8 +27036,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _notify_res, "message_id", None
                         ):
                             _heartbeat_msg_id = str(_notify_res.message_id)
+                            _heartbeat_msg_owner = _notify_adapter
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(_heartbeat_msg_id)
+                                _cleanup_msg_owners[_heartbeat_msg_id] = _notify_adapter
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -27077,16 +27913,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # inside the tail message. Fall through to the normal final send
                 # instead (#78541).
                 _sc_msg_id = _sc.message_id
-                _sc_adapter = getattr(_sc, "adapter", None)
                 if getattr(_sc, "_turn_split_delivery", False):
                     logger.info(
                         "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
                         session_key or "?",
                     )
-                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__":
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
-                            chat_id=source.chat_id,
+                        _reconcile_res = await _sc._edit_message(
                             message_id=_sc_msg_id,
                             content=_final,
                             finalize=True,
@@ -27119,17 +27953,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
+                        _transform_res = await _sc._edit_message(
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_res, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Plugin-transformed stream edit unavailable for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_transform_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
@@ -27151,17 +27991,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             _ids_snapshot = list(_cleanup_msg_ids)
+            _owners_snapshot = dict(_cleanup_msg_owners)
             _chat_id_snapshot = source.chat_id
-            _adapter_snapshot = _cleanup_adapter
             _loop_snapshot = asyncio.get_running_loop()
 
             def _cleanup_temp_bubbles() -> None:
                 async def _delete_all() -> None:
                     for _mid in _ids_snapshot:
                         try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
+                            _delete_adapter, delete_message = (
+                                self._live_delivery_operation(
+                                    source,
+                                    None,
+                                    "delete_message",
+                                )
                             )
+                            if _delete_adapter is None or delete_message is None:
+                                return
+                            if _owners_snapshot.get(_mid) is not _delete_adapter:
+                                continue
+                            await delete_message(_chat_id_snapshot, _mid)
                         except Exception:
                             pass
                 try:
@@ -27174,7 +28023,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
             try:
-                _cleanup_adapter.register_post_delivery_callback(
+                _live_cleanup_adapter = self._live_delivery_operation(
+                    source,
+                    None,
+                    "register_post_delivery_callback",
+                )[0]
+                if _live_cleanup_adapter is None:
+                    raise RuntimeError("stamped cleanup owner unavailable")
+                _live_cleanup_adapter.register_post_delivery_callback(
                     session_key,
                     _cleanup_temp_bubbles,
                     generation=run_generation,

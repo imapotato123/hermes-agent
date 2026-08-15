@@ -38,6 +38,7 @@ from gateway.session import (
     AsyncSessionStore,
     SessionSource,
     build_session_key,
+    copy_session_source,
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
@@ -1553,10 +1554,19 @@ class GatewaySlashCommandsMixin:
         # Save the requester's routing info so the new gateway process can
         # notify them once it comes back online.
         try:
+            notify_source = copy_session_source(
+                event.source,
+                message_id=(
+                    str(event.message_id)
+                    if event.message_id is not None
+                    else event.source.message_id
+                ),
+            )
             notify_data = {
-                "platform": event.source.platform.value if event.source.platform else None,
-                "chat_id": event.source.chat_id,
-                "chat_type": event.source.chat_type,
+                "platform": notify_source.platform.value if notify_source.platform else None,
+                "chat_id": notify_source.chat_id,
+                "chat_type": notify_source.chat_type,
+                "source": notify_source.to_dict(),
             }
             if event.source.delivered_via_upstream_relay is True:
                 notify_data["delivered_via_upstream_relay"] = True
@@ -1570,12 +1580,7 @@ class GatewaySlashCommandsMixin:
                 notify_data["message_id"] = event.message_id
             if event.source is not None:
                 try:
-                    self._restart_command_source = dataclasses.replace(
-                        event.source,
-                        message_id=str(event.message_id)
-                        if event.message_id is not None
-                        else event.source.message_id,
-                    )
+                    self._restart_command_source = notify_source
                 except Exception:
                     self._restart_command_source = event.source
             await asyncio.to_thread(
@@ -5635,6 +5640,14 @@ class GatewaySlashCommandsMixin:
             "user_id": event.source.user_id,
             "session_key": session_key,
             "timestamp": datetime.now().isoformat(),
+            "source": copy_session_source(
+                event.source,
+                message_id=(
+                    str(event.message_id)
+                    if event.message_id is not None
+                    else event.source.message_id
+                ),
+            ).to_dict(),
         }
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id

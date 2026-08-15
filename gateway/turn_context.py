@@ -36,6 +36,8 @@ class TurnContext:
     # --- read-only turn identity / wiring -------------------------------
     source: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
+    _live_adapter: Callable[[], Any] = None  # type: ignore[assignment]
+    _live_operation: Callable[[str], tuple[Any, Any]] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"
     _thinking_enabled: bool = False
@@ -59,6 +61,7 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    _cleanup_msg_owners: dict[str, Any] = field(default_factory=dict)
 
     # --- progress threading metadata (assigned after construction, before
     #     send_progress_messages is scheduled) ----------------------------
