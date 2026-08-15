@@ -2660,6 +2660,114 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class BackendUnavailableReply(str):
+    """Sanitized transient-backend failure returned by ``GatewayRunner``.
+
+    This marker crosses the normal handler boundary without provider details.
+    The adapter suppresses repeats per session and records the cooldown only
+    after the platform acknowledges delivery.
+    """
+
+    @property
+    def text(self) -> str:
+        return str.__str__(self)
+
+
+class BackendNoticeState:
+    """Runner-scoped cooldown and in-flight claims for backend notices.
+
+    Adapter generations can overlap during reconnect. A contender waits for
+    the active owner's delivery result: successful delivery suppresses it,
+    while failed or cancelled delivery lets exactly one waiter take over.
+    """
+
+    def __init__(self) -> None:
+        self.posted: dict[str, tuple[str, float]] = {}
+        self.inflight: set[tuple[str, str]] = set()
+        self._claim_results: dict[
+            tuple[str, str], asyncio.Future[bool]
+        ] = {}
+        self._delivery_tasks: set[asyncio.Task[Any]] = set()
+
+    def track_delivery_task(self, task: asyncio.Task[Any]) -> None:
+        """Keep an acknowledgement-ambiguous notice send alive after cancellation."""
+        self._delivery_tasks.add(task)
+
+        def _consume_result(completed: asyncio.Task[Any]) -> None:
+            self._delivery_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.exception()
+            except asyncio.CancelledError:
+                pass
+
+        task.add_done_callback(_consume_result)
+
+    def _prune(self, now: float) -> None:
+        expired = [
+            key
+            for key, (_, timestamp) in self.posted.items()
+            if now - timestamp >= _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
+        ]
+        for key in expired:
+            del self.posted[key]
+
+    def is_suppressed(self, session_key: str, notice_kind: str, now: float) -> bool:
+        self._prune(now)
+        previous = self.posted.get(session_key)
+        return bool(
+            previous is not None
+            and previous[0] == notice_kind
+            and now - previous[1] < _LLM_CONNECTION_ERROR_COOLDOWN_SECONDS
+        )
+
+    async def claim(self, session_key: str, notice_kind: str) -> bool:
+        claim = (session_key, notice_kind)
+        while True:
+            if self.is_suppressed(session_key, notice_kind, time.monotonic()):
+                return False
+
+            owner_result = self._claim_results.get(claim)
+            if owner_result is None:
+                self.inflight.add(claim)
+                self._claim_results[claim] = (
+                    asyncio.get_running_loop().create_future()
+                )
+                return True
+
+            # Cancelling a reconnect generation must not cancel the shared
+            # completion signal and strand the owner or other waiters.
+            delivered = await asyncio.shield(owner_result)
+            if delivered:
+                return False
+            # The owner failed or was cancelled. Race other waiters for a new
+            # claim; one wins and the rest await that new owner.
+
+    def finish_claim(
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        delivered: bool,
+    ) -> None:
+        claim = (session_key, notice_kind)
+        owner_result = self._claim_results.pop(claim, None)
+        self.inflight.discard(claim)
+        if delivered:
+            self.record(session_key, notice_kind, now)
+        if owner_result is not None and not owner_result.done():
+            owner_result.set_result(delivered)
+
+    def record(self, session_key: str, notice_kind: str, now: float) -> None:
+        self._prune(now)
+        while len(self.posted) >= _LLM_ERROR_TRACKER_MAX_SESSIONS:
+            oldest = min(self.posted, key=lambda key: self.posted[key][1])
+            del self.posted[oldest]
+        self.posted[session_key] = (notice_kind, now)
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -2768,10 +2876,26 @@ _RETRYABLE_ERROR_PATTERNS = (
 )
 
 
+# How long to suppress a repeat backend-unavailable notice for the same
+# session.  An outage lasting longer than this posts one
+# more notice, which is the intent — the user should be reminded the
+# backend is still down, just not once per message.
+_LLM_CONNECTION_ERROR_COOLDOWN_SECONDS = 300.0
+
+# Hard cap on tracked sessions.  Expired entries are dropped on write, so
+# this only binds when many distinct sessions fail inside one cooldown
+# window; the oldest entry is then evicted.
+_LLM_ERROR_TRACKER_MAX_SESSIONS = 1024
+
+
 # Type for message handlers.  Handlers may return a plain string (normal
-# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
+# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, a
+# ``BackendUnavailableReply`` for delivery-aware outage suppression, or
 # ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+MessageHandler = Callable[
+    [MessageEvent],
+    Awaitable[Optional[Union[str, "EphemeralReply", "BackendUnavailableReply"]]],
+]
 
 
 def resolve_channel_prompt(
@@ -3093,6 +3217,20 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Last user-visible backend-unavailable notice per session:
+        # session_key -> (notice_kind, monotonic_timestamp).  Pruned on write
+        # by _record_llm_error_notice; never grows past
+        # _LLM_ERROR_TRACKER_MAX_SESSIONS.
+        self._backend_notice_state = BackendNoticeState()
+        # Logical profile namespace used only for runner-shared backend notice
+        # state. The adapter's local session key deliberately keeps the legacy
+        # ``agent:main`` namespace, even for multiplexed secondary adapters.
+        self._backend_notice_profile: Optional[str] = None
+        # Profile whose credential/connection owns this transport. Unlike a
+        # SessionSource's runtime ``profile``, this does not change when a chat
+        # route selects another agent profile for the turn.
+        self._transport_profile: Optional[str] = None
+        self._llm_error_last_posted = self._backend_notice_state.posted
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5390,15 +5528,16 @@ class BasePlatformAdapter(ABC):
 
     def _final_delivery_adapter(
         self, source: Optional[SessionSource]
-    ) -> "BasePlatformAdapter":
-        """Return the runner's current adapter for a new final-response send.
+    ) -> Optional["BasePlatformAdapter"]:
+        """Return the current adapter for a new final-response send.
 
         A reconnect removes the failed adapter from the runner registry before
         its in-flight message task completes. That task must keep its own
         cleanup and partial-message ownership, but an as-yet-unsent final
-        response belongs on the replacement transport. This helper deliberately
-        does not migrate message IDs or route edits/deletes through the new
-        adapter: those operations remain owned by the old transport.
+        response belongs on the replacement transport. When a managed source's
+        owner has no current generation, fail closed with ``None`` rather than
+        sending through the disconnected ``self``. Standalone adapters without
+        a runner resolver retain their historical ``self`` behavior.
         """
         runner = getattr(self, "gateway_runner", None)
         resolve = getattr(runner, "_adapter_for_source", None)
@@ -5407,13 +5546,17 @@ class BasePlatformAdapter(ABC):
         try:
             live_adapter = resolve(source)
         except Exception:
-            logger.debug("[%s] Failed to resolve live adapter for final delivery", self.name)
-            return self
+            logger.debug(
+                "[%s] Failed to resolve live adapter for final delivery",
+                self.name,
+                exc_info=True,
+            )
+            return None
         if (
             not isinstance(live_adapter, BasePlatformAdapter)
             or live_adapter.platform != self.platform
         ):
-            return self
+            return None
         return live_adapter
 
     async def _send_with_retry(
@@ -6160,6 +6303,70 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    def _llm_error_notice_suppressed(
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> bool:
+        """True when this session already saw this notice inside the cooldown."""
+        session_key = self._backend_notice_session_key(session_key, source)
+        return self._backend_notice_state.is_suppressed(
+            session_key, notice_kind, now
+        )
+
+    def _backend_notice_session_key(
+        self,
+        session_key: str,
+        source: Optional[SessionSource] = None,
+    ) -> str:
+        """Return an injective profile/session key for runner-wide notice state.
+
+        Adapter-local session keys are built before multiplex routing stamps the
+        source profile. Always prefix the logical profile, including ``default``.
+        Length-prefixing keeps the encoding unambiguous even if plugin profiles
+        or session keys contain separators.
+        """
+        profile = str(
+            (getattr(source, "profile", None) if source is not None else None)
+            or self._backend_notice_profile
+            or "default"
+        ).strip() or "default"
+        return f"profile:{len(profile)}:{profile}:{session_key}"
+
+    def set_backend_notice_state(
+        self,
+        state: BackendNoticeState,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Share claims across reconnects within one logical profile."""
+        self._backend_notice_state = state
+        self._backend_notice_profile = str(profile_name or "").strip() or None
+        # Compatibility for diagnostics/tests that inspect the old map.
+        self._llm_error_last_posted = state.posted
+
+    def _record_llm_error_notice(
+        self,
+        session_key: str,
+        notice_kind: str,
+        now: float,
+        *,
+        source: Optional[SessionSource] = None,
+    ) -> None:
+        """Record a posted notice, dropping expired and surplus entries.
+
+        Called only on backend failures, so the O(n) prune is cheap and
+        keeps the map from retaining every session key for the lifetime of
+        the adapter.
+        """
+        self._backend_notice_state.record(
+            self._backend_notice_session_key(session_key, source),
+            notice_kind,
+            now,
+        )
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -6213,6 +6420,9 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            is_backend_unavailable_response = isinstance(
+                response, BackendUnavailableReply
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6330,6 +6540,19 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Resolve one current transport for every as-yet-unsent final
+                # artifact. A managed adapter removed during reconnect must not
+                # fall back to its stale socket when no replacement is available.
+                # Standalone adapters (no runner resolver) still resolve to self.
+                delivery_adapter = self._final_delivery_adapter(event.source)
+                if delivery_adapter is None:
+                    logger.warning(
+                        "[%s] No current transport owner for final delivery to %s; "
+                        "dropping all unsent response artifacts",
+                        self.name,
+                        event.source.chat_id,
+                    )
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -6339,11 +6562,13 @@ class BasePlatformAdapter(ABC):
                 _tts_path = None
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
+                if (delivery_adapter is not None
+                        and not is_backend_unavailable_response
+                        and delivery_adapter._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
-                        and not self._streaming_tts_turn_completed(
+                        and not delivery_adapter._streaming_tts_turn_completed(
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
                             event=event,
@@ -6352,7 +6577,7 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = self.prepare_tts_text(text_content)
+                            speech_text = delivery_adapter.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
                             # Pass an explicit platform-aware output path: the
@@ -6362,7 +6587,7 @@ class BasePlatformAdapter(ABC):
                             # produced MP3 (audio attachment, not a native
                             # voice bubble) on Opus platforms (#57049, #36685).
                             _tts_requested_path = build_auto_tts_output_path(
-                                self.platform
+                                delivery_adapter.platform
                             )
                             tts_result_str = await asyncio.to_thread(
                                 text_to_speech_tool,
@@ -6397,12 +6622,17 @@ class BasePlatformAdapter(ABC):
                         telegram_tts_caption = None
                         if (
                             _tts_index == 0
-                            and self.platform == Platform.TELEGRAM
+                            and delivery_adapter is not None
+                            and delivery_adapter.platform == Platform.TELEGRAM
                             and text_content
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
+                        # _tts_paths can only be populated when a delivery adapter
+                        # was resolved above, so this assertion narrows the type
+                        # without creating a stale-transport fallback.
+                        assert delivery_adapter is not None
+                        tts_result = await delivery_adapter.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
@@ -6430,10 +6660,44 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a
-                # final response; that response is a new message, so resolve
-                # the current transport before sending it.
-                if text_content and not _tts_caption_delivered:
-                    delivery_adapter = self._final_delivery_adapter(event.source)
+                # final response. ``delivery_adapter`` above is the one current
+                # transport for every new final-response artifact.
+                backend_notice_claimed = False
+                backend_notice_suppressed = False
+                backend_notice_session_key = session_key
+                if (
+                    delivery_adapter is not None
+                    and text_content
+                    and not _tts_caption_delivered
+                    and is_backend_unavailable_response
+                ):
+                    # Retain the exact adapter that will send the notice so the
+                    # claim and acknowledgement use one runner-shared state.
+                    backend_notice_session_key = (
+                        delivery_adapter._backend_notice_session_key(
+                            session_key, event.source
+                        )
+                    )
+                    backend_notice_claimed = (
+                        await delivery_adapter._backend_notice_state.claim(
+                            backend_notice_session_key,
+                            "backend_unavailable",
+                        )
+                    )
+                    if not backend_notice_claimed:
+                        backend_notice_suppressed = True
+                        logger.info(
+                            "[%s] Suppressing duplicate backend-unavailable "
+                            "notice for session %s",
+                            delivery_adapter.name,
+                            session_key,
+                        )
+                        text_content = ""
+                if (
+                    delivery_adapter is not None
+                    and text_content
+                    and not _tts_caption_delivered
+                ):
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -6450,9 +6714,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    if (
+                        not is_ephemeral_response
+                        and not is_backend_unavailable_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6483,12 +6751,55 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if backend_notice_claimed:
+                        async def _send_and_finish_backend_notice_claim():
+                            try:
+                                send_result = await delivery_adapter._send_with_retry(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_final_thread_metadata,
+                                )
+                            except BaseException:
+                                delivery_adapter._backend_notice_state.finish_claim(
+                                    backend_notice_session_key,
+                                    "backend_unavailable",
+                                    time.monotonic(),
+                                    delivered=False,
+                                )
+                                raise
+                            delivery_adapter._backend_notice_state.finish_claim(
+                                backend_notice_session_key,
+                                "backend_unavailable",
+                                time.monotonic(),
+                                delivered=bool(
+                                    getattr(send_result, "success", False)
+                                ),
+                            )
+                            return send_result
+
+                        send_task = asyncio.create_task(
+                            _send_and_finish_backend_notice_claim()
+                        )
+                        try:
+                            result = await asyncio.shield(send_task)
+                        except asyncio.CancelledError:
+                            # Once platform delivery has started, cancellation
+                            # is acknowledgement-ambiguous. Runner-scoped state
+                            # holds the send task across adapter replacement and
+                            # resolves contenders only when the platform result
+                            # is known, while this processor unwinds promptly.
+                            delivery_adapter._backend_notice_state.track_delivery_task(
+                                send_task
+                            )
+                            raise
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6525,20 +6836,33 @@ class BasePlatformAdapter(ABC):
                         )
 
                 # Human-like pacing delay between text and media
-                human_delay = self._get_human_delay()
+                human_delay = (
+                    delivery_adapter._get_human_delay()
+                    if delivery_adapter is not None
+                    else 0.0
+                )
 
                 # Send extracted images as native attachments
-                if images:
-                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
+                if delivery_adapter is not None and images:
+                    logger.info(
+                        "[%s] Extracted %d image(s) to send as attachments",
+                        delivery_adapter.name,
+                        len(images),
+                    )
                     try:
-                        await self.send_multiple_images(
+                        await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
                     except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        logger.warning(
+                            "[%s] Error batching images: %s",
+                            delivery_adapter.name,
+                            batch_err,
+                            exc_info=True,
+                        )
 
 
                 # Send extracted media files — route by file type
@@ -6570,31 +6894,43 @@ class BasePlatformAdapter(ABC):
                     else:
                         _non_image_local.append(file_path)
 
-                if _image_paths:
+                if delivery_adapter is not None and _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
                     except Exception as batch_err:
-                        logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        logger.warning(
+                            "[%s] Error batching images: %s",
+                            delivery_adapter.name,
+                            batch_err,
+                            exc_info=True,
+                        )
 
-                if _non_image_media:
+                if delivery_adapter is not None and _non_image_media:
                     logger.info(
                         "[%s] Delivering %d non-image MEDIA attachment(s)",
-                        self.name,
+                        delivery_adapter.name,
                         len(_non_image_media),
                     )
-                for media_path, is_voice in _non_image_media:
+                for media_path, is_voice in (
+                    _non_image_media if delivery_adapter is not None else []
+                ):
+                    assert delivery_adapter is not None
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(media_path).suffix.lower()
-                        if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
+                        if should_send_media_as_audio(
+                            delivery_adapter.platform,
+                            ext,
+                            is_voice=is_voice,
+                        ):
+                            media_result = await delivery_adapter.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
@@ -6602,47 +6938,59 @@ class BasePlatformAdapter(ABC):
                         elif ext in _VIDEO_EXTS:
                             logger.info(
                                 "[%s] Sending video attachment (%s) to %s",
-                                self.name,
+                                delivery_adapter.name,
                                 ext,
                                 event.source.chat_id,
                             )
-                            media_result = await self.send_video(
+                            media_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            media_result = await self.send_document(
+                            media_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
 
                         if not media_result.success:
-                            logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
+                            logger.warning(
+                                "[%s] Failed to send media (%s): %s",
+                                delivery_adapter.name,
+                                ext,
+                                media_result.error,
+                            )
+                            await delivery_adapter._notify_media_delivery_failure(
                                 event.source.chat_id,
                                 media_path,
                                 is_voice=is_voice,
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as media_err:
-                        logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        logger.warning(
+                            "[%s] Error sending media: %s",
+                            delivery_adapter.name,
+                            media_err,
+                        )
 
                 # Send auto-detected local non-image files as native attachments
-                for file_path in _non_image_local:
+                for file_path in (
+                    _non_image_local if delivery_adapter is not None else []
+                ):
+                    assert delivery_adapter is not None
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            file_result = await self.send_video(
+                            file_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            file_result = await self.send_document(
+                            file_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
@@ -6650,25 +6998,40 @@ class BasePlatformAdapter(ABC):
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
-                                self.name,
+                                delivery_adapter.name,
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
+                            await delivery_adapter._notify_media_delivery_failure(
                                 event.source.chat_id,
                                 file_path,
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as file_err:
-                        logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        logger.error(
+                            "[%s] Error sending local file %s: %s",
+                            delivery_adapter.name,
+                            file_path,
+                            file_err,
+                        )
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
-                _anything_delivered = (
-                    delivery_attempted or _tts_caption_delivered
-                    or images or local_files or media_files
+                _anything_delivered = bool(
+                    delivery_adapter is not None
+                    and (
+                        delivery_attempted
+                        or _tts_caption_delivered
+                        or images
+                        or local_files
+                        or media_files
+                    )
                 )
-                if not _anything_delivered and _response_pre_extract.strip():
+                if (
+                    not _anything_delivered
+                    and not backend_notice_suppressed
+                    and _response_pre_extract.strip()
+                ):
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
                         "(%d chars) produced no delivered message or attachment "
@@ -6676,8 +7039,13 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # Determine overall success for the processing hook.  A delivered
+            # backend-unavailable notice is still a failed agent turn.
+            processing_ok = (
+                False
+                if is_backend_unavailable_response
+                else (delivery_succeeded if delivery_attempted else not bool(response))
+            )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6747,20 +7115,31 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Send the error to the user so they aren't left with radio silence.
+            # Backend failures are explicitly marked by GatewayRunner before
+            # this delivery layer.  Exceptions raised here may instead be
+            # platform, media, storage, or hook failures and must not be
+            # mislabeled as an AI-backend outage.
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
+                _thread_metadata = _thread_metadata_for_source(
+                    event.source, _reply_anchor_for_event(event)
                 )
+                error_delivery_adapter = self._final_delivery_adapter(event.source)
+                if error_delivery_adapter is None:
+                    logger.error(
+                        "[%s] No current transport owner for internal-error notice to %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                else:
+                    await error_delivery_adapter.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            "Sorry, I encountered an internal error. "
+                            "Please try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
             except Exception as notify_err:
                 logger.error(
                     "[%s] Failed to send error notification to user: %s",
@@ -7065,6 +7444,10 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        # The weakref identifies this exact generation while it remains in the
+        # runner registry. Preserve its owning profile independently so a turn
+        # that outlives a reconnect can resolve the replacement generation.
+        source._transport_profile = getattr(self, "_transport_profile", None)
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched
